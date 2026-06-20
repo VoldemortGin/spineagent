@@ -28,13 +28,13 @@ jobs:
       # 从 ./agentspine 看过去就是 ../corespine —— Makefile 的 `uv pip install -e ../corespine`
       # 与 pyproject 的 uv path source 都能原样命中。
       #
-      # TODO(你来填):把下面的 repository 换成 corespine 的真实 GitHub slug,形如 <org>/corespine。
-      #   若 corespine 是私有仓库,再补一行 `token: ${{ secrets.CORESPINE_CHECKOUT_TOKEN }}`
+      # corespine 是公开兄弟仓库,直接并排签出,无需 token。
+      #   若将来转私有,补一行 `token: ${{ secrets.CORESPINE_CHECKOUT_TOKEN }}`
       #   (一个对 corespine 有读权限的 PAT / deploy key)。
       - name: Checkout corespine (sibling, not yet on PyPI)
         uses: actions/checkout@v4
         with:
-          repository: your-org/corespine   # TODO: 改成真实的 <org>/corespine
+          repository: VoldemortGin/corespine
           path: corespine
           # ref: main                       # 需锁定分支/标签时取消注释
 
