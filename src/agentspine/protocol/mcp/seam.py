@@ -15,7 +15,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from corespine.errors import SeamError
 from corespine.seam.registry import Registry, lazy_extra_import
+
+from agentspine.tools.tool import ToolResult
 
 # 真实官方 MCP SDK 的 import 名(装了 agentspine[mcp] 才有);默认离线路径绝不 import 它。
 _MCP_SDK_MODULE = "mcp"
@@ -73,6 +76,35 @@ class OfflineMcpStub:
         return self._handlers[name](arguments)
 
 
+class McpClientTool:
+    """跨缝适配器:把一个 MCP client 的具名工具桥成 agentspine Tool(实现 Tool 协议)。
+
+    让「会用工具的 agent」(ToolUsingAgent)能透过 MCP 调用远端 / 进程内的工具——把 run(arg)
+    的单串入参包成 {arg_key: arg} 调 client.call_tool,再取结果里的 result_key 转字符串,带上
+    provenance(ToolResult.tool = 工具名)。这正是 README 所说「把 ragspine RAG / 任意 MCP
+    server 当作一个 Tool 在运行时组合」的通路:装一个实现了 McpClient 的适配器即可,零包依赖。
+
+    最薄阻抗匹配:只做 str 单参 + 单键结果映射;复杂多参 schema 留待真实接入时再长(rule of three)。
+    """
+
+    def __init__(
+        self,
+        name: str,
+        client: McpClient,
+        *,
+        arg_key: str = "input",
+        result_key: str = "result",
+    ) -> None:
+        self.name = name
+        self._client = client
+        self._arg_key = arg_key
+        self._result_key = result_key
+
+    def run(self, arg: str) -> ToolResult:
+        result = self._client.call_tool(self.name, {self._arg_key: arg})
+        return ToolResult(tool=self.name, output=str(result[self._result_key]))
+
+
 def load_mcp_sdk() -> Any:
     """延迟 import 真实 MCP SDK;未装 [mcp] extra 时给「pip install agentspine[mcp]」友好报错。"""
     return lazy_extra_import(_MCP_SDK_MODULE, pkg="agentspine", extra="mcp")
@@ -81,7 +113,8 @@ def load_mcp_sdk() -> Any:
 def _make_real_client(**kwargs: Any) -> McpClient:
     # 缺 [mcp] extra -> 友好 ImportError(离线默认路径永远不会走到这)。
     sdk = load_mcp_sdk()
-    raise NotImplementedError(
+    # 装了 extra 但适配器尚未接入:家族统一 SeamError(「缝槽存在但真实实现未接入」)。
+    raise SeamError(
         f"真实 MCP client 适配器留待装了 agentspine[mcp] 的使用者按 {sdk.__name__!r} "
         "官方 SDK 接入;本壳只提供缝 + 离线 stub。"
     )

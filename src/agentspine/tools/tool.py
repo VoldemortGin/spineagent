@@ -16,6 +16,8 @@ import operator
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from corespine.seam.registry import Registry
+
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -79,3 +81,13 @@ def _safe_eval(node: ast.AST) -> float:
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_safe_eval(node.operand))
     raise ValueError(f"不支持的表达式节点:{type(node).__name__}")
+
+
+# 工具缝注册表:一个 spec 选实现 + entry-point 第三方工具【自动发现】(group "corespine.tool")。
+# 这正是家族「敢放手让第三方填广度、却让脊柱不变量(TOOL_INVARIANTS)烂不掉」的落点:第三方
+# 装个包、在 "corespine.tool" entry-point group 下注册自己的工具工厂,即可被 tool_registry.make /
+# names 发现并组合进 agent,无需改本包代码;而它们仍须过 conformance 的 TOOL_INVARIANTS 才算数。
+# 命名注:变量叫 tool_registry 而非 tools,以避开与 agentspine.tools 子包同名(其余缝无此冲突)。
+tool_registry: Registry[Tool] = Registry("tool")
+tool_registry.register("echo", lambda **kw: EchoTool(**kw))
+tool_registry.register("calc", lambda **kw: CalcTool(**kw))

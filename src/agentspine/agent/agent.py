@@ -23,11 +23,22 @@ from corespine.observability.trace import TraceSink
 
 @dataclass(frozen=True)
 class AgentResult:
-    """一次 agent 步的结果:产出文本 + 来源 agent 名(provenance)+ 可选 token 用量。"""
+    """一次 agent 步的结果:产出文本 + 来源 agent 名(provenance)+ 可选 token 用量 / 错误。
+
+    error 仅在【编排层弹性模式】下捕获 agent.step 异常时填充——归一为家族统一的可序列化错误
+    dict(corespine.errors.error_to_dict:含 code / retryable / context)。正常成功路径 error 为
+    None;agent.step 自身的契约仍是「成功产出非空、失败抛异常」,捕获与否是 Coordinator 的策略。
+    """
 
     agent: str
     output: str
     usage: dict[str, int] | None = None
+    error: dict[str, object] | None = None
+
+    @property
+    def ok(self) -> bool:
+        """这步是否成功(未捕获到错误)。"""
+        return self.error is None
 
 
 @runtime_checkable

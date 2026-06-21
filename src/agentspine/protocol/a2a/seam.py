@@ -15,7 +15,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from corespine.errors import SeamError
+from corespine.observability.trace import TraceSink
 from corespine.seam.registry import Registry, lazy_extra_import
+
+from agentspine.agent.agent import AgentResult, _emit_step
 
 # 真实 A2A SDK 的 import 名(装了 agentspine[a2a] 才有);默认离线路径绝不 import 它。
 _A2A_SDK_MODULE = "a2a"
@@ -74,6 +78,33 @@ class OfflineA2AStub:
         )
 
 
+class A2AAgentAdapter:
+    """跨缝适配器:把一个 A2AAgent 桥成 agentspine Agent(实现 Agent 协议)。
+
+    让一个远端 / 进程内的 A2A agent 能像本地 agent 一样进 Coordinator 顺序 / 并行编排:把 step
+    的任务包成一条 A2ATask 交给 remote.send,再把 A2AResult 转成 AgentResult。name 取 remote.name
+    以满足「结果可溯源到产出它的 agent」不变量;trace 复用本包同款 _emit_step,只记元数据。
+
+    透明桥:输出原样继承自 remote(与 LlmAgent / FunctionAgent 透传 provider / 函数输出一致)。
+    故「步产出非空」这条 Agent 不变量当且仅当 remote 自身产出非空时成立——本适配器不伪造、不
+    篡改 remote 的应答;空应答属 remote 违约,由 remote 侧负责,本壳不在此兜底(rule of three)。
+    """
+
+    def __init__(self, remote: A2AAgent, *, task_id: str = "task") -> None:
+        self._remote = remote
+        self._task_id = task_id
+
+    @property
+    def name(self) -> str:
+        return self._remote.name
+
+    def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
+        reply = self._remote.send(A2ATask(task_id=self._task_id, text=task))
+        result = AgentResult(agent=self._remote.name, output=reply.output)
+        _emit_step(trace, self._remote.name, task, result)
+        return result
+
+
 def load_a2a_sdk() -> Any:
     """延迟 import 真实 A2A SDK;未装 [a2a] extra 时给「pip install agentspine[a2a]」友好报错。"""
     return lazy_extra_import(_A2A_SDK_MODULE, pkg="agentspine", extra="a2a")
@@ -82,7 +113,8 @@ def load_a2a_sdk() -> Any:
 def _make_real_agent(**kwargs: Any) -> A2AAgent:
     # 缺 [a2a] extra -> 友好 ImportError(离线默认路径永远不会走到这)。
     sdk = load_a2a_sdk()
-    raise NotImplementedError(
+    # 装了 extra 但适配器尚未接入:家族统一 SeamError(「缝槽存在但真实实现未接入」)。
+    raise SeamError(
         f"真实 A2A 适配器留待装了 agentspine[a2a] 的使用者按 {sdk.__name__!r} 接入;"
         "本壳只提供缝 + 离线 stub。"
     )

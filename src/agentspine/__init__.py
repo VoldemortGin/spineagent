@@ -9,10 +9,23 @@ agent / tool / 编排 + MCP / A2A 协议缝。复用 corespine 的缝元模式(P
 """
 
 from agentspine.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
-from agentspine.conformance import AGENT_INVARIANTS, TOOL_INVARIANTS
+from agentspine.agent.as_tool import AgentTool
+from agentspine.agent.policy import (
+    Action,
+    Finish,
+    Observation,
+    SyntaxToolPolicy,
+    ToolCall,
+    ToolPolicy,
+    tool_policies,
+)
+from agentspine.agent.tool_using import ToolUsingAgent
+from agentspine.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
+from agentspine.orchestration.chain import ChainAgent
 from agentspine.orchestration.coordinator import Coordinator
 from agentspine.protocol.a2a.seam import (
     A2AAgent,
+    A2AAgentAdapter,
     A2AResult,
     A2ATask,
     OfflineA2AStub,
@@ -21,13 +34,14 @@ from agentspine.protocol.a2a.seam import (
 )
 from agentspine.protocol.mcp.seam import (
     McpClient,
+    McpClientTool,
     McpServer,
     McpTool,
     OfflineMcpStub,
     load_mcp_sdk,
     mcp_clients,
 )
-from agentspine.tools.tool import CalcTool, EchoTool, Tool, ToolResult
+from agentspine.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
 
 __version__ = "0.0.1"
 
@@ -37,17 +51,30 @@ __all__ = [
     "AgentResult",
     "LlmAgent",
     "FunctionAgent",
+    "ToolUsingAgent",
+    "AgentTool",
+    # tool-policy 缝(会用工具的 agent 的「大脑」)
+    "ToolPolicy",
+    "ToolCall",
+    "Finish",
+    "Action",
+    "Observation",
+    "SyntaxToolPolicy",
+    "tool_policies",
     # tools
     "Tool",
     "ToolResult",
     "EchoTool",
     "CalcTool",
+    "tool_registry",
     # orchestration
     "Coordinator",
+    "ChainAgent",
     # protocol: mcp
     "McpClient",
     "McpServer",
     "McpTool",
+    "McpClientTool",
     "OfflineMcpStub",
     "mcp_clients",
     "load_mcp_sdk",
@@ -55,11 +82,13 @@ __all__ = [
     "A2AAgent",
     "A2ATask",
     "A2AResult",
+    "A2AAgentAdapter",
     "OfflineA2AStub",
     "a2a_agents",
     "load_a2a_sdk",
     # conformance (本包绑定的不变量)
     "AGENT_INVARIANTS",
     "TOOL_INVARIANTS",
+    "POLICY_INVARIANTS",
     "__version__",
 ]
