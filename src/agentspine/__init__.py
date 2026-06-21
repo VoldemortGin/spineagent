@@ -21,6 +21,13 @@ from agentspine.agent.policy import (
 )
 from agentspine.agent.tool_using import ToolUsingAgent
 from agentspine.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
+from agentspine.llm.provider import (
+    AnthropicProvider,
+    OpenAICompatProvider,
+    llm_providers,
+    load_anthropic_sdk,
+    load_openai_sdk,
+)
 from agentspine.orchestration.chain import ChainAgent
 from agentspine.orchestration.coordinator import Coordinator
 from agentspine.protocol.a2a.seam import (
@@ -70,6 +77,12 @@ __all__ = [
     # orchestration
     "Coordinator",
     "ChainAgent",
+    # llm provider 适配器(挂在 corespine LLMProvider 缝后面)
+    "AnthropicProvider",
+    "OpenAICompatProvider",
+    "llm_providers",
+    "load_anthropic_sdk",
+    "load_openai_sdk",
     # protocol: mcp
     "McpClient",
     "McpServer",

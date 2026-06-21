@@ -38,6 +38,9 @@ dev = ["pytest>=8.0.0", "ruff>=0.9.0"]
 # 协议真实后端的占位 extra:仅在显式选用时安装,默认离线路径永不触碰。
 mcp = ["mcp"]
 a2a = ["a2a-sdk"]
+# 真实 LLM provider 的可选 extra:各走官方 SDK 延迟 import,默认离线路径(MockProvider)不触碰。
+anthropic = ["anthropic"]
+openai = ["openai"]
 
 [build-system]
 requires = ["hatchling"]
