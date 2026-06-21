@@ -1,6 +1,6 @@
 """conformance 合约:用 corespine harness 把本包的不变量绑成参数化套件 + 检出泄露违反。
 
-机制由 corespine.ConformanceSuite 提供(实现 × 不变量 笛卡尔积);保证由 agentspine 绑定
+机制由 corespine.ConformanceSuite 提供(实现 × 不变量 笛卡尔积);保证由 spineagent 绑定
 (ADR 0001 D6)。这里把三类实现各喂进自己的不变量包:
   - 6 个 agent 实现(llm / function / tool_using / a2a_adapter / chain / function_calling)× 3 条 agent 不变量;
   - 4 个 tool 实现(echo / calc / mcp_client_tool / agent_tool)× 2 条 tool 不变量;
@@ -14,16 +14,16 @@ import pytest
 from corespine.conformance.harness import ConformanceSuite
 from corespine.llm.provider import MockProvider
 
-from agentspine.agent.agent import AgentResult, FunctionAgent, LlmAgent
-from agentspine.agent.as_tool import AgentTool
-from agentspine.agent.function_calling import FunctionCallingAgent
-from agentspine.agent.policy import SyntaxToolPolicy
-from agentspine.agent.tool_using import ToolUsingAgent
-from agentspine.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
-from agentspine.orchestration.chain import ChainAgent
-from agentspine.protocol.a2a.seam import A2AAgentAdapter, OfflineA2AStub
-from agentspine.protocol.mcp.seam import McpClientTool, McpTool, OfflineMcpStub
-from agentspine.tools.tool import CalcTool, EchoTool
+from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.as_tool import AgentTool
+from spineagent.agent.function_calling import FunctionCallingAgent
+from spineagent.agent.policy import SyntaxToolPolicy
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
+from spineagent.orchestration.chain import ChainAgent
+from spineagent.protocol.a2a.seam import A2AAgentAdapter, OfflineA2AStub
+from spineagent.protocol.mcp.seam import McpClientTool, McpTool, OfflineMcpStub
+from spineagent.tools.tool import CalcTool, EchoTool
 
 
 def _echo_mcp_tool() -> McpClientTool:

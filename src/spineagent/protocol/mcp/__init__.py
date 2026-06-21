@@ -1,6 +1,6 @@
-"""agentspine.protocol.mcp —— MCP 缝:McpClient / McpServer 协议 + 离线回环 stub。"""
+"""spineagent.protocol.mcp —— MCP 缝:McpClient / McpServer 协议 + 离线回环 stub。"""
 
-from agentspine.protocol.mcp.seam import (
+from spineagent.protocol.mcp.seam import (
     McpClient,
     McpServer,
     McpTool,

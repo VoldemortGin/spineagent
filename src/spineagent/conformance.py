@@ -1,4 +1,4 @@
-"""agentspine 自己的不变量(机制借 corespine.conformance,保证由本包绑定,ADR 0001 D6)。
+"""spineagent 自己的不变量(机制借 corespine.conformance,保证由本包绑定,ADR 0001 D6)。
 
 corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的【机制】;具体保证在此绑定。
 本包绑三组:
@@ -22,9 +22,9 @@ from __future__ import annotations
 from corespine.conformance.harness import InvariantPack
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import Agent, AgentResult
-from agentspine.agent.policy import Finish, Observation, ToolCall, ToolPolicy
-from agentspine.tools.tool import Tool
+from spineagent.agent.agent import Agent, AgentResult
+from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
+from spineagent.tools.tool import Tool
 
 # 一段含敏感正文的任务:agent 若把它写进 trace 即泄露——隐私不变量要挡住的正是这个。
 # 内嵌一个独特哨兵串(绝不会作为计数 / 长度 / agent 名巧合出现),用于「按值」检出泄露。

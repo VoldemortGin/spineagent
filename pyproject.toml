@@ -1,5 +1,5 @@
 [project]
-name = "agentspine"
+name = "spineagent"
 version = "0.0.1"
 description = "Spine 家族的通用多 agent 协作框架:agent / tool / 编排 + MCP / A2A 协议缝(离线优先,依赖 corespine)。"
 readme = "README.md"
@@ -52,7 +52,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentspine"]
+packages = ["src/spineagent"]
 
 # 本地开发把 corespine 指向同家族目录里的源码(可编辑);发布层面二者各自独立发版。
 [tool.uv.sources]
@@ -61,7 +61,7 @@ corespine = { path = "../corespine", editable = true }
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-# src 布局:把 src/ 标为第一方根,isort(I 规则)才能把 `import agentspine` 正确归到一方分组。
+# src 布局:把 src/ 标为第一方根,isort(I 规则)才能把 `import spineagent` 正确归到一方分组。
 src = ["src"]
 
 [tool.ruff.lint]

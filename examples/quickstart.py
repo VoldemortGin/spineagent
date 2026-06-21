@@ -1,4 +1,4 @@
-"""agentspine 一键离线 demo:会用工具的多步 agent + 多 agent 编排 + 跨缝组合 + 隐私安全 trace。
+"""spineagent 一键离线 demo:会用工具的多步 agent + 多 agent 编排 + 跨缝组合 + 隐私安全 trace。
 
 零网络、零重依赖、确定性可复现:
   - agent 走 corespine 的 `MockProvider`(离线确定性回声)与纯函数 `FunctionAgent`;
@@ -10,7 +10,7 @@
   - trace 用 corespine 的 `InProcessPrivacyTraceSink`:只记 code / 计数 / 耗时,塞正文会被
     「构造即保证」直接拒绝。
 
-`make demo` 即跑本文件;成功时最后打印 "agentspine OK"。
+`make demo` 即跑本文件;成功时最后打印 "spineagent OK"。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from corespine.llm.provider import (
 from corespine.llm.provider import ToolCall as LlmToolCall
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine import (
+from spineagent import (
     Agent,
     AgentTool,
     CalcTool,
@@ -138,7 +138,7 @@ def main() -> None:
     mcp = OfflineMcpStub()
     mcp.register_tool(McpTool("upper"), lambda args: {"result": args["input"].upper()})
     mcp_agent = ToolUsingAgent("shouter", SyntaxToolPolicy(), [McpClientTool("upper", mcp)])
-    shouted = mcp_agent.step("upper: hello agentspine")
+    shouted = mcp_agent.step("upper: hello spineagent")
     print(f"  agent={shouted.agent} output={shouted.output!r}")
 
     # 分层督导式多 agent:把子 agent 用 AgentTool 暴露成工具,督导 agent 通过工具调用派活给它们。
@@ -173,7 +173,7 @@ def main() -> None:
             print(f"  [{label}] code={event.code} fields={dict(event.fields)}")
 
     # 自检:trace 字段里绝不出现任务正文(隐私不变量,跑挂即视为回归)。
-    secrets = (_TASK, "calc: 2 + 3", "hello agentspine")
+    secrets = (_TASK, "calc: 2 + 3", "hello spineagent")
     leaked = [
         event
         for sink in (orchestration_trace, tool_trace, step_trace)
@@ -182,7 +182,7 @@ def main() -> None:
     ]
     assert not leaked, "trace 泄露了任务正文,违反隐私不变量"
 
-    print("agentspine OK")
+    print("spineagent OK")
 
 
 if __name__ == "__main__":

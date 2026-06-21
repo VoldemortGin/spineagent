@@ -2,7 +2,7 @@
 
 import pytest
 
-from agentspine.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
+from spineagent.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
 
 
 def test_echo_tool_returns_input_with_provenance():

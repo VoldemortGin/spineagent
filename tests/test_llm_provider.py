@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import pytest
 from corespine.llm.provider import ChatCompletion, LLMProvider, MockProvider
 
-from agentspine.agent.agent import LlmAgent
-from agentspine.llm.provider import (
+from spineagent.agent.agent import LlmAgent
+from spineagent.llm.provider import (
     AnthropicProvider,
     OpenAICompatProvider,
     llm_providers,
@@ -212,7 +212,7 @@ def test_registry_unknown_spec_lists_available():
 def test_anthropic_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_anthropic_sdk()
-    assert "pip install agentspine[anthropic]" in str(ei.value)
+    assert "pip install spineagent[anthropic]" in str(ei.value)
 
 
 @pytest.mark.skipif(
@@ -221,4 +221,4 @@ def test_anthropic_missing_extra_gives_friendly_error():
 def test_openai_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_openai_sdk()
-    assert "pip install agentspine[openai]" in str(ei.value)
+    assert "pip install spineagent[openai]" in str(ei.value)

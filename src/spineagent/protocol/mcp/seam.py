@@ -5,8 +5,8 @@
 同时满足 McpClient 与 McpServer 两个协议,让「装上即可端到端跑」与测试都不需要任何外部进程。
 
 真实官方 MCP SDK 仅在选用时,经 [mcp] extra 由 corespine.lazy_extra_import 延迟 import;
-未装该 extra 时给出「pip install agentspine[mcp]」友好报错,而不是裸 ModuleNotFoundError。
-本模块顶层【绝不】import 真实 SDK——import agentspine 不该拉入任何网络 SDK。
+未装该 extra 时给出「pip install spineagent[mcp]」友好报错,而不是裸 ModuleNotFoundError。
+本模块顶层【绝不】import 真实 SDK——import spineagent 不该拉入任何网络 SDK。
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from typing import Any, Protocol, runtime_checkable
 from corespine.errors import SeamError
 from corespine.seam.registry import Registry, lazy_extra_import
 
-from agentspine.tools.tool import ToolResult
+from spineagent.tools.tool import ToolResult
 
-# 真实官方 MCP SDK 的 import 名(装了 agentspine[mcp] 才有);默认离线路径绝不 import 它。
+# 真实官方 MCP SDK 的 import 名(装了 spineagent[mcp] 才有);默认离线路径绝不 import 它。
 _MCP_SDK_MODULE = "mcp"
 
 # 一个工具处理器:参数 dict 进、结果 dict 出(可序列化,与 MCP 调用语义对齐)。
@@ -77,7 +77,7 @@ class OfflineMcpStub:
 
 
 class McpClientTool:
-    """跨缝适配器:把一个 MCP client 的具名工具桥成 agentspine Tool(实现 Tool 协议)。
+    """跨缝适配器:把一个 MCP client 的具名工具桥成 spineagent Tool(实现 Tool 协议)。
 
     让「会用工具的 agent」(ToolUsingAgent)能透过 MCP 调用远端 / 进程内的工具——把 run(arg)
     的单串入参包成 {arg_key: arg} 调 client.call_tool,再取结果里的 result_key 转字符串,带上
@@ -106,8 +106,8 @@ class McpClientTool:
 
 
 def load_mcp_sdk() -> Any:
-    """延迟 import 真实 MCP SDK;未装 [mcp] extra 时给「pip install agentspine[mcp]」友好报错。"""
-    return lazy_extra_import(_MCP_SDK_MODULE, pkg="agentspine", extra="mcp")
+    """延迟 import 真实 MCP SDK;未装 [mcp] extra 时给「pip install spineagent[mcp]」友好报错。"""
+    return lazy_extra_import(_MCP_SDK_MODULE, pkg="spineagent", extra="mcp")
 
 
 def _make_real_client(**kwargs: Any) -> McpClient:
@@ -115,7 +115,7 @@ def _make_real_client(**kwargs: Any) -> McpClient:
     sdk = load_mcp_sdk()
     # 装了 extra 但适配器尚未接入:家族统一 SeamError(「缝槽存在但真实实现未接入」)。
     raise SeamError(
-        f"真实 MCP client 适配器留待装了 agentspine[mcp] 的使用者按 {sdk.__name__!r} "
+        f"真实 MCP client 适配器留待装了 spineagent[mcp] 的使用者按 {sdk.__name__!r} "
         "官方 SDK 接入;本壳只提供缝 + 离线 stub。"
     )
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from agentspine.protocol.mcp.seam import (
+from spineagent.protocol.mcp.seam import (
     McpClient,
     McpServer,
     McpTool,
@@ -45,4 +45,4 @@ def test_real_backend_missing_extra_gives_friendly_error():
     # 默认离线环境未装 [mcp] extra:延迟 import 应给出可直接照做的安装指引。
     with pytest.raises(ImportError) as ei:
         load_mcp_sdk()
-    assert "pip install agentspine[mcp]" in str(ei.value)
+    assert "pip install spineagent[mcp]" in str(ei.value)

@@ -1,10 +1,10 @@
 """agent-as-tool 合约:把 Agent 桥成 Tool + 分层督导式多 agent(supervisor → sub-agents)。"""
 
-from agentspine.agent.agent import FunctionAgent
-from agentspine.agent.as_tool import AgentTool
-from agentspine.agent.policy import SyntaxToolPolicy
-from agentspine.agent.tool_using import ToolUsingAgent
-from agentspine.tools.tool import CalcTool, Tool
+from spineagent.agent.agent import FunctionAgent
+from spineagent.agent.as_tool import AgentTool
+from spineagent.agent.policy import SyntaxToolPolicy
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.tools.tool import CalcTool, Tool
 
 
 def test_agent_tool_bridges_an_agent():

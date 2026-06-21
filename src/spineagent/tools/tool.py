@@ -4,9 +4,9 @@
 (ToolResult.tool 标明产出它的工具,可溯源)。两个默认工具离线可跑、零依赖。
 
 运行时组合(ADR 0001 D4b):可把 ragspine 的 RAG 当作一个 Tool 插在【这里】——让某个
-agent 通过本协议在运行时调用 ragspine 做检索。但 agentspine【不】依赖 ragspine:那是
+agent 通过本协议在运行时调用 ragspine 做检索。但 spineagent【不】依赖 ragspine:那是
 松耦合的运行时组合(import 一个实现了 Tool 协议的适配器即可),不是包依赖,方向也只是
-可选的 agentspine→ragspine,绝不反向。
+可选的 spineagent→ragspine,绝不反向。
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ def _safe_eval(node: ast.AST) -> float:
 # 这正是家族「敢放手让第三方填广度、却让脊柱不变量(TOOL_INVARIANTS)烂不掉」的落点:第三方
 # 装个包、在 "corespine.tool" entry-point group 下注册自己的工具工厂,即可被 tool_registry.make /
 # names 发现并组合进 agent,无需改本包代码;而它们仍须过 conformance 的 TOOL_INVARIANTS 才算数。
-# 命名注:变量叫 tool_registry 而非 tools,以避开与 agentspine.tools 子包同名(其余缝无此冲突)。
+# 命名注:变量叫 tool_registry 而非 tools,以避开与 spineagent.tools 子包同名(其余缝无此冲突)。
 tool_registry: Registry[Tool] = Registry("tool")
 tool_registry.register("echo", lambda **kw: EchoTool(**kw))
 tool_registry.register("calc", lambda **kw: CalcTool(**kw))

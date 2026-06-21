@@ -3,7 +3,7 @@
 import pytest
 from corespine.errors import SeamError
 
-from agentspine.agent.policy import (
+from spineagent.agent.policy import (
     Finish,
     Observation,
     SyntaxToolPolicy,

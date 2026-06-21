@@ -2,13 +2,13 @@
 
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import Agent
-from agentspine.agent.policy import SyntaxToolPolicy
-from agentspine.agent.tool_using import ToolUsingAgent
-from agentspine.orchestration.coordinator import Coordinator
-from agentspine.protocol.a2a.seam import A2AAgentAdapter, OfflineA2AStub
-from agentspine.protocol.mcp.seam import McpClientTool, McpTool, OfflineMcpStub
-from agentspine.tools.tool import Tool
+from spineagent.agent.agent import Agent
+from spineagent.agent.policy import SyntaxToolPolicy
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.orchestration.coordinator import Coordinator
+from spineagent.protocol.a2a.seam import A2AAgentAdapter, OfflineA2AStub
+from spineagent.protocol.mcp.seam import McpClientTool, McpTool, OfflineMcpStub
+from spineagent.tools.tool import Tool
 
 
 def _upper_stub() -> OfflineMcpStub:

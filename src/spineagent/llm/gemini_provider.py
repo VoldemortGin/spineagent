@@ -40,7 +40,7 @@ _GEMINI_FINISH = {
 
 def load_gemini_sdk() -> Any:
     """延迟 import 官方 google-genai SDK;未装 [gemini] extra 时给友好安装指引。"""
-    return lazy_extra_import(_GEMINI_SDK_MODULE, pkg="agentspine", extra="gemini")
+    return lazy_extra_import(_GEMINI_SDK_MODULE, pkg="spineagent", extra="gemini")
 
 
 class GeminiProvider:

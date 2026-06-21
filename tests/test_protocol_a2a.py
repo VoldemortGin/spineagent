@@ -2,7 +2,7 @@
 
 import pytest
 
-from agentspine.protocol.a2a.seam import (
+from spineagent.protocol.a2a.seam import (
     A2AAgent,
     A2AResult,
     A2ATask,
@@ -38,4 +38,4 @@ def test_registry_makes_offline_default():
 def test_real_backend_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_a2a_sdk()
-    assert "pip install agentspine[a2a]" in str(ei.value)
+    assert "pip install spineagent[a2a]" in str(ei.value)

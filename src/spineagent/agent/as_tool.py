@@ -14,8 +14,8 @@ run(arg) 即对子 agent 跑一步、取其输出包成带 provenance 的 ToolRe
 
 from __future__ import annotations
 
-from agentspine.agent.agent import Agent
-from agentspine.tools.tool import ToolResult
+from spineagent.agent.agent import Agent
+from spineagent.tools.tool import ToolResult
 
 
 class AgentTool:

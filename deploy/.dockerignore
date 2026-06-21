@@ -2,8 +2,8 @@
 #
 # BuildKit 的忽略文件解析顺序:先找 `<-f 指向的 Dockerfile>.dockerignore`,再找 context 根的
 # `.dockerignore`。用本文件名 `deploy/.dockerignore` 时,需让它对构建生效(二选一):
-#   1) 把它放/链到 context 根:  ln -sf agentspine/deploy/.dockerignore ~/workspace/spine/.dockerignore
-#   2) 或改名让 BuildKit 自动识别: agentspine/deploy/Dockerfile.dockerignore
+#   1) 把它放/链到 context 根:  ln -sf spineagent/deploy/.dockerignore ~/workspace/spine/.dockerignore
+#   2) 或改名让 BuildKit 自动识别: spineagent/deploy/Dockerfile.dockerignore
 # 即便不忽略也能正确构建(镜像内是一次干净的 uv 安装,下列产物只是死重 / 拖慢上下文)。
 
 # 各包本地虚拟环境 / 缓存 / 构建产物(镜像内会重新安装,无需带入)。

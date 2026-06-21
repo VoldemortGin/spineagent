@@ -5,8 +5,8 @@ extra 延迟 import。默认路径【零网络、零重依赖】:OfflineA2AStub 
 card(能力描述)并应答一条任务,让跨 agent 协作在离线 / 测试下也能端到端跑。
 
 真实 A2A SDK(`a2a-sdk`,import 名 `a2a`)仅在选用时,经 [a2a] extra 由 corespine
-.lazy_extra_import 延迟 import;未装时给「pip install agentspine[a2a]」友好报错。本模块
-顶层【绝不】import 真实 SDK——import agentspine 不该拉入任何网络 SDK。
+.lazy_extra_import 延迟 import;未装时给「pip install spineagent[a2a]」友好报错。本模块
+顶层【绝不】import 真实 SDK——import spineagent 不该拉入任何网络 SDK。
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ from corespine.errors import SeamError
 from corespine.observability.trace import TraceSink
 from corespine.seam.registry import Registry, lazy_extra_import
 
-from agentspine.agent.agent import AgentResult, _emit_step
+from spineagent.agent.agent import AgentResult, _emit_step
 
-# 真实 A2A SDK 的 import 名(装了 agentspine[a2a] 才有);默认离线路径绝不 import 它。
+# 真实 A2A SDK 的 import 名(装了 spineagent[a2a] 才有);默认离线路径绝不 import 它。
 _A2A_SDK_MODULE = "a2a"
 
 
@@ -79,7 +79,7 @@ class OfflineA2AStub:
 
 
 class A2AAgentAdapter:
-    """跨缝适配器:把一个 A2AAgent 桥成 agentspine Agent(实现 Agent 协议)。
+    """跨缝适配器:把一个 A2AAgent 桥成 spineagent Agent(实现 Agent 协议)。
 
     让一个远端 / 进程内的 A2A agent 能像本地 agent 一样进 Coordinator 顺序 / 并行编排:把 step
     的任务包成一条 A2ATask 交给 remote.send,再把 A2AResult 转成 AgentResult。name 取 remote.name
@@ -106,8 +106,8 @@ class A2AAgentAdapter:
 
 
 def load_a2a_sdk() -> Any:
-    """延迟 import 真实 A2A SDK;未装 [a2a] extra 时给「pip install agentspine[a2a]」友好报错。"""
-    return lazy_extra_import(_A2A_SDK_MODULE, pkg="agentspine", extra="a2a")
+    """延迟 import 真实 A2A SDK;未装 [a2a] extra 时给「pip install spineagent[a2a]」友好报错。"""
+    return lazy_extra_import(_A2A_SDK_MODULE, pkg="spineagent", extra="a2a")
 
 
 def _make_real_agent(**kwargs: Any) -> A2AAgent:
@@ -115,7 +115,7 @@ def _make_real_agent(**kwargs: Any) -> A2AAgent:
     sdk = load_a2a_sdk()
     # 装了 extra 但适配器尚未接入:家族统一 SeamError(「缝槽存在但真实实现未接入」)。
     raise SeamError(
-        f"真实 A2A 适配器留待装了 agentspine[a2a] 的使用者按 {sdk.__name__!r} 接入;"
+        f"真实 A2A 适配器留待装了 spineagent[a2a] 的使用者按 {sdk.__name__!r} 接入;"
         "本壳只提供缝 + 离线 stub。"
     )
 

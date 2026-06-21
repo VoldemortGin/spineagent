@@ -40,7 +40,7 @@ _BEDROCK_FINISH = {
 
 def load_boto3_sdk() -> Any:
     """延迟 import 官方 boto3 SDK;未装 [bedrock] extra 时给友好安装指引。"""
-    return lazy_extra_import(_BOTO3_SDK_MODULE, pkg="agentspine", extra="bedrock")
+    return lazy_extra_import(_BOTO3_SDK_MODULE, pkg="spineagent", extra="bedrock")
 
 
 class BedrockConverseProvider:

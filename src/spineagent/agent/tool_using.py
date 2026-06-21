@@ -25,9 +25,9 @@ from collections.abc import Iterable
 
 from corespine.observability.trace import TraceSink
 
-from agentspine.agent.agent import AgentResult
-from agentspine.agent.policy import Finish, Observation, ToolPolicy
-from agentspine.tools.tool import Tool
+from spineagent.agent.agent import AgentResult
+from spineagent.agent.policy import Finish, Observation, ToolPolicy
+from spineagent.tools.tool import Tool
 
 # 触顶 max_steps 又无任何观测可作答时的固定兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without finishing)"

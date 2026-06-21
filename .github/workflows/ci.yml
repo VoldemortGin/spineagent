@@ -1,8 +1,8 @@
-# agentspine CI —— push + PR 上跑 lint + 测试,Python 多版本矩阵。
+# spineagent CI —— push + PR 上跑 lint + 测试,Python 多版本矩阵。
 #
-# 关键约束:agentspine 依赖兄弟薄核 corespine,而 corespine 尚未发到 PyPI。所以 CI 里把
-# corespine【并排签出】到工作区,再【先于】agentspine path-install —— 复刻本地家族布局
-# (agentspine 的 uv path source 指向 ../corespine)。之后用 Makefile 跑与本地同一套门。
+# 关键约束:spineagent 依赖兄弟薄核 corespine,而 corespine 尚未发到 PyPI。所以 CI 里把
+# corespine【并排签出】到工作区,再【先于】spineagent path-install —— 复刻本地家族布局
+# (spineagent 的 uv path source 指向 ../corespine)。之后用 Makefile 跑与本地同一套门。
 name: CI
 
 on:
@@ -18,14 +18,14 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12"]
     steps:
-      # 把 agentspine 自身签出到 ./agentspine,使其与 corespine 在工作区里【并排】。
-      - name: Checkout agentspine
+      # 把 spineagent 自身签出到 ./spineagent,使其与 corespine 在工作区里【并排】。
+      - name: Checkout spineagent
         uses: actions/checkout@v4
         with:
-          path: agentspine
+          path: spineagent
 
       # corespine 还没上 PyPI(兄弟仓库),这里并排签出到 ./corespine。
-      # 从 ./agentspine 看过去就是 ../corespine —— Makefile 的 `uv pip install -e ../corespine`
+      # 从 ./spineagent 看过去就是 ../corespine —— Makefile 的 `uv pip install -e ../corespine`
       # 与 pyproject 的 uv path source 都能原样命中。
       #
       # corespine 是公开兄弟仓库,直接并排签出,无需 token。
@@ -43,11 +43,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # `make install` 建 venv 并先装 corespine、再装 agentspine[dev];`make ci` = lint + 测试。
-      - name: Install (corespine first, then agentspine[dev])
-        working-directory: agentspine
+      # `make install` 建 venv 并先装 corespine、再装 spineagent[dev];`make ci` = lint + 测试。
+      - name: Install (corespine first, then spineagent[dev])
+        working-directory: spineagent
         run: make install
 
       - name: CI gate (lint + test)
-        working-directory: agentspine
+        working-directory: spineagent
         run: make ci

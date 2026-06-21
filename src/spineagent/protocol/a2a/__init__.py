@@ -1,6 +1,6 @@
-"""agentspine.protocol.a2a —— A2A 缝:A2AAgent 协议 + 离线回环 stub。"""
+"""spineagent.protocol.a2a —— A2A 缝:A2AAgent 协议 + 离线回环 stub。"""
 
-from agentspine.protocol.a2a.seam import (
+from spineagent.protocol.a2a.seam import (
     A2AAgent,
     A2AResult,
     A2ATask,

@@ -3,7 +3,7 @@
 from corespine.llm.provider import MockProvider
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
 
 
 def test_llm_agent_runs_a_single_step_offline():

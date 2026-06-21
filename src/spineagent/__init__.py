@@ -1,4 +1,4 @@
-"""agentspine —— 通用多 agent 协作框架(ADR 0001 D1),依赖薄核 corespine。
+"""spineagent —— 通用多 agent 协作框架(ADR 0001 D1),依赖薄核 corespine。
 
 agent / tool / 编排 + MCP / A2A 协议缝。复用 corespine 的缝元模式(Protocol + 离线确定性
 默认 + Registry 工厂 + 参数化 conformance)、隐私安全 observability 与 env 配置风格;核心
@@ -8,10 +8,10 @@ agent / tool / 编排 + MCP / A2A 协议缝。复用 corespine 的缝元模式(P
 【不】在包层面依赖 ragspine。详见 CLAUDE.md 宪章与家族 ADR 0001。
 """
 
-from agentspine.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
-from agentspine.agent.as_tool import AgentTool
-from agentspine.agent.function_calling import FunctionCallingAgent
-from agentspine.agent.policy import (
+from spineagent.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.as_tool import AgentTool
+from spineagent.agent.function_calling import FunctionCallingAgent
+from spineagent.agent.policy import (
     Action,
     Finish,
     Observation,
@@ -20,21 +20,21 @@ from agentspine.agent.policy import (
     ToolPolicy,
     tool_policies,
 )
-from agentspine.agent.tool_using import ToolUsingAgent
-from agentspine.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
-from agentspine.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
-from agentspine.llm.cohere_provider import CohereProvider, load_cohere_sdk
-from agentspine.llm.gemini_provider import GeminiProvider, load_gemini_sdk
-from agentspine.llm.provider import (
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
+from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
+from spineagent.llm.cohere_provider import CohereProvider, load_cohere_sdk
+from spineagent.llm.gemini_provider import GeminiProvider, load_gemini_sdk
+from spineagent.llm.provider import (
     AnthropicProvider,
     OpenAICompatProvider,
     llm_providers,
     load_anthropic_sdk,
     load_openai_sdk,
 )
-from agentspine.orchestration.chain import ChainAgent
-from agentspine.orchestration.coordinator import Coordinator
-from agentspine.protocol.a2a.seam import (
+from spineagent.orchestration.chain import ChainAgent
+from spineagent.orchestration.coordinator import Coordinator
+from spineagent.protocol.a2a.seam import (
     A2AAgent,
     A2AAgentAdapter,
     A2AResult,
@@ -43,7 +43,7 @@ from agentspine.protocol.a2a.seam import (
     a2a_agents,
     load_a2a_sdk,
 )
-from agentspine.protocol.mcp.seam import (
+from spineagent.protocol.mcp.seam import (
     McpClient,
     McpClientTool,
     McpServer,
@@ -52,8 +52,8 @@ from agentspine.protocol.mcp.seam import (
     load_mcp_sdk,
     mcp_clients,
 )
-from agentspine.tools.function_tool import FunctionTool, function_tool
-from agentspine.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
+from spineagent.tools.function_tool import FunctionTool, function_tool
+from spineagent.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
 
 __version__ = "0.0.1"
 

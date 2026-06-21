@@ -1,6 +1,6 @@
 """最小多 agent 编排:把若干 Agent 顺序 / 并行 / 流水线跑,收集结果。
 
-Coordinator 是 agentspine 的「编排」缝最小实现:零外部依赖、离线可跑(用 mock agent 即可)。
+Coordinator 是 spineagent 的「编排」缝最小实现:零外部依赖、离线可跑(用 mock agent 即可)。
   - run_sequential —— 同一任务逐个跑,保序收集 AgentResult;
   - run_parallel  —— 同一任务用线程池并发跑,结果仍按 agent 顺序返回(确定性 / 可断言);
   - run_pipeline  —— 链式:把上一个 agent 的输出当作下一个 agent 的输入,逐段传递、全程保序。
@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from corespine.errors import error_to_dict
 from corespine.observability.trace import TraceSink
 
-from agentspine.agent.agent import Agent, AgentResult
+from spineagent.agent.agent import Agent, AgentResult
 
 
 class Coordinator:

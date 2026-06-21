@@ -11,10 +11,10 @@ from types import SimpleNamespace
 import pytest
 from corespine.llm.provider import ChatCompletion, LLMProvider
 
-from agentspine.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
-from agentspine.llm.cohere_provider import CohereProvider, load_cohere_sdk
-from agentspine.llm.gemini_provider import GeminiProvider, load_gemini_sdk
-from agentspine.llm.provider import llm_providers
+from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
+from spineagent.llm.cohere_provider import CohereProvider, load_cohere_sdk
+from spineagent.llm.gemini_provider import GeminiProvider, load_gemini_sdk
+from spineagent.llm.provider import llm_providers
 
 _OPENAI_TOOL = {"type": "function", "function": {"name": "calc", "parameters": {"type": "object"}}}
 
@@ -88,7 +88,7 @@ def test_cohere_satisfies_protocol_and_registry():
 def test_cohere_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_cohere_sdk()
-    assert "pip install agentspine[cohere]" in str(ei.value)
+    assert "pip install spineagent[cohere]" in str(ei.value)
 
 
 # ---- Gemini(google-genai)--------------------------------------------------------------
@@ -210,11 +210,11 @@ def test_bedrock_registry_and_protocol():
 def test_gemini_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_gemini_sdk()
-    assert "pip install agentspine[gemini]" in str(ei.value)
+    assert "pip install spineagent[gemini]" in str(ei.value)
 
 
 @pytest.mark.skipif(_installed("boto3"), reason="boto3 已安装")
 def test_bedrock_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_boto3_sdk()
-    assert "pip install agentspine[bedrock]" in str(ei.value)
+    assert "pip install spineagent[bedrock]" in str(ei.value)

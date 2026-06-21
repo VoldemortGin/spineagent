@@ -6,7 +6,7 @@ MAX_TOKENS …)、content 是 block 数组(取 text block)、usage 层级不同(
 本适配器把这些转回与 OpenAI 完全一致的 ChatCompletion;reasoning / citations 本期丢弃(同 Anthropic)。
 
 import-clean:顶层【绝不】import cohere;真实 SDK 仅在未注入 client 时经 lazy_extra_import 延迟拉取
-([cohere] extra),缺则「pip install agentspine[cohere]」友好报错。映射可注入 fake client 离线单测。
+([cohere] extra),缺则「pip install spineagent[cohere]」友好报错。映射可注入 fake client 离线单测。
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ _COHERE_FINISH = {
 
 def load_cohere_sdk() -> Any:
     """延迟 import 官方 cohere SDK;未装 [cohere] extra 时给友好安装指引。"""
-    return lazy_extra_import(_COHERE_SDK_MODULE, pkg="agentspine", extra="cohere")
+    return lazy_extra_import(_COHERE_SDK_MODULE, pkg="spineagent", extra="cohere")
 
 
 class CohereProvider:

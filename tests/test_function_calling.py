@@ -16,10 +16,10 @@ from corespine.llm.provider import (
 from corespine.llm.provider import ToolCall as LLMToolCall
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import Agent
-from agentspine.agent.function_calling import FunctionCallingAgent
-from agentspine.orchestration.coordinator import Coordinator
-from agentspine.tools.function_tool import FunctionTool, function_tool
+from spineagent.agent.agent import Agent
+from spineagent.agent.function_calling import FunctionCallingAgent
+from spineagent.orchestration.coordinator import Coordinator
+from spineagent.tools.function_tool import FunctionTool, function_tool
 
 
 class _ScriptedProvider:
@@ -57,7 +57,7 @@ def _calc_tool(spy: list) -> FunctionTool:
     def calc(expression: str) -> str:
         """对一个算术表达式求值。"""
         spy.append(expression)
-        from agentspine.tools.tool import CalcTool
+        from spineagent.tools.tool import CalcTool
 
         return CalcTool().run(expression).output
 

@@ -3,13 +3,13 @@
 import pytest
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import Agent, FunctionAgent
-from agentspine.agent.as_tool import AgentTool
-from agentspine.agent.policy import SyntaxToolPolicy
-from agentspine.agent.tool_using import ToolUsingAgent
-from agentspine.orchestration.chain import ChainAgent
-from agentspine.orchestration.coordinator import Coordinator
-from agentspine.tools.tool import CalcTool
+from spineagent.agent.agent import Agent, FunctionAgent
+from spineagent.agent.as_tool import AgentTool
+from spineagent.agent.policy import SyntaxToolPolicy
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.orchestration.chain import ChainAgent
+from spineagent.orchestration.coordinator import Coordinator
+from spineagent.tools.tool import CalcTool
 
 
 def _abc_chain() -> ChainAgent:

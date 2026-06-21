@@ -1,10 +1,10 @@
-# agentspine
+# spineagent
 
 Spine 家族的**通用多 agent 协作框架**(见 [ADR 0001](../docs/adr/0001-spine-family-boundaries-and-dependency-direction.md))。
 agent / tool / 编排 + **MCP / A2A** 等 agent 协议缝。依赖薄核 `corespine`,复用其缝元模式与
 observability / config 形状;**默认路径离线可跑、import-clean、零网络 SDK**。
 
-> 通用 ≠ 地基。真正的核是更薄的 `corespine`,agentspine 是它的兄弟消费者,**不**含任何 RAG 概念。
+> 通用 ≠ 地基。真正的核是更薄的 `corespine`,spineagent 是它的兄弟消费者,**不**含任何 RAG 概念。
 > 详见 [`CLAUDE.md`](CLAUDE.md) 宪章。
 
 ## 缝的元模式(家族统一)
@@ -33,8 +33,8 @@ observability / config 形状;**默认路径离线可跑、import-clean、零网
 
 ## 运行时组合 ragspine(ADR 0001 D4b)
 
-agentspine **不**在包层面依赖 ragspine。但可在**运行时**把 ragspine 的 RAG 检索包成一个实现了
-`Tool`(或 MCP server)协议的适配器,插给某个 agent 调用——松耦合、可选,方向只能 agentspine→ragspine。
+spineagent **不**在包层面依赖 ragspine。但可在**运行时**把 ragspine 的 RAG 检索包成一个实现了
+`Tool`(或 MCP server)协议的适配器,插给某个 agent 调用——松耦合、可选,方向只能 spineagent→ragspine。
 本包 `dependencies` 永远不含 ragspine,也绝不在默认路径 import 它。
 
 第三方工具(含 ragspine RAG)还可经 entry-point 在 `corespine.tool` group 下注册工具工厂,即被
@@ -48,15 +48,15 @@ uv venv .venv
 VIRTUAL_ENV="$(pwd)/.venv" uv pip install -e ../corespine
 VIRTUAL_ENV="$(pwd)/.venv" uv pip install -e ".[dev]"
 .venv/bin/python -m pytest -q
-.venv/bin/python -c "import agentspine"
+.venv/bin/python -c "import spineagent"
 ```
 
 ## 30 秒上手
 
 ```python
 from corespine import MockProvider, InProcessPrivacyTraceSink
-from agentspine import LlmAgent, FunctionAgent, Coordinator, EchoTool, OfflineMcpStub
-from agentspine.protocol.mcp.seam import McpTool
+from spineagent import LlmAgent, FunctionAgent, Coordinator, EchoTool, OfflineMcpStub
+from spineagent.protocol.mcp.seam import McpTool
 
 # 一个离线 agent:走 corespine 的确定性 MockProvider,跑单步
 agent = LlmAgent("planner", MockProvider())
@@ -77,17 +77,17 @@ print([(r.agent, r.ok) for r in flaky.run_sequential("go", resilient=True)])  # 
 print(EchoTool().run("hi").tool)                # 'echo'
 
 # 工具缝注册表:按 spec 选工具(大小写/留白不敏感),第三方还能经 entry-point 自动发现
-from agentspine import tool_registry
+from spineagent import tool_registry
 print(tool_registry.make("calc").run("6/2").output)   # '3'
 print("calc" in tool_registry.names())                # True
 
 # 会用工具的多步 agent:离线确定性 policy 按 `<tool>: <arg>` 语法路由,$prev 把上一步输出喂回
-from agentspine import ToolUsingAgent, SyntaxToolPolicy, CalcTool
+from spineagent import ToolUsingAgent, SyntaxToolPolicy, CalcTool
 solver = ToolUsingAgent("solver", SyntaxToolPolicy(), [CalcTool()])
 print(solver.step("calc: 2 + 3\ncalc: $prev * 2").output)   # '10'(2+3=5,再 *2=10)
 
 # 分层督导式多 agent:把子 agent 用 AgentTool 暴露成工具,督导 agent 通过工具调用派活给它
-from agentspine import AgentTool
+from spineagent import AgentTool
 calculator = ToolUsingAgent("calculator", SyntaxToolPolicy(), [CalcTool()])
 supervisor = ToolUsingAgent("supervisor", SyntaxToolPolicy(), [AgentTool(calculator)])
 print(supervisor.step("calculator: calc: 2+3").output)      # '5'(督导派给子 agent,子 agent 再用工具)
@@ -98,7 +98,7 @@ stub.register_tool(McpTool("upper"), lambda a: {"result": a["s"].upper()})
 print(stub.call_tool("upper", {"s": "hi"}))     # {'result': 'HI'}
 
 # 跨缝组合:把上面那个 MCP 工具桥成 Tool,交给会用工具的 agent 在循环里驱动(零网络)
-from agentspine import McpClientTool
+from spineagent import McpClientTool
 shouter = ToolUsingAgent("shouter", SyntaxToolPolicy(), [McpClientTool("upper", stub, arg_key="s")])
 print(shouter.step("upper: hi").output)         # 'HI'
 
@@ -115,12 +115,12 @@ agent.step("敏感任务", trace=sink)               # 只记 agent 名 / 长度
 换成真实适配器即可,其余代码(agent / 编排 / 工具循环)一行不改:
 
 ```bash
-pip install "agentspine[openai]"      # OpenAI 及一切「OpenAI 兼容」端点
-pip install "agentspine[anthropic]"   # 或 [cohere] / [gemini] / [bedrock]
+pip install "spineagent[openai]"      # OpenAI 及一切「OpenAI 兼容」端点
+pip install "spineagent[anthropic]"   # 或 [cohere] / [gemini] / [bedrock]
 ```
 
 ```python
-from agentspine import OpenAICompatProvider, AnthropicProvider, GeminiProvider, LlmAgent
+from spineagent import OpenAICompatProvider, AnthropicProvider, GeminiProvider, LlmAgent
 
 # 一个适配器吃下所有 OpenAI 兼容端点:OpenAI / Azure / Together / Groq / DeepSeek / Mistral /
 # xAI / 通义 Qwen / Moonshot / Ollama / vLLM / OpenRouter / LiteLLM …(换 base_url + model 即可)
@@ -134,5 +134,5 @@ gemini = LlmAgent("gemini", GeminiProvider(model="gemini-2.5-flash"))
 
 > 覆盖:**OpenAI 兼容生态(约 85% 主流市场)走 `OpenAICompatProvider` 一把梭**;真正非 OpenAI 形状的
 > Anthropic / Cohere / Gemini / Bedrock 各有原生适配器,把 native 响应转成 OpenAI `ChatCompletion`
-> (绝不把它们套进 OpenAI 形状 = 不 shim)。默认离线路径仍是 `MockProvider`,`import agentspine`
+> (绝不把它们套进 OpenAI 形状 = 不 shim)。默认离线路径仍是 `MockProvider`,`import spineagent`
 > 永远零网络 SDK(真实 SDK 仅在选用对应 extra 时延迟 import)。reasoning / citations 等扩展本期丢弃。

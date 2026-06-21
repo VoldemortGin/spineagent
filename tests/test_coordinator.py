@@ -5,8 +5,8 @@ import threading
 import pytest
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import FunctionAgent
-from agentspine.orchestration.coordinator import Coordinator
+from spineagent.agent.agent import FunctionAgent
+from spineagent.orchestration.coordinator import Coordinator
 
 
 def _two_mock_agents():

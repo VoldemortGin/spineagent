@@ -1,6 +1,6 @@
 """agent 缝:Agent 协议 + 最小默认实现(单步执行)。
 
-家族缝的元模式:Protocol + 离线确定性默认 + 隐私安全 trace。Agent 是 agentspine 最小
+家族缝的元模式:Protocol + 离线确定性默认 + 隐私安全 trace。Agent 是 spineagent 最小
 的执行单元——给一个任务,跑【一步】拿回结果。两个默认实现都离线可跑、零网络:
 
   - LlmAgent —— 用一个 corespine LLMProvider 跑单步(离线用 MockProvider,确定性、可复现);
@@ -8,7 +8,7 @@
 
 隐私约定:step 可选接收一个 corespine TraceSink,实现只允许往里记【元数据】(agent 名、
 长度、token 数),【绝不】记任务/输出正文——由 InProcessPrivacyTraceSink「构造即保证」,
-本包再用 conformance 把这条不变量绑死(见 agentspine/conformance.py)。
+本包再用 conformance 把这条不变量绑死(见 spineagent/conformance.py)。
 """
 
 from __future__ import annotations

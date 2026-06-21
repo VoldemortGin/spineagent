@@ -3,11 +3,11 @@
 import pytest
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from agentspine.agent.agent import Agent
-from agentspine.agent.policy import Action, Observation, SyntaxToolPolicy
-from agentspine.agent.tool_using import ToolUsingAgent
-from agentspine.orchestration.coordinator import Coordinator
-from agentspine.tools.tool import CalcTool
+from spineagent.agent.agent import Agent
+from spineagent.agent.policy import Action, Observation, SyntaxToolPolicy
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.orchestration.coordinator import Coordinator
+from spineagent.tools.tool import CalcTool
 
 
 def _calc_agent(name: str = "tu", *, max_steps: int = 8) -> ToolUsingAgent:

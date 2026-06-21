@@ -18,8 +18,8 @@ from collections.abc import Iterable
 
 from corespine.observability.trace import TraceSink
 
-from agentspine.agent.agent import Agent, AgentResult
-from agentspine.orchestration.coordinator import Coordinator
+from spineagent.agent.agent import Agent, AgentResult
+from spineagent.orchestration.coordinator import Coordinator
 
 
 class ChainAgent:

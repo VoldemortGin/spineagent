@@ -22,8 +22,8 @@ from typing import Any
 from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
-from agentspine.agent.agent import AgentResult
-from agentspine.tools.function_tool import FunctionTool
+from spineagent.agent.agent import AgentResult
+from spineagent.tools.function_tool import FunctionTool
 
 # 触顶 max_steps 仍未出最终文本时的兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without a final answer)"
