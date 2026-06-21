@@ -1,4 +1,4 @@
-"""LLM provider 适配器:把真实后端接进 corespine 的 LLMProvider 缝。
+"""LLM provider 适配器:把真实后端接进 corespine 的 LLMProvider 缝(OpenAI chat-completions 规范)。
 
 家族缝的元模式(同 mcp / a2a):Protocol(在 corespine)+ 离线确定性默认(corespine MockProvider)
 + Registry 工厂 + 真实后端经可选 extra 延迟 import。本模块只提供【两个真实适配器 + 工厂】:
@@ -8,15 +8,14 @@
                              一个适配器覆盖 OpenAI 及所有「OpenAI 兼容」端点
                              (Together / Groq / DeepSeek / Ollama / vLLM / Azure …)。
 
-【为何不是 LangChain / 不做 shim】「统一 invoke」就是 corespine 的 `LLMProvider.chat()`(chat/
-messages 形状,对齐 OpenAI/Anthropic 的最广兼容接口)——LlmAgent 全程只认它。规范 tools 形状采
-OpenAI function-tool;各适配器各做【原生】映射:OpenAI 近 1:1 直传,Anthropic 转换(system 单独 +
-content blocks + OpenAI tool schema → input_schema + tool_use → tool_calls),绝不把 Claude 套进
-OpenAI 形状。这正是「敢放手填广度、却让缝稳」的做法,无需任何外部胖框架。
+【对外唯一规范 = OpenAI chat completions 形状】用户永远按 OpenAI 规范调用(传 OpenAI 形状的
+messages/tools),拿回 OpenAI 形状的 ChatCompletion。OpenAICompatProvider 近 1:1 直传;
+AnthropicProvider 在【内部】把 OpenAI messages/tools 转成 Anthropic 原生形状、再把 Anthropic 的
+响应(text / tool_use blocks / stop_reason / usage)转回 OpenAI ChatCompletion——用户无感、不 shim。
 
-【import-clean】本模块顶层【绝不】import anthropic / openai;真实 SDK 仅在【未注入 client】且
-构造适配器时经 corespine.lazy_extra_import 延迟 import,缺 extra 给「pip install agentspine[…]」
-友好报错。映射逻辑可注入 fake client 离线单测,真实路径只是那一行延迟 import。
+【import-clean】本模块顶层【绝不】import anthropic / openai;真实 SDK 仅在【未注入 client】且构造
+适配器时经 corespine.lazy_extra_import 延迟 import,缺 extra 给「pip install agentspine[…]」友好报错。
+映射逻辑可注入 fake client 离线单测,真实路径只是那一行延迟 import。
 """
 
 from __future__ import annotations
@@ -24,12 +23,29 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from corespine.llm.provider import ChatResult, LLMProvider, Message, MockProvider, ToolCall
+from corespine.llm.provider import (
+    ChatCompletion,
+    Choice,
+    FunctionCall,
+    LLMProvider,
+    MockProvider,
+    ResponseMessage,
+    ToolCall,
+    Usage,
+)
 from corespine.seam.registry import Registry, lazy_extra_import
 
 # 真实 SDK 的 import 名(装了对应 extra 才有);默认离线路径绝不 import 它们。
 _ANTHROPIC_SDK_MODULE = "anthropic"
 _OPENAI_SDK_MODULE = "openai"
+
+# Anthropic stop_reason → OpenAI finish_reason。
+_ANTHROPIC_FINISH = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+}
 
 
 def load_anthropic_sdk() -> Any:
@@ -43,13 +59,14 @@ def load_openai_sdk() -> Any:
 
 
 class AnthropicProvider:
-    """走官方 anthropic SDK 的 LLMProvider 适配器(默认 claude-opus-4-8)。
+    """走官方 anthropic SDK 的 LLMProvider 适配器(默认 claude-opus-4-8);内部转 OpenAI 形状吐出。
 
     构造:未注入 client 时延迟 import anthropic 并建 `Anthropic(**client_kwargs)`(api_key 默认
     从环境 ANTHROPIC_API_KEY 读)。`extra` 透传给 messages.create(如需 thinking / 流式等自行加)。
-    chat:把 messages 里的 system 抽出单独传(Anthropic 原生形状),user/assistant 转 Anthropic
-    messages;tools(OpenAI function-tool 形状)转 Anthropic input_schema;取回 content 里的 text
-    block 拼文本、tool_use block 转 tool_calls,映射 usage。
+    chat:OpenAI messages → Anthropic(system 单独、tool 角色转 tool_result、assistant 的 tool_calls
+    转 tool_use);OpenAI function-tool → Anthropic input_schema;再把 Anthropic 响应转回 OpenAI
+    ChatCompletion(text block → message.content、tool_use → tool_calls(arguments JSON 串)、
+    stop_reason → finish_reason、usage → prompt/completion_tokens)。
     """
 
     def __init__(
@@ -70,14 +87,9 @@ class AnthropicProvider:
         self._client = client
 
     def chat(
-        self, messages: list[Message], *, tools: list[dict[str, Any]] | None = None
-    ) -> ChatResult:
-        system = "\n".join(m.content for m in messages if m.role == "system")
-        convo = [
-            {"role": ("assistant" if m.role == "assistant" else "user"), "content": m.content}
-            for m in messages
-            if m.role != "system"
-        ]
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+    ) -> ChatCompletion:
+        system, convo = _openai_messages_to_anthropic(messages)
         kwargs = dict(self._extra)
         if tools:
             kwargs["tools"] = [_openai_tool_to_anthropic(t) for t in tools]
@@ -88,28 +100,39 @@ class AnthropicProvider:
             messages=convo,
             **kwargs,
         )
-        # content 是 block 列表:text block 拼文本,tool_use block 转 tool_calls。
-        text = "".join(
-            b.text for b in response.content if getattr(b, "type", None) == "text"
-        )
+        text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         tool_calls = tuple(
-            ToolCall(id=b.id, name=b.name, arguments=dict(b.input))
+            ToolCall(id=b.id, function=FunctionCall(name=b.name, arguments=json.dumps(b.input)))
             for b in response.content
             if getattr(b, "type", None) == "tool_use"
         )
-        usage = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-        }
-        return ChatResult(text=text, tool_calls=tool_calls, usage=usage)
+        message = ResponseMessage(
+            role="assistant", content=(text or None), tool_calls=(tool_calls or None)
+        )
+        choice = Choice(
+            index=0,
+            message=message,
+            finish_reason=_ANTHROPIC_FINISH.get(response.stop_reason, "stop"),
+        )
+        usage = Usage(
+            prompt_tokens=response.usage.input_tokens,
+            completion_tokens=response.usage.output_tokens,
+            total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+        )
+        return ChatCompletion(
+            choices=(choice,),
+            usage=usage,
+            model=getattr(response, "model", self._model),
+            id=getattr(response, "id", ""),
+        )
 
 
 class OpenAICompatProvider:
     """走官方 openai SDK 的 LLMProvider 适配器,可配 base_url 覆盖一切「OpenAI 兼容」端点。
 
     model 必填(各兼容端点的模型名不同,无通用默认)。base_url 指向兼容端点(留空即官方 OpenAI)。
-    chat:messages 近 1:1 直传(它本就是 OpenAI 形状),tools 直传,取 choices[0].message 的
-    content 与 tool_calls(arguments 是 JSON 串,解析成 dict),映射 usage(prompt/completion)。
+    chat:messages / tools 直传(本就是 OpenAI 形状),把 SDK 的 OpenAI 响应对象规整成本家 dataclass
+    形状的 ChatCompletion(字段一一对应,arguments 原样保留 JSON 串)。
     """
 
     def __init__(
@@ -131,33 +154,56 @@ class OpenAICompatProvider:
         self._client = client
 
     def chat(
-        self, messages: list[Message], *, tools: list[dict[str, Any]] | None = None
-    ) -> ChatResult:
-        payload = [{"role": m.role, "content": m.content} for m in messages]
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+    ) -> ChatCompletion:
         kwargs = dict(self._extra)
         if tools:
             kwargs["tools"] = tools  # 已是 OpenAI function-tool 形状,直传
         response = self._client.chat.completions.create(
             model=self._model,
-            messages=payload,
+            messages=messages,
             max_tokens=self._max_tokens,
             **kwargs,
         )
-        message = response.choices[0].message
-        text = message.content or ""
-        tool_calls = tuple(
-            ToolCall(
-                id=tc.id,
-                name=tc.function.name,
-                arguments=json.loads(tc.function.arguments or "{}"),
+        choices = tuple(
+            Choice(
+                index=getattr(c, "index", i),
+                finish_reason=getattr(c, "finish_reason", None) or "stop",
+                message=ResponseMessage(
+                    role=c.message.role,
+                    content=c.message.content,
+                    tool_calls=tuple(
+                        ToolCall(
+                            id=tc.id,
+                            function=FunctionCall(
+                                name=tc.function.name, arguments=tc.function.arguments or "{}"
+                            ),
+                        )
+                        for tc in (getattr(c.message, "tool_calls", None) or [])
+                    )
+                    or None,
+                ),
             )
-            for tc in (getattr(message, "tool_calls", None) or [])
+            for i, c in enumerate(response.choices)
         )
-        usage = {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-        }
-        return ChatResult(text=text, tool_calls=tool_calls, usage=usage)
+        u = getattr(response, "usage", None)
+        usage = (
+            Usage(
+                prompt_tokens=u.prompt_tokens,
+                completion_tokens=u.completion_tokens,
+                total_tokens=getattr(u, "total_tokens", u.prompt_tokens + u.completion_tokens),
+            )
+            if u
+            else None
+        )
+        return ChatCompletion(
+            choices=choices,
+            usage=usage,
+            model=getattr(response, "model", self._model),
+            id=getattr(response, "id", ""),
+            created=getattr(response, "created", 0),
+            object=getattr(response, "object", "chat.completion"),
+        )
 
 
 def _openai_tool_to_anthropic(tool: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +214,56 @@ def _openai_tool_to_anthropic(tool: dict[str, Any]) -> dict[str, Any]:
         "description": fn.get("description", ""),
         "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
     }
+
+
+def _openai_messages_to_anthropic(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """OpenAI messages(list[dict])→ (system 字符串, Anthropic messages)。
+
+    system 角色合并进 system 参数;tool 角色转 tool_result block;assistant 的 tool_calls 转
+    tool_use block——让多轮 function-calling 的工具结果能原样喂回 Anthropic。
+    """
+    system_parts: list[str] = []
+    convo: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            system_parts.append(str(content or ""))
+        elif role == "tool":
+            convo.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": m.get("tool_call_id", ""),
+                            "content": str(content or ""),
+                        }
+                    ],
+                }
+            )
+        elif role == "assistant" and m.get("tool_calls"):
+            blocks: list[dict[str, Any]] = []
+            if content:
+                blocks.append({"type": "text", "text": content})
+            for tc in m["tool_calls"]:
+                fn = tc["function"]
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": fn["name"],
+                        "input": json.loads(fn.get("arguments") or "{}"),
+                    }
+                )
+            convo.append({"role": "assistant", "content": blocks})
+        else:
+            convo.append(
+                {"role": "assistant" if role == "assistant" else "user", "content": str(content or "")}
+            )
+    return "\n".join(system_parts), convo
 
 
 # 缝注册表:一个 spec 选实现(离线默认 mock;真实后端 anthropic / openai 各走可选 extra)。

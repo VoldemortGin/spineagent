@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from corespine.llm.provider import LLMProvider, Message
+from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
 
@@ -67,13 +67,21 @@ class LlmAgent:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
-        messages = [Message(role="user", content=task)]
+        messages: list[dict[str, str]] = [{"role": "user", "content": task}]
         if self._system:
-            messages.insert(0, Message(role="system", content=self._system))
+            messages.insert(0, {"role": "system", "content": self._system})
         completion = self._provider.chat(messages)
-        result = AgentResult(
-            agent=self._name, output=completion.text, usage=completion.usage
+        message = completion.choices[0].message
+        usage = (
+            {
+                "prompt_tokens": completion.usage.prompt_tokens,
+                "completion_tokens": completion.usage.completion_tokens,
+                "total_tokens": completion.usage.total_tokens,
+            }
+            if completion.usage is not None
+            else None
         )
+        result = AgentResult(agent=self._name, output=message.content or "", usage=usage)
         _emit_step(trace, self._name, task, result)
         return result
 
@@ -102,11 +110,13 @@ def _emit_step(
     if trace is None:
         return
     usage = result.usage or {}
+    # trace 字段名沿用 input/output_tokens(隐私元数据词表);取值兼容 OpenAI usage 的 prompt/
+    # completion_tokens 与旧式 input/output_tokens 两种键。
     trace.emit(
         "agent_step",
         agent=name,
         task_chars=len(task),
         output_chars=len(result.output),
-        input_tokens=usage.get("input_tokens", 0),
-        output_tokens=usage.get("output_tokens", 0),
+        input_tokens=usage.get("prompt_tokens", usage.get("input_tokens", 0)),
+        output_tokens=usage.get("completion_tokens", usage.get("output_tokens", 0)),
     )
