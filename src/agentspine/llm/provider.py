@@ -35,6 +35,11 @@ from corespine.llm.provider import (
 )
 from corespine.seam.registry import Registry, lazy_extra_import
 
+# 非 OpenAI 原生后端适配器(各自顶层零 SDK、延迟 import;import 它们不破 import-clean)。
+from agentspine.llm.bedrock_provider import BedrockConverseProvider
+from agentspine.llm.cohere_provider import CohereProvider
+from agentspine.llm.gemini_provider import GeminiProvider
+
 # 真实 SDK 的 import 名(装了对应 extra 才有);默认离线路径绝不 import 它们。
 _ANTHROPIC_SDK_MODULE = "anthropic"
 _OPENAI_SDK_MODULE = "openai"
@@ -266,9 +271,13 @@ def _openai_messages_to_anthropic(
     return "\n".join(system_parts), convo
 
 
-# 缝注册表:一个 spec 选实现(离线默认 mock;真实后端 anthropic / openai 各走可选 extra)。
-# entry-point group "corespine.llm":第三方 provider 装包即可被发现(与 corespine README 示例同名)。
+# 缝注册表:一个 spec 选实现(离线默认 mock;真实后端各走可选 extra 延迟 import)。
+# 非 OpenAI 原生后端(anthropic / cohere / …)的适配器把 native 响应转成 OpenAI ChatCompletion;
+# OpenAI 兼容的一律走 openai。entry-point group "corespine.llm":第三方 provider 装包即可被发现。
 llm_providers: Registry[LLMProvider] = Registry("llm")
 llm_providers.register("mock", lambda **kw: MockProvider(**kw))
 llm_providers.register("anthropic", lambda **kw: AnthropicProvider(**kw))
 llm_providers.register("openai", lambda **kw: OpenAICompatProvider(**kw))
+llm_providers.register("cohere", lambda **kw: CohereProvider(**kw))
+llm_providers.register("gemini", lambda **kw: GeminiProvider(**kw))
+llm_providers.register("bedrock", lambda **kw: BedrockConverseProvider(**kw))

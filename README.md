@@ -18,7 +18,7 @@ observability / config 形状;**默认路径离线可跑、import-clean、零网
 | 模块 | 原语 |
 |---|---|
 | `agent/agent.py` | `Agent` 协议 + `LlmAgent`(走 corespine `LLMProvider`,离线用 `MockProvider`)/ `FunctionAgent`(纯函数节点);步级 trace 只记元数据 |
-| `llm/provider.py` | 真实 LLM provider 适配器(挂在 corespine `LLMProvider` 缝后面):`AnthropicProvider`(官方 `anthropic` SDK,默认 `claude-opus-4-8`)/ `OpenAICompatProvider`(官方 `openai` SDK + `base_url`,一个覆盖 OpenAI/Together/Groq/DeepSeek/Ollama/vLLM/Azure)+ `llm_providers` Registry。各走可选 extra 延迟 import,离线默认仍是 `MockProvider`,各用原生 SDK 不 shim |
+| `llm/provider.py` 等 | 真实 LLM provider 适配器(挂在 corespine `LLMProvider` 缝后面;**对外统一 OpenAI chat-completions 形状**):`OpenAICompatProvider`(`openai` SDK + `base_url`,一个吃下 OpenAI/Azure/Together/Groq/DeepSeek/Mistral/xAI/Qwen/Moonshot/Ollama/vLLM/OpenRouter/LiteLLM… 全部 OpenAI 兼容端点)+ 非 OpenAI 原生适配器把 native 转成 OpenAI 形状:`AnthropicProvider`(默认 `claude-opus-4-8`)/ `CohereProvider` / `GeminiProvider` / `BedrockConverseProvider`。`llm_providers` Registry(mock/openai/anthropic/cohere/gemini/bedrock)。各走可选 extra 延迟 import,离线默认仍是 `MockProvider`,各用原生 SDK 不 shim |
 | `agent/policy.py` | `ToolPolicy` 协议 + 离线确定性默认 `SyntaxToolPolicy`(按 `<tool>: <arg>` 语法 + 工具名集合确定性路由,**不假装 LLM 推理**)+ `tool_policies` Registry(`llm` 位留真实推理式接入) |
 | `agent/tool_using.py` | `ToolUsingAgent`:在单次 `step()` 内跑「决策→调工具→把观测喂回(`$prev` 链式)→再决策」的多步循环,带 `max_steps` 守卫;实现 `Agent` 协议故可直接进 `Coordinator` |
 | `agent/as_tool.py` | `AgentTool`:把一个 `Agent` 桥成 `Tool`,让督导 agent 通过工具调用把子任务派给专精子 agent(**分层 / 督导式多 agent**,可层层嵌套) |
@@ -107,22 +107,30 @@ agent.step("敏感任务", trace=sink)               # 只记 agent 名 / 长度
 
 ## 换上真实模型(可选 extra)
 
-`LlmAgent` 全程只认 corespine 的 `LLMProvider` 协议——`complete()` 就是「统一 invoke」。把
-`MockProvider` 换成真实适配器即可,其余代码(agent / 编排 / 工具循环)一行不改:
+**对外统一 OpenAI chat-completions 形状**(LiteLLM 模式):无论后端是谁,`chat(messages, tools)`
+都回 OpenAI 形状的 `ChatCompletion`(`choices[0].message.content/.tool_calls`、`finish_reason`、
+`usage.prompt_tokens`…)。`LlmAgent` 全程只认 corespine 的 `LLMProvider` 协议,把 `MockProvider`
+换成真实适配器即可,其余代码(agent / 编排 / 工具循环)一行不改:
 
 ```bash
-pip install "agentspine[anthropic]"   # 或 agentspine[openai]
+pip install "agentspine[openai]"      # OpenAI 及一切「OpenAI 兼容」端点
+pip install "agentspine[anthropic]"   # 或 [cohere] / [gemini] / [bedrock]
 ```
 
 ```python
-from agentspine import AnthropicProvider, OpenAICompatProvider, LlmAgent
+from agentspine import OpenAICompatProvider, AnthropicProvider, GeminiProvider, LlmAgent
 
-# Anthropic(官方 anthropic SDK;默认 claude-opus-4-8;api_key 默认读 ANTHROPIC_API_KEY)
-planner = LlmAgent("planner", AnthropicProvider())
-
-# 任意「OpenAI 兼容」端点:一个适配器 + base_url 覆盖 OpenAI / Together / Groq / DeepSeek / Ollama / vLLM
+# 一个适配器吃下所有 OpenAI 兼容端点:OpenAI / Azure / Together / Groq / DeepSeek / Mistral /
+# xAI / 通义 Qwen / Moonshot / Ollama / vLLM / OpenRouter / LiteLLM …(换 base_url + model 即可)
+gpt = LlmAgent("gpt", OpenAICompatProvider("gpt-4o"))
 local = LlmAgent("local", OpenAICompatProvider("llama3", base_url="http://localhost:11434/v1"))
+
+# 非 OpenAI 原生模型:原生适配器在内部转成 OpenAI 形状,用户无感
+claude = LlmAgent("claude", AnthropicProvider())                 # 默认 claude-opus-4-8
+gemini = LlmAgent("gemini", GeminiProvider(model="gemini-2.5-flash"))
 ```
 
-> 两个适配器各用各自的【官方 SDK 原生形状】,绝不把 Claude 套进 OpenAI 形状(不做 shim)。默认
-> 离线路径仍是 `MockProvider`,`import agentspine` 永远零网络 SDK(真实 SDK 仅在选用时延迟 import)。
+> 覆盖:**OpenAI 兼容生态(约 85% 主流市场)走 `OpenAICompatProvider` 一把梭**;真正非 OpenAI 形状的
+> Anthropic / Cohere / Gemini / Bedrock 各有原生适配器,把 native 响应转成 OpenAI `ChatCompletion`
+> (绝不把它们套进 OpenAI 形状 = 不 shim)。默认离线路径仍是 `MockProvider`,`import agentspine`
+> 永远零网络 SDK(真实 SDK 仅在选用对应 extra 时延迟 import)。reasoning / citations 等扩展本期丢弃。

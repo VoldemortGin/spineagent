@@ -21,6 +21,9 @@ from agentspine.agent.policy import (
 )
 from agentspine.agent.tool_using import ToolUsingAgent
 from agentspine.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
+from agentspine.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
+from agentspine.llm.cohere_provider import CohereProvider, load_cohere_sdk
+from agentspine.llm.gemini_provider import GeminiProvider, load_gemini_sdk
 from agentspine.llm.provider import (
     AnthropicProvider,
     OpenAICompatProvider,
@@ -77,12 +80,18 @@ __all__ = [
     # orchestration
     "Coordinator",
     "ChainAgent",
-    # llm provider 适配器(挂在 corespine LLMProvider 缝后面)
+    # llm provider 适配器(挂在 corespine LLMProvider 缝后面;输出统一 OpenAI ChatCompletion)
     "AnthropicProvider",
     "OpenAICompatProvider",
+    "CohereProvider",
+    "GeminiProvider",
+    "BedrockConverseProvider",
     "llm_providers",
     "load_anthropic_sdk",
     "load_openai_sdk",
+    "load_cohere_sdk",
+    "load_gemini_sdk",
+    "load_boto3_sdk",
     # protocol: mcp
     "McpClient",
     "McpServer",

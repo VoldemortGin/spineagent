@@ -39,8 +39,13 @@ dev = ["pytest>=8.0.0", "ruff>=0.9.0"]
 mcp = ["mcp"]
 a2a = ["a2a-sdk"]
 # 真实 LLM provider 的可选 extra:各走官方 SDK 延迟 import,默认离线路径(MockProvider)不触碰。
+# OpenAI 兼容端点(Together/Groq/DeepSeek/Mistral/xAI/Qwen/Ollama/vLLM…)统一走 [openai] 的 base_url;
+# 非 OpenAI 原生(anthropic/cohere/…)各有原生适配器、各走自己的 extra。
 anthropic = ["anthropic"]
 openai = ["openai"]
+cohere = ["cohere"]
+gemini = ["google-genai"]
+bedrock = ["boto3"]
 
 [build-system]
 requires = ["hatchling"]
