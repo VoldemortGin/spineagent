@@ -1,6 +1,6 @@
 [project]
 name = "spineagent"
-version = "0.0.2"
+version = "0.0.3"
 description = "Spine 家族的通用多 agent 协作框架:agent / tool / 编排 + MCP / A2A 协议缝(离线优先,依赖 corespine)。"
 readme = "README.md"
 license = "Apache-2.0"
