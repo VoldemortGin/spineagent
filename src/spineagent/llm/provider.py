@@ -34,6 +34,14 @@ from corespine.llm.provider import (
 from corespine.seam.registry import Registry, lazy_extra_import
 
 # 非 OpenAI 原生后端适配器(各自顶层零 SDK、延迟 import;import 它们不破 import-clean)。
+from spineagent.llm._mapping import (
+    AssistantToolCallsTurn,
+    SystemTurn,
+    ToolResultTurn,
+    join_system,
+    normalize_openai_messages,
+    unwrap_function_tool,
+)
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
 from spineagent.llm.cohere_provider import CohereProvider
 from spineagent.llm.gemini_provider import GeminiProvider
@@ -211,12 +219,8 @@ class OpenAICompatProvider:
 
 def _openai_tool_to_anthropic(tool: dict[str, Any]) -> dict[str, Any]:
     """OpenAI function-tool 形状 → Anthropic 工具形状(name/description/input_schema)。"""
-    fn = tool.get("function", tool)
-    return {
-        "name": fn["name"],
-        "description": fn.get("description", ""),
-        "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
-    }
+    name, description, parameters = unwrap_function_tool(tool)
+    return {"name": name, "description": description, "input_schema": parameters}
 
 
 def _openai_messages_to_anthropic(
@@ -224,49 +228,40 @@ def _openai_messages_to_anthropic(
 ) -> tuple[str, list[dict[str, Any]]]:
     """OpenAI messages(list[dict])→ (system 字符串, Anthropic messages)。
 
+    共享 `normalize_openai_messages` 解析成中性 Turn 序列,再按 Turn 类型拼 Anthropic block:
     system 角色合并进 system 参数;tool 角色转 tool_result block;assistant 的 tool_calls 转
     tool_use block——让多轮 function-calling 的工具结果能原样喂回 Anthropic。
     """
-    system_parts: list[str] = []
+    turns = normalize_openai_messages(messages)
     convo: list[dict[str, Any]] = []
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content")
-        if role == "system":
-            system_parts.append(str(content or ""))
-        elif role == "tool":
+    for turn in turns:
+        if isinstance(turn, SystemTurn):
+            continue  # system 由 join_system 汇总
+        elif isinstance(turn, ToolResultTurn):
             convo.append(
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "tool_result",
-                            "tool_use_id": m.get("tool_call_id", ""),
-                            "content": str(content or ""),
+                            "tool_use_id": turn.tool_call_id,
+                            "content": turn.content,
                         }
                     ],
                 }
             )
-        elif role == "assistant" and m.get("tool_calls"):
+        elif isinstance(turn, AssistantToolCallsTurn):
             blocks: list[dict[str, Any]] = []
-            if content:
-                blocks.append({"type": "text", "text": content})
-            for tc in m["tool_calls"]:
-                fn = tc["function"]
+            if turn.text is not None:
+                blocks.append({"type": "text", "text": turn.text})
+            for p in turn.tool_calls:
                 blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": fn["name"],
-                        "input": json.loads(fn.get("arguments") or "{}"),
-                    }
+                    {"type": "tool_use", "id": p.id, "name": p.name, "input": p.arguments}
                 )
             convo.append({"role": "assistant", "content": blocks})
         else:
-            convo.append(
-                {"role": "assistant" if role == "assistant" else "user", "content": str(content or "")}
-            )
-    return "\n".join(system_parts), convo
+            convo.append({"role": turn.role, "content": turn.content})
+    return join_system(turns), convo
 
 
 # 缝注册表:一个 spec 选实现(离线默认 mock;真实后端各走可选 extra 延迟 import)。

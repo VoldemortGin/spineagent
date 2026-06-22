@@ -23,6 +23,15 @@ from corespine.llm.provider import (
 )
 from corespine.seam.registry import lazy_extra_import
 
+from spineagent.llm._mapping import (
+    AssistantToolCallsTurn,
+    SystemTurn,
+    ToolResultTurn,
+    join_system,
+    normalize_openai_messages,
+    unwrap_function_tool,
+)
+
 _BOTO3_SDK_MODULE = "boto3"
 
 # Bedrock Converse stopReason(蛇形)→ OpenAI finish_reason;未知值落 stop。
@@ -100,12 +109,12 @@ def _bedrock_usage(usage: dict[str, Any] | None) -> Usage | None:
 
 def _openai_tool_to_bedrock(tool: dict[str, Any]) -> dict[str, Any]:
     """OpenAI function-tool → Bedrock toolSpec(name/description/inputSchema.json)。"""
-    fn = tool.get("function", tool)
+    name, description, parameters = unwrap_function_tool(tool)
     return {
         "toolSpec": {
-            "name": fn["name"],
-            "description": fn.get("description", ""),
-            "inputSchema": {"json": fn.get("parameters", {"type": "object", "properties": {}})},
+            "name": name,
+            "description": description,
+            "inputSchema": {"json": parameters},
         }
     }
 
@@ -115,48 +124,38 @@ def _openai_messages_to_bedrock(
 ) -> tuple[str, list[dict[str, Any]]]:
     """OpenAI messages → (system 文本, Bedrock Converse messages)。
 
+    共享 `normalize_openai_messages` 解析成中性 Turn 序列,再按 Turn 类型拼 Bedrock block:
     system → system 参数;user/assistant → content[{text}];tool 角色 → toolResult block;
     assistant 的 tool_calls → toolUse block(多轮工具结果可喂回)。
     """
-    system_parts: list[str] = []
+    turns = normalize_openai_messages(messages)
     convo: list[dict[str, Any]] = []
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content")
-        if role == "system":
-            system_parts.append(str(content or ""))
-        elif role == "tool":
+    for turn in turns:
+        if isinstance(turn, SystemTurn):
+            continue  # system 由 join_system 汇总
+        elif isinstance(turn, ToolResultTurn):
             convo.append(
                 {
                     "role": "user",
                     "content": [
                         {
                             "toolResult": {
-                                "toolUseId": m.get("tool_call_id", ""),
-                                "content": [{"text": str(content or "")}],
+                                "toolUseId": turn.tool_call_id,
+                                "content": [{"text": turn.content}],
                             }
                         }
                     ],
                 }
             )
-        elif role == "assistant" and m.get("tool_calls"):
+        elif isinstance(turn, AssistantToolCallsTurn):
             blocks: list[dict[str, Any]] = []
-            if content:
-                blocks.append({"text": content})
-            for tc in m["tool_calls"]:
-                fn = tc["function"]
+            if turn.text is not None:
+                blocks.append({"text": turn.text})
+            for p in turn.tool_calls:
                 blocks.append(
-                    {
-                        "toolUse": {
-                            "toolUseId": tc["id"],
-                            "name": fn["name"],
-                            "input": json.loads(fn.get("arguments") or "{}"),
-                        }
-                    }
+                    {"toolUse": {"toolUseId": p.id, "name": p.name, "input": p.arguments}}
                 )
             convo.append({"role": "assistant", "content": blocks})
         else:
-            convo.append(
-                {"role": "assistant" if role == "assistant" else "user", "content": [{"text": str(content or "")}]}
-            )
-    return "\n".join(system_parts), convo
+            convo.append({"role": turn.role, "content": [{"text": turn.content}]})
+    return join_system(turns), convo

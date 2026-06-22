@@ -23,6 +23,15 @@ from corespine.llm.provider import (
 )
 from corespine.seam.registry import lazy_extra_import
 
+from spineagent.llm._mapping import (
+    AssistantToolCallsTurn,
+    SystemTurn,
+    ToolResultTurn,
+    join_system,
+    normalize_openai_messages,
+    unwrap_function_tool,
+)
+
 _GEMINI_SDK_MODULE = "google.genai"
 
 # Gemini finishReason(大写枚举)→ OpenAI finish_reason;未知值落 stop。
@@ -119,11 +128,11 @@ def _openai_tool_to_gemini(tool: dict[str, Any]) -> dict[str, Any]:
     注:用 parameters_json_schema(承载标准 JSON Schema,与 OpenAI tool 的 parameters 同源)而非
     FunctionDeclaration.parameters(后者是 Gemini 自家 Schema 类型,不是 JSON Schema)。
     """
-    fn = tool.get("function", tool)
+    name, description, parameters = unwrap_function_tool(tool)
     return {
-        "name": fn["name"],
-        "description": fn.get("description", ""),
-        "parameters_json_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        "name": name,
+        "description": description,
+        "parameters_json_schema": parameters,
     }
 
 
@@ -132,42 +141,41 @@ def _openai_messages_to_gemini(
 ) -> tuple[str, list[dict[str, Any]]]:
     """OpenAI messages → (system_instruction, Gemini contents)。
 
+    共享 `normalize_openai_messages` 解析成中性 Turn 序列,再按 Turn 类型拼 Gemini part:
     system → system_instruction;user → role user;assistant → role model;tool 角色 → function_response
-    part;assistant 的 tool_calls → function_call part(让多轮工具结果能喂回 Gemini)。
+    part(用 turn.name——Gemini 的怪癖,见 _mapping);assistant 的 tool_calls → function_call part。
     """
-    system_parts: list[str] = []
+    turns = normalize_openai_messages(messages)
     contents: list[dict[str, Any]] = []
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content")
-        if role == "system":
-            system_parts.append(str(content or ""))
-        elif role == "tool":
+    for turn in turns:
+        if isinstance(turn, SystemTurn):
+            continue  # system 由 join_system 汇总进 system_instruction
+        elif isinstance(turn, ToolResultTurn):
             contents.append(
                 {
                     "role": "user",
                     "parts": [
                         {
                             "function_response": {
-                                "name": m.get("name", m.get("tool_call_id", "")),
-                                "response": {"result": str(content or "")},
+                                "name": turn.name,
+                                "response": {"result": turn.content},
                             }
                         }
                     ],
                 }
             )
-        elif role == "assistant" and m.get("tool_calls"):
+        elif isinstance(turn, AssistantToolCallsTurn):
             parts: list[dict[str, Any]] = []
-            if content:
-                parts.append({"text": content})
-            for tc in m["tool_calls"]:
-                fn = tc["function"]
-                parts.append(
-                    {"function_call": {"name": fn["name"], "args": json.loads(fn.get("arguments") or "{}")}}
-                )
+            if turn.text is not None:
+                parts.append({"text": turn.text})
+            for p in turn.tool_calls:
+                parts.append({"function_call": {"name": p.name, "args": p.arguments}})
             contents.append({"role": "model", "parts": parts})
         else:
             contents.append(
-                {"role": "model" if role == "assistant" else "user", "parts": [{"text": str(content or "")}]}
+                {
+                    "role": ("model" if turn.role == "assistant" else "user"),
+                    "parts": [{"text": turn.content}],
+                }
             )
-    return "\n".join(system_parts), contents
+    return join_system(turns), contents
