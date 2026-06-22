@@ -46,6 +46,8 @@ openai = ["openai"]
 cohere = ["cohere"]
 gemini = ["google-genai"]
 bedrock = ["boto3"]
+# 一键装齐全部协议后端 + LLM provider(不含开发用 dev)。自引用聚合,改子 extra 无需同步维护。
+all = ["spineagent[mcp,a2a,anthropic,openai,cohere,gemini,bedrock]"]
 
 [build-system]
 requires = ["hatchling"]
