@@ -8,6 +8,19 @@ agent / tool / 编排 + MCP / A2A 协议缝。复用 corespine 的缝元模式(P
 【不】在包层面依赖 ragspine。详见 CLAUDE.md 宪章与家族 ADR 0001。
 """
 
+# 运行时类型契约(对齐家族标准):装了 beartype 就在【调用期】对整个包强制每条注解,
+# 与 mypy --strict(静态半边)互补。守护式 import:未装时离线核心照常 import。
+# 务必放在【任何第一方 spineagent.* import 之前】,使 claw 钩子覆盖全包子模块。
+try:
+    from beartype import BeartypeConf
+    from beartype.claw import beartype_this_package
+except ImportError:  # 未装 beartype 时跳过运行时契约
+    pass
+else:
+    # is_pep484_tower=True:采用 PEP 484 隐式数值塔(float 注解亦接受 int),与 mypy /
+    # Python 约定一致——否则 beartype 会把 int-传-float 这类合法调用误判为违规。
+    beartype_this_package(conf=BeartypeConf(is_pep484_tower=True))
+
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
 from spineagent.agent.as_tool import AgentTool
 from spineagent.agent.function_calling import FunctionCallingAgent
@@ -55,7 +68,15 @@ from spineagent.protocol.mcp.seam import (
 from spineagent.tools.function_tool import FunctionTool, function_tool
 from spineagent.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
 
-__version__ = "0.0.1"
+# 版本号动态取自已安装包元数据(单一真相源 = pyproject.toml 的 version),杜绝再与硬编码
+# 字符串漂移;未安装(纯源码场景)取不到时回退到一个常量。
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("spineagent")
+except PackageNotFoundError:  # 未安装(直接从源码树 import)时回退
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     # agent

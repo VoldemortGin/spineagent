@@ -31,7 +31,13 @@ classifiers = [
 ]
 # 默认路径只依赖薄核 corespine,零网络、零重依赖、离线可跑。真实协议 SDK 经下方可选
 # extra 延迟 import,核心绝不背任何网络 SDK 运行时依赖。
-dependencies = ["corespine"]
+dependencies = [
+    "corespine",
+    # 运行时类型契约(对齐家族标准):import/调用期对全包注解强制执行,与 mypy --strict
+    # 的静态半边互补。守护式 import(见 src/spineagent/__init__.py)使其缺失时仍可离线
+    # 运行,但列为核心依赖以保证质量门默认开启。
+    "beartype>=0.18",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "ruff>=0.9.0", "mypy>=1.11"]
