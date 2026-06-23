@@ -268,4 +268,4 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   `never_calls_an_unavailable_tool`、`empty_tools_yields_nonempty_finish`、`decide_is_pure`。
 
 ### `__version__`
-`spineagent.__version__ -> str`(当前 `"0.0.1"`)。
+`spineagent.__version__ -> str`(当前 `"0.0.3"`)。
