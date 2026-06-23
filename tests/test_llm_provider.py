@@ -9,9 +9,11 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from corespine import CorespineError
 from corespine.llm.provider import ChatCompletion, LLMProvider, MockProvider
 
 from spineagent.agent.agent import LlmAgent
+from spineagent.llm.errors import ProviderError
 from spineagent.llm.provider import (
     AnthropicProvider,
     OpenAICompatProvider,
@@ -61,9 +63,13 @@ class _FakeAnthropic:
 
     def create(self, *, model, max_tokens, system, messages, tools=None, **extra):
         self.last = SimpleNamespace(system=system, messages=messages, tools=tools)
-        user = messages[-1]["content"] if messages and isinstance(messages[-1]["content"], str) else ""
+        user = (
+            messages[-1]["content"] if messages and isinstance(messages[-1]["content"], str) else ""
+        )
         if tools:
-            content = [SimpleNamespace(type="tool_use", id="tu1", name="calc", input={"expr": "1+1"})]
+            content = [
+                SimpleNamespace(type="tool_use", id="tu1", name="calc", input={"expr": "1+1"})
+            ]
             stop = "tool_use"
         else:
             content = [
@@ -97,7 +103,9 @@ class _FakeOpenAI:
             message = SimpleNamespace(role="assistant", content=None, tool_calls=[tc])
             finish = "tool_calls"
         else:
-            message = SimpleNamespace(role="assistant", content=f"O[{system}]{user}", tool_calls=None)
+            message = SimpleNamespace(
+                role="assistant", content=f"O[{system}]{user}", tool_calls=None
+            )
             finish = "stop"
         return SimpleNamespace(
             choices=[SimpleNamespace(index=0, message=message, finish_reason=finish)],
@@ -119,12 +127,18 @@ def test_anthropic_output_is_openai_shaped():
     assert msg.content == "A[你是助手]你好"  # 只取 text block,thinking 块被过滤
     assert msg.tool_calls is None
     assert result.choices[0].finish_reason == "stop"  # end_turn → stop
-    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (3, 7, 10)
+    assert (
+        result.usage.prompt_tokens,
+        result.usage.completion_tokens,
+        result.usage.total_tokens,
+    ) == (3, 7, 10)
 
 
 def test_anthropic_separates_system_into_native_shape():
     fake = _FakeAnthropic()
-    AnthropicProvider(client=fake).chat([{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}])
+    AnthropicProvider(client=fake).chat(
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]
+    )
     assert fake.last.system == "sys"  # system 单独传(Anthropic 原生)
     assert fake.last.messages == [{"role": "user", "content": "q"}]
 
@@ -132,7 +146,9 @@ def test_anthropic_separates_system_into_native_shape():
 def test_anthropic_tool_use_becomes_openai_tool_calls():
     fake = _FakeAnthropic()
     result = AnthropicProvider(client=fake).chat(_msgs("", "算 1+1"), tools=[_OPENAI_TOOL])
-    assert fake.last.tools == [{"name": "calc", "description": "算术", "input_schema": {"type": "object"}}]
+    assert fake.last.tools == [
+        {"name": "calc", "description": "算术", "input_schema": {"type": "object"}}
+    ]
     choice = result.choices[0]
     assert choice.finish_reason == "tool_calls"  # tool_use → tool_calls
     assert choice.message.content is None
@@ -148,7 +164,10 @@ def test_anthropic_multi_turn_tool_calls_round_trip():
     assert fake.last.system == "sys"  # system 单独抽出
     assert fake.last.messages == [
         {"role": "user", "content": "q"},
-        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "calc", "input": {"x": 1}}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "c1", "name": "calc", "input": {"x": 1}}],
+        },
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "2"}]},
     ]  # assistant.tool_calls→tool_use、tool 角色→tool_result
     choice = result.choices[0]
@@ -181,7 +200,9 @@ def test_openai_passes_messages_through_natively():
 
 
 def test_openai_tool_calls_preserve_json_arguments():
-    result = OpenAICompatProvider("gpt-x", client=_FakeOpenAI()).chat(_msgs("", "x"), tools=[_OPENAI_TOOL])
+    result = OpenAICompatProvider("gpt-x", client=_FakeOpenAI()).chat(
+        _msgs("", "x"), tools=[_OPENAI_TOOL]
+    )
     choice = result.choices[0]
     assert choice.finish_reason == "tool_calls"
     assert choice.message.content is None
@@ -198,7 +219,9 @@ def test_openai_multi_turn_tool_calls_pass_through_verbatim():
     assert choice.message.content is None
     tc = choice.message.tool_calls[0]
     assert (tc.id, tc.function.name) == ("tc1", "calc")  # fake tool 分支回 id "tc1"
-    assert json.loads(tc.function.arguments) == {"expr": "1+1"}  # fake tool 分支回 '{"expr": "1+1"}'
+    assert json.loads(tc.function.arguments) == {
+        "expr": "1+1"
+    }  # fake tool 分支回 '{"expr": "1+1"}'
 
 
 def test_openai_usage_none_maps_to_none():
@@ -289,3 +312,76 @@ def test_openai_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_openai_sdk()
     assert "pip install spineagent[openai]" in str(ei.value)
+
+
+# ---- H1:vendor 异常归一(ProviderError),程序错照常上抛 -----------------------------
+
+
+class _BoomNetwork(Exception):
+    """模拟 vendor SDK 抛出的网络/超时/API 异常(不真连网络)。"""
+
+
+class _ExplodingAnthropic:
+    """伪 anthropic 客户端:messages.create 一调即抛网络异常。"""
+
+    def __init__(self) -> None:
+        self.messages = self
+
+    def create(self, **kwargs):
+        raise _BoomNetwork("connection reset")
+
+
+class _ExplodingOpenAI:
+    """伪 openai 客户端:chat.completions.create 一调即抛网络异常。"""
+
+    def __init__(self) -> None:
+        self.chat = SimpleNamespace(completions=self)
+
+    def create(self, **kwargs):
+        raise _BoomNetwork("read timeout")
+
+
+def test_provider_error_is_corespine_error_with_stable_code():
+    # ProviderError 继承家族统一基类,code 稳定可 grep(对齐 ragspine 同形 ProviderError)。
+    assert issubclass(ProviderError, CorespineError)
+    assert ProviderError("x").code == "provider.error"
+
+
+def test_anthropic_vendor_exception_is_normalized_to_provider_error():
+    with pytest.raises(ProviderError) as ei:
+        AnthropicProvider(client=_ExplodingAnthropic()).chat(_msgs("", "hi"))
+    assert isinstance(ei.value.__cause__, _BoomNetwork)  # 原异常用 from e 链上
+
+
+def test_openai_vendor_exception_is_normalized_to_provider_error():
+    with pytest.raises(ProviderError) as ei:
+        OpenAICompatProvider("gpt-x", client=_ExplodingOpenAI()).chat(_msgs("", "hi"))
+    assert isinstance(ei.value.__cause__, _BoomNetwork)
+
+
+def test_anthropic_program_error_in_mapping_propagates_not_swallowed():
+    # 响应映射期的程序错(这里 response.content 为 None → 迭代抛 TypeError)绝不被归一成
+    # ProviderError;它落在 try 之外,照常上抛,以免兜底掩盖逻辑 bug。
+    class _BadShapeAnthropic:
+        def __init__(self) -> None:
+            self.messages = self
+
+        def create(self, **kwargs):
+            # 网络调用本身成功,但响应缺 content 字段 → 映射期 AttributeError(程序/契约错)。
+            return SimpleNamespace(stop_reason="end_turn")
+
+    with pytest.raises(AttributeError):
+        AnthropicProvider(client=_BadShapeAnthropic()).chat(_msgs("", "hi"))
+
+
+def test_openai_program_error_in_mapping_propagates_not_swallowed():
+    class _BadShapeOpenAI:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kwargs):
+            # 网络调用成功但响应缺 choices → 映射期 AttributeError(程序/契约错),不归 ProviderError。
+            return SimpleNamespace(usage=None)
+
+    with pytest.raises(AttributeError):
+        OpenAICompatProvider("gpt-x", client=_BadShapeOpenAI()).chat(_msgs("", "hi"))

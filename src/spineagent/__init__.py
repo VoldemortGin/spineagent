@@ -37,6 +37,7 @@ from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import AGENT_INVARIANTS, POLICY_INVARIANTS, TOOL_INVARIANTS
 from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
 from spineagent.llm.cohere_provider import CohereProvider, load_cohere_sdk
+from spineagent.llm.errors import ProviderError
 from spineagent.llm.gemini_provider import GeminiProvider, load_gemini_sdk
 from spineagent.llm.provider import (
     AnthropicProvider,
@@ -112,6 +113,7 @@ __all__ = [
     "CohereProvider",
     "GeminiProvider",
     "BedrockConverseProvider",
+    "ProviderError",
     "llm_providers",
     "load_anthropic_sdk",
     "load_openai_sdk",

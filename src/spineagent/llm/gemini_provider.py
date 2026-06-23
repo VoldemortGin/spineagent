@@ -31,6 +31,7 @@ from spineagent.llm._mapping import (
     normalize_openai_messages,
     unwrap_function_tool,
 )
+from spineagent.llm.errors import ProviderError
 
 _GEMINI_SDK_MODULE = "google.genai"
 
@@ -79,9 +80,14 @@ class GeminiProvider:
             config["tools"] = [
                 {"function_declarations": [_openai_tool_to_gemini(t) for t in tools]}
             ]
-        response = self._client.models.generate_content(
-            model=self._model, contents=contents, config=config or None
-        )
+        # 只包裹 SDK 网络调用:vendor 网络/超时/API 异常归一到 ProviderError;响应映射的程序错
+        # 落在 try 外,照常上抛,不被兜底掩盖。
+        try:
+            response = self._client.models.generate_content(
+                model=self._model, contents=contents, config=config or None
+            )
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"Gemini 调用失败:{exc}") from exc
         candidate = response.candidates[0]
         parts = getattr(candidate.content, "parts", None) or []
         text = "".join(p.text for p in parts if getattr(p, "text", None))
@@ -89,7 +95,8 @@ class GeminiProvider:
             ToolCall(
                 id=f"call_{i}_{p.function_call.name}",  # Gemini 无 id,自造稳定 id
                 function=FunctionCall(
-                    name=p.function_call.name, arguments=json.dumps(dict(p.function_call.args or {}))
+                    name=p.function_call.name,
+                    arguments=json.dumps(dict(p.function_call.args or {})),
                 ),
             )
             for i, p in enumerate(parts)
@@ -103,7 +110,9 @@ class GeminiProvider:
         )
         choice = Choice(index=0, message=message, finish_reason=finish)
         return ChatCompletion(
-            choices=(choice,), usage=_gemini_usage(getattr(response, "usage_metadata", None)), model=self._model
+            choices=(choice,),
+            usage=_gemini_usage(getattr(response, "usage_metadata", None)),
+            model=self._model,
         )
 
 

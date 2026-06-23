@@ -13,6 +13,7 @@ from corespine.llm.provider import ChatCompletion, LLMProvider
 
 from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
 from spineagent.llm.cohere_provider import CohereProvider, load_cohere_sdk
+from spineagent.llm.errors import ProviderError
 from spineagent.llm.gemini_provider import GeminiProvider, load_gemini_sdk
 from spineagent.llm.provider import llm_providers
 
@@ -53,7 +54,9 @@ class _FakeCohere:
         user = next((m["content"] for m in messages if m.get("role") == "user"), "")
         if tools:
             tc = SimpleNamespace(
-                id="c1", type="function", function=SimpleNamespace(name="calc", arguments='{"x": 1}')
+                id="c1",
+                type="function",
+                function=SimpleNamespace(name="calc", arguments='{"x": 1}'),
             )
             message = SimpleNamespace(content=[], tool_calls=[tc])
             finish = "TOOL_CALL"
@@ -72,11 +75,17 @@ def test_cohere_text_maps_to_openai_shape():
     assert result.choices[0].message.content == "C:hi"  # content block 拼成 message.content
     assert result.choices[0].finish_reason == "stop"  # COMPLETE → stop
     assert result.choices[0].message.tool_calls is None
-    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (4, 6, 10)
+    assert (
+        result.usage.prompt_tokens,
+        result.usage.completion_tokens,
+        result.usage.total_tokens,
+    ) == (4, 6, 10)
 
 
 def test_cohere_tool_call_maps_to_openai_tool_calls():
-    result = CohereProvider(client=_FakeCohere()).chat([{"role": "user", "content": "算"}], tools=[_OPENAI_TOOL])
+    result = CohereProvider(client=_FakeCohere()).chat(
+        [{"role": "user", "content": "算"}], tools=[_OPENAI_TOOL]
+    )
     choice = result.choices[0]
     assert choice.finish_reason == "tool_calls"  # TOOL_CALL → tool_calls
     assert choice.message.content is None
@@ -86,7 +95,9 @@ def test_cohere_tool_call_maps_to_openai_tool_calls():
 
 
 def test_cohere_unknown_finish_reason_falls_back_to_stop():
-    result = CohereProvider(client=_FakeCohere(finish_no_tool="SOMETHING_NEW")).chat([{"role": "user", "content": "x"}])
+    result = CohereProvider(client=_FakeCohere(finish_no_tool="SOMETHING_NEW")).chat(
+        [{"role": "user", "content": "x"}]
+    )
     assert result.choices[0].finish_reason == "stop"  # 未知 finish_reason 容忍落 stop
 
 
@@ -110,9 +121,7 @@ def test_cohere_satisfies_protocol_and_registry():
     assert "cohere" in llm_providers.names()
 
 
-@pytest.mark.skipif(
-    _installed("cohere"), reason="cohere 已安装,无法验证缺失报错"
-)
+@pytest.mark.skipif(_installed("cohere"), reason="cohere 已安装,无法验证缺失报错")
 def test_cohere_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_cohere_sdk()
@@ -133,7 +142,11 @@ class _FakeGemini:
     def generate_content(self, *, model, contents, config=None):
         self.last = SimpleNamespace(model=model, contents=contents, config=config)
         if self._with_tool:
-            parts = [SimpleNamespace(text=None, function_call=SimpleNamespace(name="calc", args={"x": 1}))]
+            parts = [
+                SimpleNamespace(
+                    text=None, function_call=SimpleNamespace(name="calc", args={"x": 1})
+                )
+            ]
             finish = "STOP"
         else:
             parts = [SimpleNamespace(text="G:hi", function_call=None)]
@@ -150,12 +163,18 @@ def test_gemini_text_maps_to_openai_shape():
     assert isinstance(result, ChatCompletion)
     assert result.choices[0].message.content == "G:hi"
     assert result.choices[0].finish_reason == "stop"
-    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (5, 8, 13)
+    assert (
+        result.usage.prompt_tokens,
+        result.usage.completion_tokens,
+        result.usage.total_tokens,
+    ) == (5, 8, 13)
 
 
 def test_gemini_function_call_maps_with_synthesized_id_and_json_args():
     fake = _FakeGemini(with_tool=True)
-    result = GeminiProvider(client=fake).chat([{"role": "user", "content": "算"}], tools=[_OPENAI_TOOL])
+    result = GeminiProvider(client=fake).chat(
+        [{"role": "user", "content": "算"}], tools=[_OPENAI_TOOL]
+    )
     # 工具转成 Gemini function_declarations,且用 parameters_json_schema(标准 JSON Schema),非 parameters
     decl = fake.last.config["tools"][0]["function_declarations"][0]
     assert decl["name"] == "calc" and "parameters_json_schema" in decl and "parameters" not in decl
@@ -169,7 +188,9 @@ def test_gemini_function_call_maps_with_synthesized_id_and_json_args():
 
 
 def test_gemini_safety_finish_maps_to_content_filter():
-    result = GeminiProvider(client=_FakeGemini(finish="SAFETY")).chat([{"role": "user", "content": "x"}])
+    result = GeminiProvider(client=_FakeGemini(finish="SAFETY")).chat(
+        [{"role": "user", "content": "x"}]
+    )
     assert result.choices[0].finish_reason == "content_filter"
 
 
@@ -178,11 +199,17 @@ def test_gemini_multi_turn_tool_calls_round_trip():
     fake = _FakeGemini(with_tool=True)
     result = GeminiProvider(client=fake).chat(HISTORY, tools=[_OPENAI_TOOL])
     assert fake.last.config["system_instruction"] == "sys"  # system → system_instruction
-    assert fake.last.contents == [
-        {"role": "user", "parts": [{"text": "q"}]},
-        {"role": "model", "parts": [{"function_call": {"name": "calc", "args": {"x": 1}}}]},
-        {"role": "user", "parts": [{"function_response": {"name": "c1", "response": {"result": "2"}}}]},
-    ]  # assistant.tool_calls→function_call、tool 角色→function_response(name 回落 tool_call_id "c1")
+    assert (
+        fake.last.contents
+        == [
+            {"role": "user", "parts": [{"text": "q"}]},
+            {"role": "model", "parts": [{"function_call": {"name": "calc", "args": {"x": 1}}}]},
+            {
+                "role": "user",
+                "parts": [{"function_response": {"name": "c1", "response": {"result": "2"}}}],
+            },
+        ]
+    )  # assistant.tool_calls→function_call、tool 角色→function_response(name 回落 tool_call_id "c1")
     choice = result.choices[0]
     assert choice.finish_reason == "tool_calls"
     assert choice.message.content is None
@@ -223,15 +250,23 @@ class _FakeBedrock:
 
 
 def test_bedrock_text_maps_to_openai_shape():
-    result = BedrockConverseProvider("anthropic.claude-x", client=_FakeBedrock()).chat([{"role": "user", "content": "hi"}])
+    result = BedrockConverseProvider("anthropic.claude-x", client=_FakeBedrock()).chat(
+        [{"role": "user", "content": "hi"}]
+    )
     assert isinstance(result, ChatCompletion)
     assert result.choices[0].message.content == "B:hi"
     assert result.choices[0].finish_reason == "stop"  # end_turn → stop
-    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (3, 5, 8)
+    assert (
+        result.usage.prompt_tokens,
+        result.usage.completion_tokens,
+        result.usage.total_tokens,
+    ) == (3, 5, 8)
 
 
 def test_bedrock_tooluse_maps_to_openai_tool_calls():
-    result = BedrockConverseProvider("m", client=_FakeBedrock(with_tool=True)).chat([{"role": "user", "content": "算"}], tools=[_OPENAI_TOOL])
+    result = BedrockConverseProvider("m", client=_FakeBedrock(with_tool=True)).chat(
+        [{"role": "user", "content": "算"}], tools=[_OPENAI_TOOL]
+    )
     choice = result.choices[0]
     assert choice.finish_reason == "tool_calls"  # tool_use → tool_calls
     tc = choice.message.tool_calls[0]
@@ -240,7 +275,9 @@ def test_bedrock_tooluse_maps_to_openai_tool_calls():
 
 
 def test_bedrock_guardrail_maps_to_content_filter():
-    result = BedrockConverseProvider("m", client=_FakeBedrock(stop="guardrail_intervened")).chat([{"role": "user", "content": "x"}])
+    result = BedrockConverseProvider("m", client=_FakeBedrock(stop="guardrail_intervened")).chat(
+        [{"role": "user", "content": "x"}]
+    )
     assert result.choices[0].finish_reason == "content_filter"
 
 
@@ -251,8 +288,14 @@ def test_bedrock_multi_turn_tool_calls_round_trip():
     assert fake.last.kwargs["system"] == [{"text": "sys"}]  # system → system 参数
     assert fake.last.messages == [
         {"role": "user", "content": [{"text": "q"}]},
-        {"role": "assistant", "content": [{"toolUse": {"toolUseId": "c1", "name": "calc", "input": {"x": 1}}}]},
-        {"role": "user", "content": [{"toolResult": {"toolUseId": "c1", "content": [{"text": "2"}]}}]},
+        {
+            "role": "assistant",
+            "content": [{"toolUse": {"toolUseId": "c1", "name": "calc", "input": {"x": 1}}}],
+        },
+        {
+            "role": "user",
+            "content": [{"toolResult": {"toolUseId": "c1", "content": [{"text": "2"}]}}],
+        },
     ]  # assistant.tool_calls→toolUse、tool 角色→toolResult
     choice = result.choices[0]
     assert choice.finish_reason == "tool_calls"  # tool_use → tool_calls
@@ -268,9 +311,7 @@ def test_bedrock_registry_and_protocol():
     assert "bedrock" in llm_providers.names()
 
 
-@pytest.mark.skipif(
-    _installed("google.genai"), reason="google-genai 已安装"
-)
+@pytest.mark.skipif(_installed("google.genai"), reason="google-genai 已安装")
 def test_gemini_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_gemini_sdk()
@@ -282,3 +323,62 @@ def test_bedrock_missing_extra_gives_friendly_error():
     with pytest.raises(ImportError) as ei:
         load_boto3_sdk()
     assert "pip install spineagent[bedrock]" in str(ei.value)
+
+
+# ---- H1:三家原生适配器的 vendor 异常归一 + 程序错照常上抛 -----------------------------
+
+
+class _BoomNetwork(Exception):
+    """模拟 vendor SDK 抛出的网络/超时/API 异常(不真连网络)。"""
+
+
+def test_cohere_vendor_exception_is_normalized_to_provider_error():
+    class _Exploding:
+        def chat(self, **kwargs):
+            raise _BoomNetwork("cohere down")
+
+    with pytest.raises(ProviderError) as ei:
+        CohereProvider(client=_Exploding()).chat([{"role": "user", "content": "hi"}])
+    assert isinstance(ei.value.__cause__, _BoomNetwork)
+
+
+def test_gemini_vendor_exception_is_normalized_to_provider_error():
+    class _Exploding:
+        def __init__(self) -> None:
+            self.models = self
+
+        def generate_content(self, **kwargs):
+            raise _BoomNetwork("gemini down")
+
+    with pytest.raises(ProviderError) as ei:
+        GeminiProvider(client=_Exploding()).chat([{"role": "user", "content": "hi"}])
+    assert isinstance(ei.value.__cause__, _BoomNetwork)
+
+
+def test_bedrock_vendor_exception_is_normalized_to_provider_error():
+    class _Exploding:
+        def converse(self, **kwargs):
+            raise _BoomNetwork("bedrock down")
+
+    with pytest.raises(ProviderError) as ei:
+        BedrockConverseProvider("m", client=_Exploding()).chat([{"role": "user", "content": "hi"}])
+    assert isinstance(ei.value.__cause__, _BoomNetwork)
+
+
+def test_native_program_error_in_mapping_propagates_not_swallowed():
+    # 响应映射期的程序错绝不被归一成 ProviderError —— 落在 try 之外照常上抛。
+    # Cohere:网络成功但响应缺 .message 字段 → 映射期 AttributeError。
+    class _BadCohere:
+        def chat(self, **kwargs):
+            return SimpleNamespace(finish_reason="COMPLETE")  # 无 .message
+
+    with pytest.raises(AttributeError):
+        CohereProvider(client=_BadCohere()).chat([{"role": "user", "content": "hi"}])
+
+    # Bedrock:网络成功但响应是缺 "output" 键的 dict → 映射期 KeyError。
+    class _BadBedrock:
+        def converse(self, **kwargs):
+            return {"stopReason": "end_turn"}  # 无 "output"
+
+    with pytest.raises(KeyError):
+        BedrockConverseProvider("m", client=_BadBedrock()).chat([{"role": "user", "content": "hi"}])

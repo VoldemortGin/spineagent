@@ -44,6 +44,7 @@ from spineagent.llm._mapping import (
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
 from spineagent.llm.cohere_provider import CohereProvider
+from spineagent.llm.errors import ProviderError
 from spineagent.llm.gemini_provider import GeminiProvider
 
 # 真实 SDK 的 import 名(装了对应 extra 才有);默认离线路径绝不 import 它们。
@@ -104,13 +105,18 @@ class AnthropicProvider:
         kwargs = dict(self._extra)
         if tools:
             kwargs["tools"] = [_openai_tool_to_anthropic(t) for t in tools]
-        response = self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=system,
-            messages=convo,
-            **kwargs,
-        )
+        # 只包裹 SDK 网络调用:vendor 网络/超时/API 异常归一到 ProviderError;响应映射的程序错
+        # (KeyError/AttributeError 等)落在 try 外,照常上抛,不被兜底掩盖。
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=system,
+                messages=convo,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"Anthropic 调用失败:{exc}") from exc
         text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         tool_calls = tuple(
             ToolCall(id=b.id, function=FunctionCall(name=b.name, arguments=json.dumps(b.input)))
@@ -170,12 +176,16 @@ class OpenAICompatProvider:
         kwargs = dict(self._extra)
         if tools:
             kwargs["tools"] = tools  # 已是 OpenAI function-tool 形状,直传
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            max_tokens=self._max_tokens,
-            **kwargs,
-        )
+        # 只包裹 SDK 网络调用(见 AnthropicProvider 同款注释):vendor 故障归一,程序错照常上抛。
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                max_tokens=self._max_tokens,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"OpenAI 兼容端点调用失败:{exc}") from exc
         choices = tuple(
             Choice(
                 index=getattr(c, "index", i),

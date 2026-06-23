@@ -31,6 +31,7 @@ from spineagent.llm._mapping import (
     normalize_openai_messages,
     unwrap_function_tool,
 )
+from spineagent.llm.errors import ProviderError
 
 _BOTO3_SDK_MODULE = "boto3"
 
@@ -78,7 +79,12 @@ class BedrockConverseProvider:
             kwargs["system"] = [{"text": system}]
         if tools:
             kwargs["toolConfig"] = {"tools": [_openai_tool_to_bedrock(t) for t in tools]}
-        response = self._client.converse(modelId=self._model, messages=convo, **kwargs)
+        # 只包裹 SDK 网络调用:vendor 网络/超时/API 异常归一到 ProviderError;响应映射的程序错
+        # 落在 try 外,照常上抛,不被兜底掩盖。
+        try:
+            response = self._client.converse(modelId=self._model, messages=convo, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"Bedrock 调用失败:{exc}") from exc
         blocks = response["output"]["message"].get("content", []) or []
         text = "".join(b["text"] for b in blocks if "text" in b)
         tool_calls = tuple(
@@ -96,7 +102,9 @@ class BedrockConverseProvider:
         )
         finish = _BEDROCK_FINISH.get(response.get("stopReason"), "stop")
         choice = Choice(index=0, message=message, finish_reason=finish)
-        return ChatCompletion(choices=(choice,), usage=_bedrock_usage(response.get("usage")), model=self._model)
+        return ChatCompletion(
+            choices=(choice,), usage=_bedrock_usage(response.get("usage")), model=self._model
+        )
 
 
 def _bedrock_usage(usage: dict[str, Any] | None) -> Usage | None:
@@ -104,7 +112,11 @@ def _bedrock_usage(usage: dict[str, Any] | None) -> Usage | None:
         return None
     inp = int(usage.get("inputTokens", 0) or 0)
     out = int(usage.get("outputTokens", 0) or 0)
-    return Usage(prompt_tokens=inp, completion_tokens=out, total_tokens=int(usage.get("totalTokens", inp + out)))
+    return Usage(
+        prompt_tokens=inp,
+        completion_tokens=out,
+        total_tokens=int(usage.get("totalTokens", inp + out)),
+    )
 
 
 def _openai_tool_to_bedrock(tool: dict[str, Any]) -> dict[str, Any]:

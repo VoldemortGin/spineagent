@@ -21,6 +21,8 @@ from corespine.llm.provider import (
 )
 from corespine.seam.registry import lazy_extra_import
 
+from spineagent.llm.errors import ProviderError
+
 _COHERE_SDK_MODULE = "cohere"
 
 # Cohere finish_reason(大写)→ OpenAI finish_reason;未知值一律落 stop。
@@ -62,15 +64,24 @@ class CohereProvider:
         kwargs = dict(self._extra)
         if tools:
             kwargs["tools"] = tools  # Cohere v2 tools 已是 OpenAI function-tool 形状,直传
-        response = self._client.chat(model=self._model, messages=messages, **kwargs)
+        # 只包裹 SDK 网络调用:vendor 网络/超时/API 异常归一到 ProviderError;响应映射的程序错
+        # 落在 try 外,照常上抛,不被兜底掩盖。
+        try:
+            response = self._client.chat(model=self._model, messages=messages, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"Cohere 调用失败:{exc}") from exc
         message = response.message
         text = "".join(
-            b.text for b in (getattr(message, "content", None) or []) if getattr(b, "type", None) == "text"
+            b.text
+            for b in (getattr(message, "content", None) or [])
+            if getattr(b, "type", None) == "text"
         )
         tool_calls = tuple(
             ToolCall(
                 id=tc.id,
-                function=FunctionCall(name=tc.function.name, arguments=tc.function.arguments or "{}"),
+                function=FunctionCall(
+                    name=tc.function.name, arguments=tc.function.arguments or "{}"
+                ),
             )
             for tc in (getattr(message, "tool_calls", None) or [])
         )
@@ -79,7 +90,11 @@ class CohereProvider:
         )
         finish = _COHERE_FINISH.get(str(getattr(response, "finish_reason", None) or ""), "stop")
         choice = Choice(index=0, message=result_message, finish_reason=finish)
-        return ChatCompletion(choices=(choice,), usage=_cohere_usage(getattr(response, "usage", None)), model=self._model)
+        return ChatCompletion(
+            choices=(choice,),
+            usage=_cohere_usage(getattr(response, "usage", None)),
+            model=self._model,
+        )
 
 
 def _cohere_usage(usage: Any) -> Usage | None:
