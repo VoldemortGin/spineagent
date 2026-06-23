@@ -1,0 +1,44 @@
+{{- if .Values.job.enabled }}
+# spineagent 默认工作负载：一次性离线 demo（examples/quickstart.py）——对应 compose 的 demo 服务。
+# Job = run-to-completion：跑完打印 "spineagent OK" 并 exit 0；这是 spineagent 唯一现成的可运行入口。
+# 无端口、无健康探针(退出码即信号)、无卷(不落盘)、无 redis/db(stateless)。
+#
+# 注意：Job 的 spec 多为不可变字段，helm upgrade 重跑 demo 时若报 immutable，先 helm uninstall 再 install，
+# 或给本资源加 Helm hook（按需，本默认不加以保持最简）。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "spineagent.fullname" . }}-demo
+  labels:
+    {{- include "spineagent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo
+spec:
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "spineagent.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: demo
+    spec:
+      restartPolicy: Never
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: demo
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.job.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with (include "spineagent.envFrom" .) }}
+          envFrom:
+            {{- . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.job.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

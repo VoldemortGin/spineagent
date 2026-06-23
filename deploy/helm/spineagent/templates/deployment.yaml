@@ -1,0 +1,50 @@
+{{- if .Values.server.enabled }}
+# 【前瞻骨架·默认关闭】HTTP server Deployment ——
+# 诚实说明：spineagent 当前【没有】任何 HTTP server / FastAPI / uvicorn,也无 /healthz。
+# 本模板纯为「将来 spineagent 长出 server 入口」预留结构(与 ragspine 的 server-deployment 对齐),
+# 由 server.enabled=true 显式开启,届时把 server.command 指向真实启动脚本(须含 --host 0.0.0.0)。
+# 默认 enabled=false —— 现在打开它也无 server 可启,故默认关闭才诚实。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "spineagent.fullname" . }}-server
+  labels:
+    {{- include "spineagent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: {{ .Values.server.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "spineagent.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        {{- include "spineagent.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.server.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.containerPort }}
+              protocol: TCP
+          {{- with (include "spineagent.envFrom" .) }}
+          envFrom:
+            {{- . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

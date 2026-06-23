@@ -1,0 +1,31 @@
+# spineagent —— Kubernetes Helm chart（落地 deploy/README.md 的 Helm「后续步骤」）。
+#
+# 与 deploy/compose.yaml 同源同设计,但【诚实贴合 spineagent 的真实形态】:
+# spineagent 是通用多 agent 协作【库】,不是常驻服务 —— 无 HTTP server、无 worker、无 redis/db、
+# 无 SPINEAGENT_* 旋钮、不落盘。镜像默认跑 examples/quickstart.py(一次性离线 demo,exit 0=健康)。
+#
+# 因此本 chart 的【默认工作负载是一个 Job】(run-to-completion 烟雾测试),而非 Deployment+Service。
+# 与兄弟包 ragspine 对齐的是:【同一个镜像 + 离线默认(mock provider,零 key)+ 真实后端经
+# values.yaml/env 旋钮选择性接入】这套元模式,以及 chart 的结构(Chart/values/templates 同构)。
+# 差异之处在 values.yaml 与各模板里就地标注。
+#
+# appVersion 跟随 pyproject.toml 的项目版本;version 是 chart 自身的 SemVer。
+apiVersion: v2
+name: spineagent
+description: spineagent —— framework-free 通用多 agent 协作框架（离线默认 + 真实 LLM/协议后端可选;库形态,默认部署为一次性 Job）
+type: application
+# chart 自身版本（与应用版本解耦）。
+version: 0.1.0
+# 应用版本 = 当前 pyproject.toml 的 version。
+appVersion: "0.0.3"
+keywords:
+  - multi-agent
+  - agent
+  - orchestration
+  - mcp
+  - a2a
+home: https://github.com/lin-han/spineagent
+sources:
+  - https://github.com/lin-han/spineagent
+maintainers:
+  - name: lin han

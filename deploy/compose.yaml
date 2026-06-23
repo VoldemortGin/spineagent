@@ -1,0 +1,48 @@
+# spineagent —— 一键自托管 Docker Compose 编排（落地 deploy/README.md）。
+#
+# 【诚实边界·先读这一段】spineagent 是 Spine 家族的通用多 agent 协作【库】,
+# 不是常驻服务:它【没有】HTTP server、【没有】worker / 队列消费者、【没有】redis / 数据库、
+# 【没有】任何 SPINEAGENT_* 环境旋钮、【不】落盘。镜像默认 CMD 跑 examples/quickstart.py ——
+# 一个【一次性、零网络、跑完即退（exit 0=健康）】的离线 demo。
+#
+# 因此本 compose 与兄弟包 ragspine 的设计【同源但不照搬】:
+#   - 对齐:【一个镜像 + 离线默认（mock provider,零 key)+ 真实后端经 env 旋钮选择性接入】。
+#   - 差异:ragspine 是 server + worker + redis 的常驻栈;spineagent 只有【一个一次性 demo 角色】,
+#           故 restart: "no"(跑完即退,不重启)、无 redis/postgres、无命名卷、无健康探针(退出码即信号)。
+#
+# spineagent 自身【不读任何 SPINEAGENT_* 变量】(其 src/ 对 os.environ 零引用)。唯一有效的
+# 运行时变量是【真实 LLM provider 的 *_API_KEY】(ANTHROPIC_API_KEY / OPENAI_API_KEY / …),
+# 且【仅当】你把代码改成显式选用真实 provider 时才被对应厂商 SDK 读取;默认 demo 走 MockProvider,
+# 无需任何 key。这些 key 经 env_file 注入,故下方 environment 不重复列出(避免伪旋钮)。
+#
+# 【build context = 家族根】:spineagent 在 dependencies 里写着 corespine,但 corespine 尚未发 PyPI
+# (本地是 uv path source 指向 ../corespine)。Docker 的 COPY 只能取 context 内文件,而包根
+# spineagent/ 看不到兄弟目录 corespine/。故 context 抬到家族根(deploy/ 的上两级 = ~/workspace/spine),
+# Dockerfile 才能同时 COPY 进 corespine/ 与 spineagent/,按 corespine→spineagent 顺序可编辑安装。
+# 详见 deploy/Dockerfile 与 deploy/README.md。
+#
+# 用法见 deploy/README.md。本机静态校验(无需真起容器):
+#   docker compose -f deploy/compose.yaml config
+#   python -c "import yaml; yaml.safe_load(open('deploy/compose.yaml')); print('compose YAML OK')"
+#
+# 需要 Docker Compose v2.24+（env_file 的 path/required 长式语法）。
+name: spineagent
+
+services:
+  # 一次性离线 demo（examples/quickstart.py）。跑完打印 "spineagent OK" 并 exit 0。
+  # 这是 spineagent 唯一可运行的容器角色 —— 它是库的自带烟雾测试,不是常驻服务。
+  demo:
+    build:
+      # context = 家族根(deploy/ 的上两级),COPY 才能同时取到兄弟包 corespine/ 与 spineagent/。
+      context: ../..
+      # dockerfile 路径相对【context 根(家族根)】,故带上 spineagent/ 前缀。
+      dockerfile: spineagent/deploy/Dockerfile
+    image: spineagent:local
+    # 一次性 job 语义:跑完即退,【不】重启(常驻服务才用 unless-stopped)。
+    restart: "no"
+    # env_file 仅注入【机密】(*_API_KEY)。required:false —— 未创建 deploy/.env 时离线默认仍可直接跑。
+    # 默认 demo 走 MockProvider,这些 key 全不需要;它们只在你显式接真实 provider 时由厂商 SDK 读取。
+    env_file:
+      - path: .env
+        required: false
+    # 默认 command 即镜像 CMD（离线 demo）。如需在容器内跑别的入口,可在此覆盖 command。

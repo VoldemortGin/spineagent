@@ -1,0 +1,21 @@
+{{- if .Values.server.enabled }}
+# 【前瞻骨架·默认关闭】ClusterIP Service —— 把 server pod 端口暴露为集群内 <fullname>:port。
+# 诚实说明：spineagent 当前无 HTTP server,故无端口可暴露;本 Service 随 server.enabled 一同开启。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spineagent.fullname" . }}
+  labels:
+    {{- include "spineagent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.server.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "spineagent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+{{- end }}

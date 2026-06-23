@@ -1,0 +1,79 @@
+# ============================================================================
+# spineagent Helm chart 默认值 —— 镜像 deploy/compose.yaml 的设计,诚实贴合「库」形态。
+#
+# 【先读这一段·诚实边界】spineagent 是通用多 agent 协作【库】,不是常驻服务:
+#   - 无 HTTP server、无 worker / 队列、无 redis / 数据库、不落盘;
+#   - 其 src/ 对 os.environ【零引用】—— 没有任何 SPINEAGENT_* 应用旋钮,配置纯走 Python 代码。
+# 故本 chart【默认渲染一个 Job】(跑 examples/quickstart.py:一次性、零网络、exit 0=健康),
+# 而非 Deployment+Service+Ingress。后三者作为【前瞻骨架】保留(结构对齐 ragspine、备将来 spineagent
+# 真长出 HTTP server 时启用),默认全部【关闭】—— 现在打开它们也无 server 可指,故默认 off 才诚实。
+#
+# 与 ragspine 对齐的元模式:【同一镜像 + 离线默认(mock provider,零 key)+ 真实后端经 values 旋钮】。
+# 与 ragspine 的差异:这里没有 vectorStore/embedding/persistence/redis/postgres/qdrant 这些
+# RAG-特定旋钮(它们是 ragspine 领域概念,搬过来即伪旋钮)。
+# ============================================================================
+
+# 部分名称覆盖（一般留空，用 release 名 + chart 名自动拼装 fullname）。
+nameOverride: ""
+fullnameOverride: ""
+
+# ---- 镜像：所有角色（Job / 可选 Deployment）共用同一镜像 ------------------------
+image:
+  # 镜像仓库与 tag。本地 kind 验证时先 build 出 spineagent:local：
+  #   docker build -f spineagent/deploy/Dockerfile -t spineagent:local ~/workspace/spine
+  # 再 `kind load docker-image spineagent:local` 灌进 kind 节点（否则 IfNotPresent 找不到镜像）。
+  repository: spineagent
+  tag: local
+  # 本地镜像用 IfNotPresent：避免 k8s 去远端 registry 拉一个本地构建的 tag。
+  pullPolicy: IfNotPresent
+
+# ---- 默认工作负载：一次性离线 demo Job（spineagent 唯一现成的可运行入口）-----------
+# 跑 examples/quickstart.py，跑完打印 "spineagent OK" 并 exit 0。Job 语义=run-to-completion。
+job:
+  enabled: true
+  # 失败重试次数（demo 是确定性的，0 表示不重试，跑挂即视为回归信号）。
+  backoffLimit: 0
+  # 默认 command 即镜像 CMD（离线 demo）；非空则覆盖。例:["python","-c","import spineagent;print('ok')"]
+  command: []
+  resources: {}
+
+# ---- 前瞻骨架：HTTP server（默认关闭，spineagent 当前【没有】server）---------------
+# 诚实说明：spineagent 不含任何 HTTP server / FastAPI / uvicorn,也无 /healthz。打开此开关
+# 现在【无意义】(无 server 可启)——它纯为「将来 spineagent 长出 server 入口」预留结构,届时把
+# command 指向真实启动脚本、把 enabled 置 true 即可复用本 chart 的 Deployment+Service+Ingress。
+server:
+  enabled: false
+  replicaCount: 1
+  # 将来真实 server 的启动命令（须含 --host 0.0.0.0 之类对外可达参数）；现在留空=无可启。
+  command: []
+  # 容器监听端口（将来 server 启用时生效）。
+  containerPort: 8000
+  service:
+    port: 8000
+  resources: {}
+
+# ---- 机密 -> 仅当填值时才渲染一个 Secret，并作为 env 注入（厂商 SDK 自行读取）---------
+# 这些是 *_API_KEY（非 SPINEAGENT_* 旋钮，spineagent 没有那种旋钮）：仅当你把入口改成显式选用
+# 真实 LLM provider 时，对应厂商 SDK 才从环境读取。默认离线 demo 走 MockProvider，全留空即可。
+secrets:
+  # AnthropicProvider 选用时由 anthropic SDK 读取（需镜像装了 spineagent[anthropic]）。
+  anthropicApiKey: ""
+  # OpenAICompatProvider 选用时由 openai SDK 读取（需镜像装了 spineagent[openai]）。
+  openaiApiKey: ""
+
+# ---- 额外非机密环境变量（逃生舱，默认空）---------------------------------------
+# spineagent 没有内建 SPINEAGENT_* 旋钮，故这里【不】预置任何键（预置即伪旋钮）。
+# 如你的自定义入口确需读某个非机密 env，可在此以 key: value 形式追加，会注入到 ConfigMap。
+extraEnv: {}
+
+# ---- 容器安全上下文 -----------------------------------------------------------
+# 基础镜像（uv:python3.11-bookworm-slim）默认以 root 跑且不落盘，这里不强加 fsGroup（无卷需改属主）。
+# 如你的集群有 PodSecurity 限制，可在此填 runAsNonRoot / runAsUser 等。
+podSecurityContext: {}
+
+# ---- Ingress（默认关闭；依赖 server.enabled，当前无 server 可暴露）------------------
+ingress:
+  enabled: false
+  className: ""
+  host: spineagent.local
+  annotations: {}

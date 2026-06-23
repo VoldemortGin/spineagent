@@ -1,0 +1,8 @@
+# 打包 chart 时排除的文件（helm package / helm install 时忽略）。
+.DS_Store
+.git/
+.gitignore
+*.tmp
+*.bak
+*.swp
+*.orig

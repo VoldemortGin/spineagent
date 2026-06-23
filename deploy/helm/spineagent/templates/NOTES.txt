@@ -1,0 +1,33 @@
+spineagent 已安装：release "{{ .Release.Name }}"（namespace "{{ .Release.Namespace }}"）。
+
+【诚实提示】spineagent 是通用多 agent 协作【库】,不是常驻服务 —— 无 HTTP server、无 worker、
+无 redis/db、不落盘。本 chart 默认渲染一个【一次性离线 demo Job】(examples/quickstart.py),
+跑完打印 "spineagent OK" 并 exit 0(退出码即健康信号)。
+
+配置概览：
+  默认 demo Job   = {{ .Values.job.enabled }}（一次性，跑完即退）
+  HTTP server     = {{ .Values.server.enabled }}{{ if not .Values.server.enabled }}（spineagent 当前无 server，故关闭；前瞻骨架，备将来）{{ end }}
+  额外 env(extraEnv) = {{ if .Values.extraEnv }}已设{{ else }}无（spineagent 无内建 SPINEAGENT_* 旋钮）{{ end }}
+  机密(API key)   = {{ if include "spineagent.hasSecrets" . }}已设{{ else }}无（默认 MockProvider，零 key）{{ end }}
+
+{{- if .Values.job.enabled }}
+
+1) 查看 demo Job 状态并读日志（应见结尾 "spineagent OK"）：
+
+  kubectl --namespace {{ .Release.Namespace }} get job/{{ include "spineagent.fullname" . }}-demo
+  kubectl --namespace {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=demo
+
+2) 等待跑完（run-to-completion）：
+
+  kubectl --namespace {{ .Release.Namespace }} wait --for=condition=complete job/{{ include "spineagent.fullname" . }}-demo --timeout=120s
+{{- end }}
+{{- if .Values.server.enabled }}
+
+注意：server.enabled=true,但 spineagent 当前【没有】真实 HTTP server 入口 ——
+请确认 values.server.command 指向了一个真实存在的启动脚本(否则容器将因找不到入口而失败)。
+{{- end }}
+{{- if and (include "spineagent.hasSecrets" .) (not .Values.server.enabled) }}
+
+注意：已设 API key,但默认 demo 走离线 MockProvider、不读这些 key ——
+key 仅在你把入口改成显式选用真实 LLM provider 时由对应厂商 SDK 读取。
+{{- end }}

@@ -1,0 +1,30 @@
+{{- if and .Values.ingress.enabled .Values.server.enabled }}
+# 【前瞻骨架·默认关闭】可选 Ingress —— 把 server Service 暴露到集群外的 host。
+# 诚实说明：依赖 server.enabled(spineagent 当前无 server),故 ingress.enabled 单独打开亦无效;
+# 须同时 server.enabled=true 才渲染。与 ragspine 的 ingress 模板对齐,备将来 server 落地后启用。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "spineagent.fullname" . }}
+  labels:
+    {{- include "spineagent.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "spineagent.fullname" . }}
+                port:
+                  number: {{ .Values.server.service.port }}
+{{- end }}
