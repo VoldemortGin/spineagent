@@ -1,0 +1,82 @@
+# Release → PyPI via Trusted Publishing (OIDC — NO stored token / secret).
+#
+# 与家族 corespine / ragspine / pdfspine 的发布模型对齐:发布 GitHub Release 时触发,`gate`
+# 跑与 ci.yml 同形的四道门(ruff format + ruff + mypy --strict + pytest,跨 3.10/3.11/3.12),
+# 全绿后 `publish` 才 build sdist + wheel 并上传 `spineagent` 分发包。发布版本以 pyproject.toml
+# 的 version 为准(与 tag 保持同步),不从 tag 推导。
+#
+# ── 依赖 corespine 的处理 ──────────────────────────────────────────────────────────────
+# spineagent 依赖薄核 corespine(已在 PyPI,>=0.1.1)。gate 用 `uv pip install --no-sources`
+# 忽略 pyproject 里指向 ../corespine 的本地 path source(那只服务本地开发),强制从 PyPI 装
+# corespine —— 与 ci.yml 同一套装法。publish 阶段 `python -m build` 走标准 PEP 517(hatchling),
+# 天然不读 [tool.uv.sources],产出的 wheel 依赖恒为 `corespine>=0.1.1`(PyPI),无本地路径泄漏。
+#
+# ── 一次性 PyPI 设置(网页端,需账号登录)──────────────────────────────────────────────
+# `spineagent` 项目【已存在】于 PyPI(0.0.x 曾手动 twine 上传),故【不】走 pending publisher,
+# 而是直接给现有项目加 trusted publisher(同 ragspine 的既有项目做法):
+#   PyPI → Manage → spineagent → Publishing → "Add a new publisher":
+#     Owner: VoldemortGin   Repository: spineagent   Workflow: release.yml   Environment: (留空)
+#   配置完成前 `publish` 会以 "not authorized" 失败——在此之前本 workflow 实质 dormant
+#   (不发 Release 即不触发)。
+#
+# ── 切一个 release ───────────────────────────────────────────────────────────────────
+# 在 pyproject.toml bump `version`(须【大于】PyPI 现有的 0.0.3,如 0.0.4;PyPI 拒绝重传同版本),
+# 提交,然后发布一个 GitHub Release(tag 如 v0.0.4)。
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  gate:
+    name: gate (py${{ matrix.python }})
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (+ Python ${{ matrix.python }})
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 建 venv 并可编辑安装 spineagent[dev];corespine 从 PyPI 解析(--no-sources 忽略
+      # pyproject 里指向 ../corespine 的本地 path source,该 source 只服务本地开发)。
+      - name: Install (spineagent[dev]; corespine from PyPI)
+        run: |
+          uv venv .venv
+          VIRTUAL_ENV="$(pwd)/.venv" uv pip install --no-sources -e ".[dev]"
+
+      # 四道门与 ci.yml 同形(格式 / lint / 类型 / 测试),经 Makefile 复用同一套命令。
+      - name: Format check (ruff format --check)
+        run: make fmt-check
+
+      - name: Lint (ruff)
+        run: make lint
+
+      - name: Typecheck (mypy --strict)
+        run: make typecheck
+
+      - name: Test (pytest)
+        run: make test
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC — Trusted Publishing 所需。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install -U build
+          python -m build
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1

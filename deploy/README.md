@@ -59,10 +59,15 @@ docker compose -f deploy/compose.yaml up --build
 
 ## 为什么 context 是家族根而不是包根
 
-`spineagent` 在 `dependencies` 里写着 `corespine`,但 `corespine` 还没发到 PyPI(本地是 uv
-path source 指向 `../corespine`)。Docker 的 `COPY` 只能取 **build context 内**的文件,而包根
-`spineagent/` 里看不到兄弟目录 `corespine/`。把 context 抬到家族根,镜像才能同时 `COPY` 进两个
-包,并按 `corespine → spineagent` 的顺序可编辑安装 —— 与本地 `make install` 完全一致。
+`spineagent` 在 `dependencies` 里写着 `corespine`,而本镜像刻意【从家族源码可编辑安装】它
+(与本地 `make install` 一致:按 `corespine → spineagent` 顺序 `-e` 装两个包),好让镜像从
+单次家族 checkout 自包含复现。Docker 的 `COPY` 只能取 **build context 内**的文件,而包根
+`spineagent/` 里看不到兄弟目录 `corespine/`,故把 context 抬到家族根,镜像才能同时 `COPY` 进
+两个包。
+
+> 注:`corespine` 现已发布到 PyPI(`>=0.1.1`),故此处「源码可编辑装 corespine」是**设计选择**
+> (monorepo 单 checkout 可复现)而非必需 —— 亦可改为从 PyPI 装 `corespine`、把 context 收回
+> 包根 `spineagent/`。当前镜像保留源码构建以对齐本地开发布局。
 
 ## 关于 `.dockerignore`
 

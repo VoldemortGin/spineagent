@@ -15,11 +15,11 @@
 # 且【仅当】你把代码改成显式选用真实 provider 时才被对应厂商 SDK 读取;默认 demo 走 MockProvider,
 # 无需任何 key。这些 key 经 env_file 注入,故下方 environment 不重复列出(避免伪旋钮)。
 #
-# 【build context = 家族根】:spineagent 在 dependencies 里写着 corespine,但 corespine 尚未发 PyPI
-# (本地是 uv path source 指向 ../corespine)。Docker 的 COPY 只能取 context 内文件,而包根
-# spineagent/ 看不到兄弟目录 corespine/。故 context 抬到家族根(deploy/ 的上两级 = ~/workspace/spine),
+# 【build context = 家族根】:本镜像刻意从家族源码可编辑安装 corespine(与本地 make install 一致),
+# 好让镜像从单次 checkout 自包含复现。Docker 的 COPY 只能取 context 内文件,而包根 spineagent/
+# 看不到兄弟目录 corespine/。故 context 抬到家族根(deploy/ 的上两级 = ~/workspace/spine),
 # Dockerfile 才能同时 COPY 进 corespine/ 与 spineagent/,按 corespine→spineagent 顺序可编辑安装。
-# 详见 deploy/Dockerfile 与 deploy/README.md。
+# (corespine 现已发 PyPI >=0.1.1,故这是设计选择而非必需;详见 deploy/Dockerfile 与 deploy/README.md。)
 #
 # 用法见 deploy/README.md。本机静态校验(无需真起容器):
 #   docker compose -f deploy/compose.yaml config
