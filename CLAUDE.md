@@ -30,7 +30,7 @@ agent 协议缝。它是家族里【演进最快】的成员,刻意单开独立�
 ```
 src/spineagent/
   agent/agent.py            Agent 协议 + LlmAgent(走 corespine LLMProvider)/ FunctionAgent(纯函数)
-  llm/provider.py           真实 LLM provider 适配器(对外统一 OpenAI chat-completions 形状):OpenAICompatProvider(openai SDK + base_url 吃下所有 OpenAI 兼容端点)+ AnthropicProvider(默认 claude-opus-4-8);llm_providers Registry。各走可选 extra 延迟 import,离线默认仍 MockProvider。
+  llm/provider.py           真实 LLM provider 适配器(对外统一 OpenAI chat-completions 形状):OpenAICompatProvider(openai SDK + base_url 吃下所有 OpenAI 兼容端点)+ AnthropicProvider(默认 claude-opus-4-8);二者【额外】实现 StreamingLLMProvider 叠加协议(stream_chat → ChatCompletionChunk,流式拼接 == 非流式)。llm_providers Registry。各走可选 extra 延迟 import,离线默认仍 MockProvider。
   llm/cohere_provider.py    CohereProvider:Cohere v2 native → OpenAI ChatCompletion([cohere] extra)
   llm/gemini_provider.py    GeminiProvider:Gemini generateContent native → OpenAI ChatCompletion([gemini] extra,同覆盖 Vertex Gemini)
   llm/bedrock_provider.py   BedrockConverseProvider:AWS Bedrock Converse native → OpenAI ChatCompletion([bedrock] extra,Converse 跨模型同形)
@@ -38,6 +38,8 @@ src/spineagent/
   agent/tool_using.py       ToolUsingAgent:离线确定性多步循环(SyntaxToolPolicy 语法路由),带 max_steps 守卫;实现 Agent 协议
   agent/function_calling.py FunctionCallingAgent:真 LLM function-calling 多步循环(FunctionTool schema → chat(tools=) → tool_calls → 执行 → OpenAI tool 角色喂回 → 再 chat);实现 Agent 协议,底层换任意 provider 不改一行
   agent/as_tool.py          AgentTool:把 Agent 桥成 Tool(分层 / 督导式多 agent:督导 agent 通过工具调用派活给子 agent,可嵌套)
+  agent/artifact.py         artifact 缝:Artifact(字节/文本 + mime + name + producer provenance)+ ArtifactSink 协议(store/fetch)+ 离线默认(InProcessArtifactSink / 组合 corespine BlobStore 的 BlobArtifactSink)+ artifact_sinks Registry;AgentResult.artifacts 挂交付物引用
+  agent/builtin/deep_research.py  DeepResearchAgent:纯组合(planner 分解 + Coordinator 并行检索 + LlmAgent 综合)装配的预置深研 agent,实现 Agent 协议;离线默认 MockProvider + 空 tools,真实效果靠注入 provider/tools
   agent/middleware.py       Middleware 缝:协议(before_step / after_step)+ MiddlewareAgent 有序洋葱链包裹任意 Agent(组合完仍是 Agent)+ 离线内置四件套(TokenUsage / Summary / DynamicTool / Attachment)+ middlewares Registry;trace 只记计数,零正文泄漏
   sandbox/seam.py           Sandbox 缝:协议(run(code, *, timeout, limits) -> SandboxResult)+ 离线确定性默认 InProcessSandbox(受限白名单 AST 求值器,构造即保证无网络出口 / 无文件系统逃逸,ops / output 上限)+ sandboxes Registry;真实硬隔离后端 subprocess / container 走 [sandbox] extra 延迟 import
   skills/skill.py           Skill 缝:SkillSpec(manifest)+ 协议(describe() 确定性 schema / invoke(args) 带 provenance)+ 离线默认 FixtureSkill(脚本经 Sandbox 隔离执行)+ skill_registry Registry
@@ -49,7 +51,7 @@ src/spineagent/
   orchestration/chain.py        ChainAgent:把一串 agent 串成单个 Agent(流水线即一等可组合单元:可进 Coordinator / 当工具 / 套 chain)
   protocol/mcp/seam.py      McpClient / McpServer 协议 + OfflineMcpStub(离线回环)+ McpClientTool(MCP 工具→Tool)+ 延迟真实 SDK
   protocol/a2a/seam.py      A2AAgent 协议 + OfflineA2AStub(离线回环)+ A2AAgentAdapter(A2A→Agent)+ 延迟真实 SDK
-  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / SANDBOX / SKILL / MIDDLEWARE_INVARIANTS)
+  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / STREAMING / SANDBOX / SKILL / MIDDLEWARE / ARTIFACT_INVARIANTS)
 ```
 
 ## 跑(始终从包根)

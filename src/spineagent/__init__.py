@@ -31,6 +31,7 @@ from spineagent.agent.artifact import (
     artifact_sinks,
 )
 from spineagent.agent.as_tool import AgentTool
+from spineagent.agent.builtin.deep_research import DeepResearchAgent, default_planner
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.middleware import (
     AttachmentMiddleware,
@@ -140,6 +141,9 @@ __all__ = [
     "ToolUsingAgent",
     "AgentTool",
     "FunctionCallingAgent",
+    # 预置 agent(纯组合装配)
+    "DeepResearchAgent",
+    "default_planner",
     # artifact 缝(agent 产出文件级交付物)
     "Artifact",
     "ArtifactRef",

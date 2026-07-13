@@ -20,6 +20,7 @@ from corespine.llm.provider import MockProvider
 from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
 from spineagent.agent.artifact import BlobArtifactSink, InProcessArtifactSink
 from spineagent.agent.as_tool import AgentTool
+from spineagent.agent.builtin.deep_research import DeepResearchAgent
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.middleware import (
     AttachmentMiddleware,
@@ -71,6 +72,7 @@ AGENT_SUITE = ConformanceSuite(
         "middleware": lambda: MiddlewareAgent(
             "mw", FunctionAgent("inner", lambda t: f"done:{t}"), [TokenUsageMiddleware()]
         ),
+        "deep_research": DeepResearchAgent,
     },
     AGENT_INVARIANTS,
 )
