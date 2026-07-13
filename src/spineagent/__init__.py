@@ -39,6 +39,7 @@ from spineagent.conformance import (
     LLM_INVARIANTS,
     POLICY_INVARIANTS,
     SANDBOX_INVARIANTS,
+    SKILL_INVARIANTS,
     TOOL_INVARIANTS,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
@@ -81,6 +82,16 @@ from spineagent.sandbox.seam import (
     SandboxResult,
     load_container_sdk,
     sandboxes,
+)
+from spineagent.skills.as_tool import skill_as_function_tool
+from spineagent.skills.bundle import SkillBundle
+from spineagent.skills.skill import (
+    FixtureSkill,
+    Skill,
+    SkillError,
+    SkillResult,
+    SkillSpec,
+    skill_registry,
 )
 from spineagent.tools.function_tool import (
     FunctionTool,
@@ -166,11 +177,21 @@ __all__ = [
     "InProcessSandbox",
     "sandboxes",
     "load_container_sdk",
+    # skills 缝(带 manifest 的可调用能力包,脚本经 Sandbox 隔离执行)
+    "Skill",
+    "SkillSpec",
+    "SkillResult",
+    "SkillError",
+    "FixtureSkill",
+    "SkillBundle",
+    "skill_registry",
+    "skill_as_function_tool",
     # conformance (本包绑定的不变量)
     "AGENT_INVARIANTS",
     "TOOL_INVARIANTS",
     "POLICY_INVARIANTS",
     "LLM_INVARIANTS",
     "SANDBOX_INVARIANTS",
+    "SKILL_INVARIANTS",
     "__version__",
 ]

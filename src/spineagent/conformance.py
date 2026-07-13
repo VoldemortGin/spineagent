@@ -41,6 +41,7 @@ from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceS
 from spineagent.agent.agent import Agent, AgentResult
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
 from spineagent.sandbox.seam import Limits, Sandbox
+from spineagent.skills.skill import Skill, SkillResult
 from spineagent.tools.tool import Tool
 
 # 一段含敏感正文的任务:agent 若把它写进 trace 即泄露——隐私不变量要挡住的正是这个。
@@ -255,4 +256,60 @@ SANDBOX_INVARIANTS: InvariantPack[Sandbox] = (
     .add("usage_is_accounted", _usage_is_accounted)
     .add("resource_limit_takes_effect", _resource_limit_takes_effect)
     .add("no_network_egress", _no_network_egress)
+)
+
+
+# ---- Skill 不变量(能力包契约,实现中立)------------------------------------------------------
+# 从 describe() 的 schema 合成一份「零值」样例参数驱动 invoke——故不预设某 skill 的具体 inputs,
+# 任何 skill(含第三方经 entry-point 装入的)都能被同一套不变量施压。skill 专属的语义(脚本算什么)
+# 归各实现单测(见 tests/test_skills.py)。
+_JSON_ZERO: dict[str, object] = {
+    "string": "",
+    "integer": 0,
+    "number": 0,
+    "boolean": False,
+    "array": [],
+    "object": {},
+}
+
+
+def _sample_args_from_schema(schema: dict[str, object]) -> dict[str, object]:
+    """从 describe() 的 function schema 合成一份满足 required 的零值样例参数。"""
+    params = schema.get("function", {})
+    parameters = params.get("parameters", {}) if isinstance(params, dict) else {}
+    properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+    required = parameters.get("required", []) if isinstance(parameters, dict) else []
+    args: dict[str, object] = {}
+    if isinstance(properties, dict):
+        names = required if isinstance(required, list) and required else list(properties)
+        for name in names:
+            spec = properties.get(name, {}) if isinstance(properties, dict) else {}
+            json_type = spec.get("type") if isinstance(spec, dict) else None
+            args[name] = _JSON_ZERO.get(json_type, 0) if isinstance(json_type, str) else 0
+    return args
+
+
+def _describe_returns_deterministic_schema(skill: Skill) -> None:
+    first = skill.describe()
+    second = skill.describe()
+    assert isinstance(first, dict) and first, "describe() 必须返回非空 schema dict"
+    assert first == second, "describe() 必须确定性:同一 skill 恒定同一 schema"
+
+
+def _invoke_carries_skill_provenance(skill: Skill) -> None:
+    result = skill.invoke(_sample_args_from_schema(skill.describe()))
+    assert isinstance(result, SkillResult)
+    assert result.skill == skill.spec.name, "结果必须可溯源到产出它的 skill"
+
+
+def _invoke_returns_output(skill: Skill) -> None:
+    result = skill.invoke(_sample_args_from_schema(skill.describe()))
+    assert result.output, "skill 调用必须产出非空文本"
+
+
+SKILL_INVARIANTS: InvariantPack[Skill] = (
+    InvariantPack("skill")
+    .add("describe_returns_deterministic_schema", _describe_returns_deterministic_schema)
+    .add("invoke_carries_skill_provenance", _invoke_carries_skill_provenance)
+    .add("invoke_returns_output", _invoke_returns_output)
 )
