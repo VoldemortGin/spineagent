@@ -19,11 +19,19 @@ from corespine.llm.provider import MockProvider
 from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
 from spineagent.agent.as_tool import AgentTool
 from spineagent.agent.function_calling import FunctionCallingAgent
+from spineagent.agent.middleware import (
+    AttachmentMiddleware,
+    DynamicToolMiddleware,
+    MiddlewareAgent,
+    SummaryMiddleware,
+    TokenUsageMiddleware,
+)
 from spineagent.agent.policy import SyntaxToolPolicy
 from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
     LLM_INVARIANTS,
+    MIDDLEWARE_INVARIANTS,
     POLICY_INVARIANTS,
     SANDBOX_INVARIANTS,
     SKILL_INVARIANTS,
@@ -56,6 +64,9 @@ AGENT_SUITE = ConformanceSuite(
         "a2a_adapter": lambda: A2AAgentAdapter(OfflineA2AStub()),
         "chain": lambda: ChainAgent("chain", [FunctionAgent("a", lambda t: f"a:{t}")]),
         "function_calling": lambda: FunctionCallingAgent("fc", MockProvider(), []),
+        "middleware": lambda: MiddlewareAgent(
+            "mw", FunctionAgent("inner", lambda t: f"done:{t}"), [TokenUsageMiddleware()]
+        ),
     },
     AGENT_INVARIANTS,
 )
@@ -88,6 +99,17 @@ _SKILL_SPEC = SkillSpec(
 )
 SKILL_SUITE = ConformanceSuite(
     {"fixture": lambda: FixtureSkill(_SKILL_SPEC, "x + y")}, SKILL_INVARIANTS
+)
+
+# Middleware conformance:离线确定性内置四件套(各带缺省,零参可造)。
+MIDDLEWARE_SUITE = ConformanceSuite(
+    {
+        "token_usage": TokenUsageMiddleware,
+        "summary": SummaryMiddleware,
+        "dynamic_tool": DynamicToolMiddleware,
+        "attachment": AttachmentMiddleware,
+    },
+    MIDDLEWARE_INVARIANTS,
 )
 
 
@@ -246,6 +268,12 @@ def test_sandbox_conformance(case):
 @pytest.mark.parametrize(**SKILL_SUITE.parametrize_kwargs())
 def test_skill_conformance(case):
     """每个 skill 实现(离线默认 fixture)× 每条 skill 不变量 各跑一格(1 × 3 = 3 格全绿)。"""
+    case()
+
+
+@pytest.mark.parametrize(**MIDDLEWARE_SUITE.parametrize_kwargs())
+def test_middleware_conformance(case):
+    """每个内置 middleware(4 件套)× 每条 middleware 不变量 各跑一格(4 × 4 = 16 格全绿)。"""
     case()
 
 

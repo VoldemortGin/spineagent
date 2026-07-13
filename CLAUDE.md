@@ -38,13 +38,18 @@ src/spineagent/
   agent/tool_using.py       ToolUsingAgent:离线确定性多步循环(SyntaxToolPolicy 语法路由),带 max_steps 守卫;实现 Agent 协议
   agent/function_calling.py FunctionCallingAgent:真 LLM function-calling 多步循环(FunctionTool schema → chat(tools=) → tool_calls → 执行 → OpenAI tool 角色喂回 → 再 chat);实现 Agent 协议,底层换任意 provider 不改一行
   agent/as_tool.py          AgentTool:把 Agent 桥成 Tool(分层 / 督导式多 agent:督导 agent 通过工具调用派活给子 agent,可嵌套)
+  agent/middleware.py       Middleware 缝:协议(before_step / after_step)+ MiddlewareAgent 有序洋葱链包裹任意 Agent(组合完仍是 Agent)+ 离线内置四件套(TokenUsage / Summary / DynamicTool / Attachment)+ middlewares Registry;trace 只记计数,零正文泄漏
+  sandbox/seam.py           Sandbox 缝:协议(run(code, *, timeout, limits) -> SandboxResult)+ 离线确定性默认 InProcessSandbox(受限白名单 AST 求值器,构造即保证无网络出口 / 无文件系统逃逸,ops / output 上限)+ sandboxes Registry;真实硬隔离后端 subprocess / container 走 [sandbox] extra 延迟 import
+  skills/skill.py           Skill 缝:SkillSpec(manifest)+ 协议(describe() 确定性 schema / invoke(args) 带 provenance)+ 离线默认 FixtureSkill(脚本经 Sandbox 隔离执行)+ skill_registry Registry
+  skills/bundle.py          SkillBundle:manifest.toml + 脚本文件的目录加载器(tomllib,3.10 回退 tomli)
+  skills/as_tool.py         skill_as_function_tool:把 Skill 桥成 FunctionTool,直接进 FunctionCallingAgent
   tools/tool.py             Tool 协议 + EchoTool / CalcTool + tool_registry(spec 选工具 + entry-point 第三方工具发现,group corespine.tool);注:运行时可把 ragspine RAG 插为 Tool
   tools/function_tool.py    FunctionTool(带 JSON-schema、接 dict 参数,给真 function-calling 用)+ @function_tool 装饰器(从签名自动推 schema)
   orchestration/coordinator.py  Coordinator:顺序 / 并行 / 流水线(output→input)跑多 agent、保序收集;弹性容错 resilient 把异常归一为 AgentResult.error,坏 agent 不炸整批
   orchestration/chain.py        ChainAgent:把一串 agent 串成单个 Agent(流水线即一等可组合单元:可进 Coordinator / 当工具 / 套 chain)
   protocol/mcp/seam.py      McpClient / McpServer 协议 + OfflineMcpStub(离线回环)+ McpClientTool(MCP 工具→Tool)+ 延迟真实 SDK
   protocol/a2a/seam.py      A2AAgent 协议 + OfflineA2AStub(离线回环)+ A2AAgentAdapter(A2A→Agent)+ 延迟真实 SDK
-  conformance.py            本包绑定的不变量包(AGENT_INVARIANTS / TOOL_INVARIANTS / POLICY_INVARIANTS)
+  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / SANDBOX / SKILL / MIDDLEWARE_INVARIANTS)
 ```
 
 ## 跑(始终从包根)

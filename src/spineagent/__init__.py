@@ -24,6 +24,16 @@ else:
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
 from spineagent.agent.as_tool import AgentTool
 from spineagent.agent.function_calling import FunctionCallingAgent
+from spineagent.agent.middleware import (
+    AttachmentMiddleware,
+    DynamicToolMiddleware,
+    Middleware,
+    MiddlewareAgent,
+    StepContext,
+    SummaryMiddleware,
+    TokenUsageMiddleware,
+    middlewares,
+)
 from spineagent.agent.policy import (
     Action,
     Finish,
@@ -37,6 +47,7 @@ from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
     LLM_INVARIANTS,
+    MIDDLEWARE_INVARIANTS,
     POLICY_INVARIANTS,
     SANDBOX_INVARIANTS,
     SKILL_INVARIANTS,
@@ -119,6 +130,15 @@ __all__ = [
     "ToolUsingAgent",
     "AgentTool",
     "FunctionCallingAgent",
+    # middleware 缝(有序链包裹任意 Agent,组合完仍是 Agent)
+    "Middleware",
+    "MiddlewareAgent",
+    "StepContext",
+    "TokenUsageMiddleware",
+    "SummaryMiddleware",
+    "DynamicToolMiddleware",
+    "AttachmentMiddleware",
+    "middlewares",
     # tool-policy 缝(会用工具的 agent 的「大脑」)
     "ToolPolicy",
     "ToolCall",
@@ -193,5 +213,6 @@ __all__ = [
     "LLM_INVARIANTS",
     "SANDBOX_INVARIANTS",
     "SKILL_INVARIANTS",
+    "MIDDLEWARE_INVARIANTS",
     "__version__",
 ]

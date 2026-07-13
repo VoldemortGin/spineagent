@@ -33,12 +33,14 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
 """
 
 import json
+from typing import cast
 
 from corespine.conformance.harness import InvariantPack
 from corespine.llm.provider import ChatCompletion, LLMProvider
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
-from spineagent.agent.agent import Agent, AgentResult
+from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
+from spineagent.agent.middleware import Middleware, MiddlewareAgent, StepContext
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
 from spineagent.sandbox.seam import Limits, Sandbox
 from spineagent.skills.skill import Skill, SkillResult
@@ -312,4 +314,58 @@ SKILL_INVARIANTS: InvariantPack[Skill] = (
     .add("describe_returns_deterministic_schema", _describe_returns_deterministic_schema)
     .add("invoke_carries_skill_provenance", _invoke_carries_skill_provenance)
     .add("invoke_returns_output", _invoke_returns_output)
+)
+
+
+# ---- Middleware 不变量(链包裹契约,实现中立)-------------------------------------------------
+# 只验任何 Middleware 都该守的形状 / provenance 保全 / 包裹后确定性 / 包裹后 trace 零泄漏。把待测
+# middleware 单元素成链包住一个 fixture FunctionAgent 施压——各 middleware 专属语义(压缩 / 记账 /
+# 工具调度 / 附件)归各实现单测(见 tests/test_middleware.py)。
+def _mw_wrap(mw: Middleware) -> MiddlewareAgent:
+    # FunctionAgent 的 name 是只读 property,而 Agent 协议把 name 记为可写变量;二者语义相容(读即
+    # 满足),用 cast 消解 mypy 对 property vs 变量的保守判定(与家族其它缝把具体 agent 当 Agent 传同理)。
+    inner = cast(Agent, FunctionAgent("inner", lambda task: f"done:{task}"))
+    return MiddlewareAgent("mw", inner, [mw])
+
+
+def _before_step_returns_none(mw: Middleware) -> None:
+    # before_step 由协议保证返回 None;此处只验它对一个全新 ctx 不抛(形状 / 健壮性)。
+    mw.before_step(StepContext(agent="mw", task="ping"))
+
+
+def _after_step_preserves_provenance(mw: Middleware) -> None:
+    ctx = StepContext(agent="mw", task="ping")
+    mw.before_step(ctx)  # 有的 middleware 在 before 里备好 after 要用的元数据
+    result = AgentResult(agent="inner", output="ok")
+    out = mw.after_step(ctx, result)
+    assert isinstance(out, AgentResult), "after_step 必须返回 AgentResult"
+    assert out.agent == result.agent, "after_step 必须保留结果 provenance,绝不吞掉来源"
+
+
+def _wrapped_step_is_deterministic(mw: Middleware) -> None:
+    # 同一 (中间件, 输入) 两跑:输出 + trace code 序列必须全等(顺序 / 决策确定性)。
+    first_sink, second_sink = InProcessPrivacyTraceSink(), InProcessPrivacyTraceSink()
+    first = _mw_wrap(mw).step("ping", trace=first_sink)
+    second = _mw_wrap(mw).step("ping", trace=second_sink)
+    assert first.output == second.output, "包裹后同输入必产同输出"
+    assert first_sink.codes() == second_sink.codes(), "包裹后 trace code 序列必确定"
+
+
+def _wrapped_trace_is_privacy_safe(mw: Middleware) -> None:
+    sink = InProcessPrivacyTraceSink()
+    _mw_wrap(mw).step(_SENSITIVE_TASK, trace=sink)
+    assert sink.codes(), "包裹后至少应发一条元数据 trace"
+    for event in sink.events:
+        leaked = {k for k in event.fields if k.strip().lower() in FORBIDDEN_KEYS}
+        assert not leaked, f"middleware trace 泄露了受限字段:{sorted(leaked)}"
+        for key, value in event.fields.items():
+            assert _SENSITIVE_MARKER not in str(value), f"middleware trace 字段 {key!r} 泄露了正文"
+
+
+MIDDLEWARE_INVARIANTS: InvariantPack[Middleware] = (
+    InvariantPack("middleware")
+    .add("before_step_returns_none", _before_step_returns_none)
+    .add("after_step_preserves_provenance", _after_step_preserves_provenance)
+    .add("wrapped_step_is_deterministic", _wrapped_step_is_deterministic)
+    .add("wrapped_trace_is_privacy_safe", _wrapped_trace_is_privacy_safe)
 )
