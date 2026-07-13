@@ -22,6 +22,14 @@ else:
     beartype_this_package(conf=BeartypeConf(is_pep484_tower=True))
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.artifact import (
+    Artifact,
+    ArtifactRef,
+    ArtifactSink,
+    BlobArtifactSink,
+    InProcessArtifactSink,
+    artifact_sinks,
+)
 from spineagent.agent.as_tool import AgentTool
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.middleware import (
@@ -46,6 +54,7 @@ from spineagent.agent.policy import (
 from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
+    ARTIFACT_INVARIANTS,
     LLM_INVARIANTS,
     MIDDLEWARE_INVARIANTS,
     POLICY_INVARIANTS,
@@ -130,6 +139,13 @@ __all__ = [
     "ToolUsingAgent",
     "AgentTool",
     "FunctionCallingAgent",
+    # artifact 缝(agent 产出文件级交付物)
+    "Artifact",
+    "ArtifactRef",
+    "ArtifactSink",
+    "InProcessArtifactSink",
+    "BlobArtifactSink",
+    "artifact_sinks",
     # middleware 缝(有序链包裹任意 Agent,组合完仍是 Agent)
     "Middleware",
     "MiddlewareAgent",
@@ -214,5 +230,6 @@ __all__ = [
     "SANDBOX_INVARIANTS",
     "SKILL_INVARIANTS",
     "MIDDLEWARE_INVARIANTS",
+    "ARTIFACT_INVARIANTS",
     "__version__",
 ]

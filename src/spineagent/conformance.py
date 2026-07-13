@@ -27,6 +27,11 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
   middleware  —— ①before_step 返回 None(形状);②after_step 返回 AgentResult 且保留结果 provenance;
                  ③包裹后单步确定性(同输入两跑,输出 + trace code 序列全等);④包裹后步级 trace 零
                  正文泄漏(隐私安全)。
+  artifact_sink —— ①ref 溯源到落地它的 sink;②ref 保留 Artifact 产出者 provenance;③字节 + 元数据
+                 可 round-trip 取回。
+  streaming   —— 【叠加协议 StreamingLLMProvider】①stream_chat 各 chunk 是 ChatCompletionChunk 形状、
+                 末块 finish_reason 合法;②流式各 chunk 的 delta.content 顺序拼接 == 非流式 chat()
+                 的 message.content(确定性等价)。
 
 任何号称 Agent / Tool / ToolPolicy / LLMProvider / Sandbox / Skill / Middleware 的实现都必须跑过
 对应那组——没过 conformance 的实现直接红,而非埋雷。
@@ -39,6 +44,7 @@ from corespine.llm.provider import ChatCompletion, LLMProvider
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
+from spineagent.agent.artifact import Artifact, ArtifactSink
 from spineagent.agent.middleware import Middleware, MiddlewareAgent, StepContext
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
 from spineagent.sandbox.seam import Limits, Sandbox
@@ -364,4 +370,34 @@ MIDDLEWARE_INVARIANTS: InvariantPack[Middleware] = (
     .add("after_step_preserves_provenance", _after_step_preserves_provenance)
     .add("wrapped_step_is_deterministic", _wrapped_step_is_deterministic)
     .add("wrapped_trace_is_privacy_safe", _wrapped_trace_is_privacy_safe)
+)
+
+
+# ---- ArtifactSink 不变量(文件级交付物落地契约,实现中立)------------------------------------
+# 用一个带 producer provenance 的规范 Artifact 驱动:任何 ArtifactSink 落地后都必须①ref 溯源到本
+# sink;②把 Artifact 的产出者 provenance 一路带下去;③字节 + 元数据可 round-trip 取回。
+_ARTIFACT = Artifact.from_text("note.txt", "hello 交付物", mime="text/plain", producer="tester")
+
+
+def _ref_carries_sink_provenance(sink: ArtifactSink) -> None:
+    ref = sink.store(_ARTIFACT)
+    assert ref.sink == sink.name, "ArtifactRef 必须可溯源到落地它的 sink"
+
+
+def _ref_preserves_producer_provenance(sink: ArtifactSink) -> None:
+    ref = sink.store(_ARTIFACT)
+    assert ref.producer == _ARTIFACT.producer, "ArtifactRef 必须保留 Artifact 的产出者 provenance"
+
+
+def _artifact_round_trips(sink: ArtifactSink) -> None:
+    got = sink.fetch(sink.store(_ARTIFACT))
+    assert got.data == _ARTIFACT.data, "取回的字节必须与存入一致"
+    assert got.mime == _ARTIFACT.mime and got.name == _ARTIFACT.name, "取回的元数据必须一致"
+
+
+ARTIFACT_INVARIANTS: InvariantPack[ArtifactSink] = (
+    InvariantPack("artifact_sink")
+    .add("ref_carries_sink_provenance", _ref_carries_sink_provenance)
+    .add("ref_preserves_producer_provenance", _ref_preserves_producer_provenance)
+    .add("artifact_round_trips", _artifact_round_trips)
 )

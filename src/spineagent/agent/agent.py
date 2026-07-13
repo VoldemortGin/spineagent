@@ -12,11 +12,13 @@
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
+
+from spineagent.agent.artifact import ArtifactRef
 
 
 @dataclass(frozen=True)
@@ -26,12 +28,16 @@ class AgentResult:
     error 仅在【编排层弹性模式】下捕获 agent.step 异常时填充——归一为家族统一的可序列化错误
     dict(corespine.errors.error_to_dict:含 code / retryable / context)。正常成功路径 error 为
     None;agent.step 自身的契约仍是「成功产出非空、失败抛异常」,捕获与否是 Coordinator 的策略。
+
+    artifacts 挂本步产出的【文件级交付物引用】(ArtifactRef,轻量带 provenance;重字节在
+    ArtifactSink 里)。与 usage / error 同类的一等元数据,默认空 tuple——不产 artifact 的 agent 无感。
     """
 
     agent: str
     output: str
     usage: dict[str, int] | None = None
     error: dict[str, object] | None = None
+    artifacts: tuple[ArtifactRef, ...] = field(default_factory=tuple)
 
     @property
     def ok(self) -> bool:

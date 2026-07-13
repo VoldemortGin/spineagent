@@ -13,10 +13,12 @@
 from types import SimpleNamespace
 
 import pytest
+from corespine.blob.store import MemoryBlobStore
 from corespine.conformance.harness import ConformanceSuite
 from corespine.llm.provider import MockProvider
 
 from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.artifact import BlobArtifactSink, InProcessArtifactSink
 from spineagent.agent.as_tool import AgentTool
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.middleware import (
@@ -30,6 +32,7 @@ from spineagent.agent.policy import SyntaxToolPolicy
 from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
+    ARTIFACT_INVARIANTS,
     LLM_INVARIANTS,
     MIDDLEWARE_INVARIANTS,
     POLICY_INVARIANTS,
@@ -110,6 +113,15 @@ MIDDLEWARE_SUITE = ConformanceSuite(
         "attachment": AttachmentMiddleware,
     },
     MIDDLEWARE_INVARIANTS,
+)
+
+# ArtifactSink conformance:进程内默认 + 组合 corespine MemoryBlobStore 的 BlobArtifactSink。
+ARTIFACT_SUITE = ConformanceSuite(
+    {
+        "in_process": InProcessArtifactSink,
+        "blob": lambda: BlobArtifactSink(MemoryBlobStore()),
+    },
+    ARTIFACT_INVARIANTS,
 )
 
 
@@ -274,6 +286,12 @@ def test_skill_conformance(case):
 @pytest.mark.parametrize(**MIDDLEWARE_SUITE.parametrize_kwargs())
 def test_middleware_conformance(case):
     """每个内置 middleware(4 件套)× 每条 middleware 不变量 各跑一格(4 × 4 = 16 格全绿)。"""
+    case()
+
+
+@pytest.mark.parametrize(**ARTIFACT_SUITE.parametrize_kwargs())
+def test_artifact_conformance(case):
+    """每个 ArtifactSink(in_process / blob)× 每条 artifact 不变量 各跑一格(2 × 3 = 6 格全绿)。"""
     case()
 
 
