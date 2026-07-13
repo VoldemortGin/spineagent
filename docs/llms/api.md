@@ -247,9 +247,20 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - 走 `boto3` 的 `bedrock-runtime` Converse API(跨模型同形)。`model` 必填(= Bedrock modelId)。
   Converse native → OpenAI `ChatCompletion`。extra `[bedrock]`。
 
+### `class FailoverProvider` / `StreamingFailoverProvider` / `make_failover_provider`
+`FailoverProvider(providers: Sequence[LLMProvider], *, cooldown_seconds: float = 30.0, retryable_errors: tuple[type[BaseException], ...] = (ProviderError,), now_fn: Callable[[], float] = time.monotonic)`
+- 组合式容错 provider:包裹一组下游,做 (a) 轮询分摊 + (b) 撞可重试错后冷却窗口内跳过 +
+  (c) 全冷却时强制按序回退,全失败抛 `FailoverExhaustedError`(聚合各下游原因,经凭据脱敏,绝不含 key)。
+- 只 catch `retryable_errors`(默认 `ProviderError`);逻辑错(KeyError/ValueError…)照常上抛,不被吞。
+- `make_failover_provider(providers, **kw) -> FailoverProvider`:诚实选类——【全下游都实现
+  `StreamingLLMProvider`】才返回带 `stream_chat` 的 `StreamingFailoverProvider`,混编则返回不带
+  `stream_chat` 的基类(`isinstance(p, StreamingLLMProvider)` 如实报 False)。`now_fn` 可注入以确定性测试冷却。
+
 ### `llm_providers`
 `Registry[LLMProvider]`(seam 名 `llm`)。`make(spec, **kw)` / `names()`。
-- 已注册:`"mock"`(→ `corespine.MockProvider`)、`"openai"`、`"anthropic"`、`"cohere"`、`"gemini"`、`"bedrock"`。
+- 已注册:`"mock"`(→ `corespine.MockProvider`)、`"openai"`、`"anthropic"`、`"cohere"`、`"gemini"`、`"bedrock"`、
+  `"failover"`(组合 provider:`make("failover", downstreams=[{"spec": "openai", "model": …}, {"spec": "anthropic"}], cooldown_seconds=30)`——
+  `downstreams` 是 spec 列表,经本注册表逐个构造成下游;也可传已构造的 `providers=[...]`)。
 
 ### `load_*_sdk()`
 `load_anthropic_sdk()` / `load_openai_sdk()` / `load_cohere_sdk()` / `load_gemini_sdk()` / `load_boto3_sdk()`

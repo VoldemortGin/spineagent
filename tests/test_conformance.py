@@ -44,6 +44,7 @@ from spineagent.conformance import (
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
 from spineagent.llm.cohere_provider import CohereProvider
+from spineagent.llm.failover_provider import make_failover_provider
 from spineagent.llm.gemini_provider import GeminiProvider
 from spineagent.llm.provider import AnthropicProvider, OpenAICompatProvider
 from spineagent.orchestration.chain import ChainAgent
@@ -251,6 +252,8 @@ LLM_SUITE = ConformanceSuite(
         "cohere": lambda: CohereProvider(client=_ConfFakeCohere()),
         "gemini": lambda: GeminiProvider(client=_ConfFakeGemini()),
         "bedrock": lambda: BedrockConverseProvider("m", client=_ConfFakeBedrock()),
+        # 组合 provider:包裹两个健康下游,LLMProvider 形状/取值域/往返不变量对它同样成立。
+        "failover": lambda: make_failover_provider([MockProvider(), MockProvider()]),
     },
     LLM_INVARIANTS,
 )
@@ -342,6 +345,8 @@ STREAMING_SUITE = ConformanceSuite(
         "mock": MockProvider,
         "openai": lambda: OpenAICompatProvider("gpt-x", client=_StreamFakeOpenAI()),
         "anthropic": lambda: AnthropicProvider(client=_StreamFakeAnthropic()),
+        # 全下游支持流式 → 工厂返回流式变体;流式拼接 == 非流式 对组合层同样成立。
+        "failover": lambda: make_failover_provider([MockProvider(), MockProvider()]),
     },
     STREAMING_INVARIANTS,
 )
@@ -391,15 +396,15 @@ def test_artifact_conformance(case):
 
 @pytest.mark.parametrize(**LLM_SUITE.parametrize_kwargs())
 def test_llm_provider_conformance(case):
-    """每个 LLMProvider(mock + 5 后端,各注入 fake client)× 每条 llm 不变量 各跑一格
-    (6 × 4 = 24 格全绿)。零真实 API:全部经 fake client 离线驱动。"""
+    """每个 LLMProvider(mock + 5 后端各注入 fake client + failover 组合)× 每条 llm 不变量
+    各跑一格(7 × 4 = 28 格全绿)。零真实 API:全部经 fake client / MockProvider 离线驱动。"""
     case()
 
 
 @pytest.mark.parametrize(**STREAMING_SUITE.parametrize_kwargs())
 def test_streaming_conformance(case):
-    """每个 StreamingLLMProvider(mock + openai + anthropic,注入流式 fake client)× 每条 streaming
-    不变量 各跑一格(3 × 2 = 6 格全绿)。核心:流式拼接 == 非流式。"""
+    """每个 StreamingLLMProvider(mock + openai + anthropic 注入流式 fake client + failover 组合)
+    × 每条 streaming 不变量 各跑一格(4 × 2 = 8 格全绿)。核心:流式拼接 == 非流式。"""
     case()
 
 

@@ -56,6 +56,7 @@ from spineagent.llm._mapping import (
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
 from spineagent.llm.cohere_provider import CohereProvider
 from spineagent.llm.errors import ProviderError
+from spineagent.llm.failover_provider import make_failover_provider
 from spineagent.llm.gemini_provider import GeminiProvider
 
 # 真实 SDK 的 import 名(装了对应 extra 才有);默认离线路径绝不 import 它们。
@@ -369,9 +370,35 @@ def _openai_messages_to_anthropic(
     return join_system(turns), convo
 
 
+def _build_failover(
+    *,
+    downstreams: list[dict[str, Any]] | None = None,
+    providers: list[LLMProvider] | None = None,
+    cooldown_seconds: float | None = None,
+    **kwargs: Any,
+) -> LLMProvider:
+    """从配置装配 FailoverProvider:`downstreams` 是 spec 列表,经本注册表逐个构造成下游 provider。
+
+    配置形状(走仓内 spec 驱动的 Registry 惯例)——每个下游是一份 `{"spec": <名>, **构造参数}`:
+        make("failover", downstreams=[{"spec": "openai", "model": "gpt-4o"}, {"spec": "anthropic"}],
+             cooldown_seconds=30)
+    也可直接传已构造好的 `providers=[...]`(两者可并存,拼在下游列表)。工厂按下游能力诚实选流式/
+    非流式变体(见 make_failover_provider)。
+    """
+    built: list[LLMProvider] = list(providers or [])
+    for entry in downstreams or []:
+        entry = dict(entry)
+        spec = entry.pop("spec")
+        built.append(llm_providers.make(spec, **entry))
+    if cooldown_seconds is not None:
+        kwargs["cooldown_seconds"] = cooldown_seconds
+    return make_failover_provider(built, **kwargs)
+
+
 # 缝注册表:一个 spec 选实现(离线默认 mock;真实后端各走可选 extra 延迟 import)。
 # 非 OpenAI 原生后端(anthropic / cohere / …)的适配器把 native 响应转成 OpenAI ChatCompletion;
-# OpenAI 兼容的一律走 openai。entry-point group "corespine.llm":第三方 provider 装包即可被发现。
+# OpenAI 兼容的一律走 openai。failover 是【组合】provider:包裹其它下游做轮询 + 冷却 + 跨家回退。
+# entry-point group "corespine.llm":第三方 provider 装包即可被发现。
 llm_providers: Registry[LLMProvider] = Registry("llm")
 llm_providers.register("mock", lambda **kw: MockProvider(**kw))
 llm_providers.register("anthropic", lambda **kw: AnthropicProvider(**kw))
@@ -379,3 +406,4 @@ llm_providers.register("openai", lambda **kw: OpenAICompatProvider(**kw))
 llm_providers.register("cohere", lambda **kw: CohereProvider(**kw))
 llm_providers.register("gemini", lambda **kw: GeminiProvider(**kw))
 llm_providers.register("bedrock", lambda **kw: BedrockConverseProvider(**kw))
+llm_providers.register("failover", _build_failover)

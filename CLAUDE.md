@@ -34,6 +34,7 @@ src/spineagent/
   llm/cohere_provider.py    CohereProvider:Cohere v2 native → OpenAI ChatCompletion([cohere] extra)
   llm/gemini_provider.py    GeminiProvider:Gemini generateContent native → OpenAI ChatCompletion([gemini] extra,同覆盖 Vertex Gemini)
   llm/bedrock_provider.py   BedrockConverseProvider:AWS Bedrock Converse native → OpenAI ChatCompletion([bedrock] extra,Converse 跨模型同形)
+  llm/failover_provider.py  FailoverProvider / StreamingFailoverProvider:组合式容错——包裹一组下游做轮询分摊 + 撞可重试错(默认 ProviderError)冷却 + 全冷却时强制回退,全失败抛脱敏聚合错(绝不含凭据);只回退可重试错、绝不吞逻辑错;make_failover_provider 仅在全下游支持流式时才声明流式(isinstance 不撒谎);冷却用可注入 now_fn。registry spec "failover" 走 downstreams spec 列表装配
   agent/policy.py           ToolPolicy 缝:协议 + 离线确定性默认 SyntaxToolPolicy(`<tool>: <arg>` 语法路由,不假装 LLM 推理)+ tool_policies Registry
   agent/tool_using.py       ToolUsingAgent:离线确定性多步循环(SyntaxToolPolicy 语法路由),带 max_steps 守卫;实现 Agent 协议
   agent/function_calling.py FunctionCallingAgent:真 LLM function-calling 多步循环(FunctionTool schema → chat(tools=) → tool_calls → 执行 → OpenAI tool 角色喂回 → 再 chat);实现 Agent 协议,底层换任意 provider 不改一行
