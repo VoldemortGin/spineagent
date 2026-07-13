@@ -29,6 +29,8 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
                  正文泄漏(隐私安全)。
   artifact_sink —— ①ref 溯源到落地它的 sink;②ref 保留 Artifact 产出者 provenance;③字节 + 元数据
                  可 round-trip 取回。
+  approval_gate —— ①review 返回 Decision 三态;②gate 有非空名字;③review 幂等(同 request 恒同决议);
+                 ④请求摘要不含参数正文(只 schema 指纹 + 计数)。
   streaming   —— 【叠加协议 StreamingLLMProvider】①stream_chat 各 chunk 是 ChatCompletionChunk 形状、
                  末块 finish_reason 合法;②流式各 chunk 的 delta.content 顺序拼接 == 非流式 chat()
                  的 message.content(确定性等价)。
@@ -50,6 +52,7 @@ from corespine.llm.provider import (
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
+from spineagent.agent.approval import ApprovalGate, Decision, make_approval_request
 from spineagent.agent.artifact import Artifact, ArtifactSink
 from spineagent.agent.middleware import Middleware, MiddlewareAgent, StepContext
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
@@ -443,4 +446,45 @@ ARTIFACT_INVARIANTS: InvariantPack[ArtifactSink] = (
     .add("ref_carries_sink_provenance", _ref_carries_sink_provenance)
     .add("ref_preserves_producer_provenance", _ref_preserves_producer_provenance)
     .add("artifact_round_trips", _artifact_round_trips)
+)
+
+
+# ---- ApprovalGate 不变量(审批门契约,实现中立)-----------------------------------------------
+# 只验任何 ApprovalGate 都该守的形状 / 三态域 / 幂等 / 摘要不含正文。用一次带敏感值的工具调用构造
+# 请求:任何 gate 看到的 request 都只该携带 schema 指纹与计数,绝不含参数值——各 gate 专属的策略
+# 语义(auto 的模式匹配 / manual 的挂起-恢复)归各实现单测(见 tests/test_approval.py)。
+_APPROVAL_REQUEST = make_approval_request(
+    "tool_call", "delete_file", {"path": _SENSITIVE_MARKER}
+)
+
+
+def _review_returns_a_decision(gate: ApprovalGate) -> None:
+    decision = gate.review(_APPROVAL_REQUEST)
+    assert isinstance(decision, Decision), "review 必须返回一个 Decision 三态"
+
+
+def _gate_has_name(gate: ApprovalGate) -> None:
+    assert isinstance(gate.name, str) and gate.name, "gate 必须有非空名字(provenance)"
+
+
+def _review_is_idempotent(gate: ApprovalGate) -> None:
+    # 同一 request 连续 review(其间无 resolve)必返回同一决议(决议是 request id 的稳定函数)。
+    first = gate.review(_APPROVAL_REQUEST)
+    second = gate.review(_APPROVAL_REQUEST)
+    assert first == second, "review 必须幂等:同一 request 恒返回同一决议"
+
+
+def _request_digest_carries_no_argument_body(gate: ApprovalGate) -> None:
+    # 审批请求只带 schema 指纹与计数:即便参数值是敏感正文,也绝不出现在 request 的任何字段里。
+    req = _APPROVAL_REQUEST
+    for value in (req.code, req.id, req.tool, req.arg_fingerprint):
+        assert _SENSITIVE_MARKER not in value, "审批请求摘要绝不含参数正文"
+
+
+APPROVAL_INVARIANTS: InvariantPack[ApprovalGate] = (
+    InvariantPack("approval_gate")
+    .add("review_returns_a_decision", _review_returns_a_decision)
+    .add("gate_has_name", _gate_has_name)
+    .add("review_is_idempotent", _review_is_idempotent)
+    .add("request_digest_carries_no_argument_body", _request_digest_carries_no_argument_body)
 )

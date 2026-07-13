@@ -18,6 +18,11 @@ from corespine.conformance.harness import ConformanceSuite
 from corespine.llm.provider import MockProvider
 
 from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.approval import (
+    ApprovalMiddleware,
+    AutoApprovalGate,
+    ManualApprovalGate,
+)
 from spineagent.agent.artifact import BlobArtifactSink, InProcessArtifactSink
 from spineagent.agent.as_tool import AgentTool
 from spineagent.agent.builtin.deep_research import DeepResearchAgent
@@ -33,6 +38,7 @@ from spineagent.agent.policy import SyntaxToolPolicy
 from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
+    APPROVAL_INVARIANTS,
     ARTIFACT_INVARIANTS,
     LLM_INVARIANTS,
     MIDDLEWARE_INVARIANTS,
@@ -108,15 +114,23 @@ SKILL_SUITE = ConformanceSuite(
     {"fixture": lambda: FixtureSkill(_SKILL_SPEC, "x + y")}, SKILL_INVARIANTS
 )
 
-# Middleware conformance:离线确定性内置四件套(各带缺省,零参可造)。
+# Middleware conformance:离线确定性内置五件套(各带缺省,零参可造)。审批 middleware 以「空
+# gated_tools + AutoApprovalGate」入套——默认零行为变化,故它同样过 middleware 的全部保证。
 MIDDLEWARE_SUITE = ConformanceSuite(
     {
         "token_usage": TokenUsageMiddleware,
         "summary": SummaryMiddleware,
         "dynamic_tool": DynamicToolMiddleware,
         "attachment": AttachmentMiddleware,
+        "approval": lambda: ApprovalMiddleware(AutoApprovalGate()),
     },
     MIDDLEWARE_INVARIANTS,
+)
+
+# ApprovalGate conformance:两个离线确定性默认(auto 策略表 / manual 进程内挂起,均零参可造)。
+APPROVAL_SUITE = ConformanceSuite(
+    {"auto": AutoApprovalGate, "manual": ManualApprovalGate},
+    APPROVAL_INVARIANTS,
 )
 
 # ArtifactSink conformance:进程内默认 + 组合 corespine MemoryBlobStore 的 BlobArtifactSink。
@@ -384,7 +398,13 @@ def test_skill_conformance(case):
 
 @pytest.mark.parametrize(**MIDDLEWARE_SUITE.parametrize_kwargs())
 def test_middleware_conformance(case):
-    """每个内置 middleware(4 件套)× 每条 middleware 不变量 各跑一格(4 × 4 = 16 格全绿)。"""
+    """每个内置 middleware(5 件套,含审批)× 每条 middleware 不变量 各跑一格(5 × 4 = 20 格全绿)。"""
+    case()
+
+
+@pytest.mark.parametrize(**APPROVAL_SUITE.parametrize_kwargs())
+def test_approval_conformance(case):
+    """每个 ApprovalGate(auto / manual)× 每条 approval 不变量 各跑一格(2 × 4 = 8 格全绿)。"""
     case()
 
 

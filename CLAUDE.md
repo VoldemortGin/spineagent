@@ -42,6 +42,7 @@ src/spineagent/
   agent/artifact.py         artifact 缝:Artifact(字节/文本 + mime + name + producer provenance)+ ArtifactSink 协议(store/fetch)+ 离线默认(InProcessArtifactSink / 组合 corespine BlobStore 的 BlobArtifactSink)+ artifact_sinks Registry;AgentResult.artifacts 挂交付物引用
   agent/builtin/deep_research.py  DeepResearchAgent:纯组合(planner 分解 + Coordinator 并行检索 + LlmAgent 综合)装配的预置深研 agent,实现 Agent 协议;离线默认 MockProvider + 空 tools,真实效果靠注入 provider/tools
   agent/middleware.py       Middleware 缝:协议(before_step / after_step)+ MiddlewareAgent 有序洋葱链包裹任意 Agent(组合完仍是 Agent)+ 离线内置四件套(TokenUsage / Summary / DynamicTool / Attachment)+ middlewares Registry;trace 只记计数,零正文泄漏
+  agent/approval.py         审批门 / Wait 缝(对标 n8n Send-and-Wait 概念):ApprovalGate 协议(review(ApprovalRequest)→ Decision 三态 approved/rejected/pending)+ ApprovalRequest(只带 code/确定性 id/工具名/参数 schema 指纹+计数,绝不含参数正文)+ 离线默认 AutoApprovalGate(工具名 glob allow/deny 策略表,永不 pending)/ ManualApprovalGate(进程内挂起:review 登记待审、resolve 落决议+铸一次性 resume token、redeem 消费重放必败)+ 可插拔一次性 ResumeTokenStore(默认 InMemoryResumeTokenStore,只存 sha256 哈希)+ make_approval_gate/approval_gates Registry;ApprovalMiddleware 插进 middleware 链:approved 放行、rejected 抛 ApprovalRejected 断路、pending 抛 ApprovalPending 挂起(编排层经 error_to_dict 归一进 AgentResult.error;resolve 后重跑 step 恢复,复用决议幂等,零新增循环机制),默认 gated_tools 空=零行为变化(opt-in);决议幂等,trace 只记 code/计数/决议
   sandbox/seam.py           Sandbox 缝:协议(run(code, *, timeout, limits) -> SandboxResult)+ 离线确定性默认 InProcessSandbox(受限白名单 AST 求值器,构造即保证无网络出口 / 无文件系统逃逸,ops / output 上限)+ sandboxes Registry;真实硬隔离后端 subprocess / container 走 [sandbox] extra 延迟 import
   skills/skill.py           Skill 缝:SkillSpec(manifest)+ 协议(describe() 确定性 schema / invoke(args) 带 provenance)+ 离线默认 FixtureSkill(脚本经 Sandbox 隔离执行)+ skill_registry Registry
   skills/bundle.py          SkillBundle:manifest.toml + 脚本文件的目录加载器(tomllib,3.10 回退 tomli)
@@ -52,7 +53,7 @@ src/spineagent/
   orchestration/chain.py        ChainAgent:把一串 agent 串成单个 Agent(流水线即一等可组合单元:可进 Coordinator / 当工具 / 套 chain)
   protocol/mcp/seam.py      McpClient / McpServer 协议 + OfflineMcpStub(离线回环)+ McpClientTool(MCP 工具→Tool)+ 延迟真实 SDK
   protocol/a2a/seam.py      A2AAgent 协议 + OfflineA2AStub(离线回环)+ A2AAgentAdapter(A2A→Agent)+ 延迟真实 SDK
-  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / STREAMING / SANDBOX / SKILL / MIDDLEWARE / ARTIFACT_INVARIANTS)
+  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / STREAMING / SANDBOX / SKILL / MIDDLEWARE / ARTIFACT / APPROVAL_INVARIANTS)
 ```
 
 ## 跑(始终从包根)

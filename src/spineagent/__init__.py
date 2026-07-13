@@ -22,6 +22,25 @@ else:
     beartype_this_package(conf=BeartypeConf(is_pep484_tower=True))
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.approval import (
+    ApprovalConflict,
+    ApprovalError,
+    ApprovalGate,
+    ApprovalMiddleware,
+    ApprovalPending,
+    ApprovalRejected,
+    ApprovalRequest,
+    AutoApprovalGate,
+    Decision,
+    InMemoryResumeTokenStore,
+    InvalidResumeToken,
+    ManualApprovalGate,
+    ResumeTicket,
+    ResumeTokenStore,
+    approval_gates,
+    make_approval_gate,
+    make_approval_request,
+)
 from spineagent.agent.artifact import (
     Artifact,
     ArtifactRef,
@@ -55,6 +74,7 @@ from spineagent.agent.policy import (
 from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
+    APPROVAL_INVARIANTS,
     ARTIFACT_INVARIANTS,
     LLM_INVARIANTS,
     MIDDLEWARE_INVARIANTS,
@@ -160,6 +180,24 @@ __all__ = [
     "DynamicToolMiddleware",
     "AttachmentMiddleware",
     "middlewares",
+    # approval 缝(审批门 / Wait:风险动作前暂停,等人类批准 / 拒绝后恢复)
+    "ApprovalGate",
+    "ApprovalRequest",
+    "Decision",
+    "AutoApprovalGate",
+    "ManualApprovalGate",
+    "ResumeTicket",
+    "ResumeTokenStore",
+    "InMemoryResumeTokenStore",
+    "ApprovalMiddleware",
+    "ApprovalError",
+    "ApprovalRejected",
+    "ApprovalPending",
+    "ApprovalConflict",
+    "InvalidResumeToken",
+    "approval_gates",
+    "make_approval_gate",
+    "make_approval_request",
     # tool-policy 缝(会用工具的 agent 的「大脑」)
     "ToolPolicy",
     "ToolCall",
@@ -236,6 +274,7 @@ __all__ = [
     "SKILL_INVARIANTS",
     "MIDDLEWARE_INVARIANTS",
     "ARTIFACT_INVARIANTS",
+    "APPROVAL_INVARIANTS",
     "STREAMING_INVARIANTS",
     "__version__",
 ]
