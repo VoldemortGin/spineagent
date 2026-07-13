@@ -44,6 +44,8 @@ dev = ["pytest>=8.0.0", "ruff>=0.9.0", "mypy>=1.11"]
 # 协议真实后端的占位 extra:仅在显式选用时安装,默认离线路径永不触碰。
 mcp = ["mcp"]
 a2a = ["a2a-sdk"]
+# sandbox 真实硬隔离后端(container)的占位 extra:默认离线路径用 InProcessSandbox,永不触碰。
+sandbox = ["docker"]
 # 真实 LLM provider 的可选 extra:各走官方 SDK 延迟 import,默认离线路径(MockProvider)不触碰。
 # OpenAI 兼容端点(Together/Groq/DeepSeek/Mistral/xAI/Qwen/Ollama/vLLM…)统一走 [openai] 的 base_url;
 # 非 OpenAI 原生(anthropic/cohere/…)各有原生适配器、各走自己的 extra。
@@ -53,7 +55,7 @@ cohere = ["cohere"]
 gemini = ["google-genai"]
 bedrock = ["boto3"]
 # 一键装齐全部协议后端 + LLM provider(不含开发用 dev)。自引用聚合,改子 extra 无需同步维护。
-all = ["spineagent[mcp,a2a,anthropic,openai,cohere,gemini,bedrock]"]
+all = ["spineagent[mcp,a2a,sandbox,anthropic,openai,cohere,gemini,bedrock]"]
 
 [build-system]
 requires = ["hatchling"]

@@ -25,6 +25,7 @@ from spineagent.conformance import (
     AGENT_INVARIANTS,
     LLM_INVARIANTS,
     POLICY_INVARIANTS,
+    SANDBOX_INVARIANTS,
     TOOL_INVARIANTS,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
@@ -34,6 +35,7 @@ from spineagent.llm.provider import AnthropicProvider, OpenAICompatProvider
 from spineagent.orchestration.chain import ChainAgent
 from spineagent.protocol.a2a.seam import A2AAgentAdapter, OfflineA2AStub
 from spineagent.protocol.mcp.seam import McpClientTool, McpTool, OfflineMcpStub
+from spineagent.sandbox.seam import InProcessSandbox
 from spineagent.tools.tool import CalcTool, EchoTool
 
 
@@ -67,6 +69,10 @@ TOOL_SUITE = ConformanceSuite(
 )
 
 POLICY_SUITE = ConformanceSuite({"syntax": SyntaxToolPolicy}, POLICY_INVARIANTS)
+
+# Sandbox conformance:离线套件只接离线默认 InProcessSandbox(真实硬隔离后端 subprocess / container
+# 是 SeamError 桩,无法零参构造、也不该在零网络 CI 里跑——与 LLM_SUITE 只接可离线构造实现同理)。
+SANDBOX_SUITE = ConformanceSuite({"in_process": InProcessSandbox}, SANDBOX_INVARIANTS)
 
 
 # ---- LLMProvider conformance:MockProvider + 5 个真实后端(各注入 fake client,零真实 API)----
@@ -212,6 +218,12 @@ def test_tool_conformance(case):
 @pytest.mark.parametrize(**POLICY_SUITE.parametrize_kwargs())
 def test_policy_conformance(case):
     """每个 policy 实现 × 每条 tool-policy 不变量 各跑一格(1 × 4 = 4 格全绿)。"""
+    case()
+
+
+@pytest.mark.parametrize(**SANDBOX_SUITE.parametrize_kwargs())
+def test_sandbox_conformance(case):
+    """每个 Sandbox 实现(离线默认 in_process)× 每条 sandbox 不变量 各跑一格(1 × 5 = 5 格全绿)。"""
     case()
 
 

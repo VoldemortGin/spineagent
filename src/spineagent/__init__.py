@@ -38,6 +38,7 @@ from spineagent.conformance import (
     AGENT_INVARIANTS,
     LLM_INVARIANTS,
     POLICY_INVARIANTS,
+    SANDBOX_INVARIANTS,
     TOOL_INVARIANTS,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
@@ -70,6 +71,16 @@ from spineagent.protocol.mcp.seam import (
     OfflineMcpStub,
     load_mcp_sdk,
     mcp_clients,
+)
+from spineagent.sandbox.seam import (
+    DEFAULT_LIMITS,
+    InProcessSandbox,
+    Limits,
+    ResourceUsage,
+    Sandbox,
+    SandboxResult,
+    load_container_sdk,
+    sandboxes,
 )
 from spineagent.tools.function_tool import (
     FunctionTool,
@@ -146,10 +157,20 @@ __all__ = [
     "OfflineA2AStub",
     "a2a_agents",
     "load_a2a_sdk",
+    # sandbox 缝(隔离执行 skill / tool 代码)
+    "Sandbox",
+    "SandboxResult",
+    "ResourceUsage",
+    "Limits",
+    "DEFAULT_LIMITS",
+    "InProcessSandbox",
+    "sandboxes",
+    "load_container_sdk",
     # conformance (本包绑定的不变量)
     "AGENT_INVARIANTS",
     "TOOL_INVARIANTS",
     "POLICY_INVARIANTS",
     "LLM_INVARIANTS",
+    "SANDBOX_INVARIANTS",
     "__version__",
 ]

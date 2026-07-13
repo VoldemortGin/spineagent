@@ -19,9 +19,17 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
                  length / content_filter);③usage 存在时三个 token 字段非负;④给了 tools 且模型
                  发了 tool_calls 时,每条 tool_call 形状可往返(id / function.name 非空、
                  function.arguments 是合法 JSON)。绝不预设具体文本/工具名——那是各适配器单测的事。
+  sandbox     —— 【隔离契约,实现中立】①结果可溯源到产出它的沙箱(provenance);②执行必产出非空
+                 文本;③资源记账非负(ops / output_chars / wall_seconds);④资源上限生效(给 0
+                 字符产出上限必判失败);⑤无网络出口(网络探针必被拒绝 / 判失败)。
+  skill       —— ①describe() 返回确定性 schema(同一 skill 恒定同一);②invoke 结果可溯源到产出
+                 它的 skill(provenance)且产出非空。
+  middleware  —— ①before_step 返回 None(形状);②after_step 返回 AgentResult 且保留结果 provenance;
+                 ③包裹后单步确定性(同输入两跑,输出 + trace code 序列全等);④包裹后步级 trace 零
+                 正文泄漏(隐私安全)。
 
-任何号称 Agent / Tool / ToolPolicy / LLMProvider 的实现都必须跑过对应那组——没过 conformance 的
-实现直接红,而非埋雷。
+任何号称 Agent / Tool / ToolPolicy / LLMProvider / Sandbox / Skill / Middleware 的实现都必须跑过
+对应那组——没过 conformance 的实现直接红,而非埋雷。
 """
 
 import json
@@ -32,6 +40,7 @@ from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceS
 
 from spineagent.agent.agent import Agent, AgentResult
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
+from spineagent.sandbox.seam import Limits, Sandbox
 from spineagent.tools.tool import Tool
 
 # 一段含敏感正文的任务:agent 若把它写进 trace 即泄露——隐私不变量要挡住的正是这个。
@@ -197,4 +206,53 @@ LLM_INVARIANTS: InvariantPack[LLMProvider] = (
     .add("finish_reason_in_allowed_domain", _finish_reason_in_allowed_domain)
     .add("usage_fields_are_non_negative", _usage_fields_are_non_negative)
     .add("tool_calls_round_trip", _tool_calls_round_trip)
+)
+
+
+# ---- Sandbox 不变量(隔离契约)------------------------------------------------------------------
+# 【实现中立】只验任何 Sandbox 都该守的隔离 / 记账 / 溯源属性,用一段所有后端都必须能跑的规范代码
+# (纯算术 "1 + 1")驱动,再用一段网络探针钉死「无网络出口」。绝不预设某后端如何解释 code——那是
+# 各后端单测的事(见 tests/test_sandbox.py)。注:离线 conformance 套件只接【离线默认】InProcessSandbox
+# (与 LLM_SUITE 只接可离线构造的实现同理);真实硬隔离后端过不过这几条,是其接入时自己的责任。
+_SANDBOX_CANONICAL = "1 + 1"
+# 一段试图开网络出口的探针:任何守约的沙箱都必须【拒绝执行 / 判失败】,绝不真的连出去。
+_SANDBOX_NETWORK_PROBE = "__import__('socket').socket()"
+
+
+def _result_carries_sandbox_provenance(sandbox: Sandbox) -> None:
+    result = sandbox.run(_SANDBOX_CANONICAL)
+    assert result.sandbox == sandbox.name, "结果必须可溯源到产出它的沙箱"
+
+
+def _run_produces_output(sandbox: Sandbox) -> None:
+    assert sandbox.run(_SANDBOX_CANONICAL).output, "沙箱执行必须产出非空文本"
+
+
+def _usage_is_accounted(sandbox: Sandbox) -> None:
+    usage = sandbox.run(_SANDBOX_CANONICAL).usage
+    assert usage.ops >= 0, "usage.ops 不得为负"
+    assert usage.output_chars >= 0, "usage.output_chars 不得为负"
+    assert usage.wall_seconds >= 0.0, "usage.wall_seconds 不得为负"
+
+
+def _resource_limit_takes_effect(sandbox: Sandbox) -> None:
+    # 给一个「必然被超出」的产出上限(0 字符):守约沙箱必判失败,绝不放行完整产出。
+    result = sandbox.run(_SANDBOX_CANONICAL, limits=Limits(max_output_chars=0))
+    assert not result.ok, "资源上限必须生效:产出超上限时执行不得成功"
+
+
+def _no_network_egress(sandbox: Sandbox) -> None:
+    # 隔离核心:试图开网络出口的代码必须被拒绝 / 判失败(离线套件里由 InProcessSandbox 的 AST
+    # 白名单构造即保证;真实后端须由 OS 级隔离封住,否则接入时这条会如实标红)。
+    result = sandbox.run(_SANDBOX_NETWORK_PROBE)
+    assert not result.ok, "沙箱绝不允许网络出口:网络探针必须被拒绝 / 判失败"
+
+
+SANDBOX_INVARIANTS: InvariantPack[Sandbox] = (
+    InvariantPack("sandbox")
+    .add("result_carries_sandbox_provenance", _result_carries_sandbox_provenance)
+    .add("run_produces_output", _run_produces_output)
+    .add("usage_is_accounted", _usage_is_accounted)
+    .add("resource_limit_takes_effect", _resource_limit_takes_effect)
+    .add("no_network_egress", _no_network_egress)
 )

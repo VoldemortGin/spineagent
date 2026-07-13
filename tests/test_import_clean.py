@@ -17,6 +17,7 @@ _NETWORK_SDKS = [
     "openai",
     "cohere",
     "boto3",
+    "docker",
     "google",
     "requests",
     "aiohttp",
