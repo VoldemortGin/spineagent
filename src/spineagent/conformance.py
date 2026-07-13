@@ -33,7 +33,6 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
 """
 
 import json
-from typing import cast
 
 from corespine.conformance.harness import InvariantPack
 from corespine.llm.provider import ChatCompletion, LLMProvider
@@ -322,10 +321,7 @@ SKILL_INVARIANTS: InvariantPack[Skill] = (
 # middleware 单元素成链包住一个 fixture FunctionAgent 施压——各 middleware 专属语义(压缩 / 记账 /
 # 工具调度 / 附件)归各实现单测(见 tests/test_middleware.py)。
 def _mw_wrap(mw: Middleware) -> MiddlewareAgent:
-    # FunctionAgent 的 name 是只读 property,而 Agent 协议把 name 记为可写变量;二者语义相容(读即
-    # 满足),用 cast 消解 mypy 对 property vs 变量的保守判定(与家族其它缝把具体 agent 当 Agent 传同理)。
-    inner = cast(Agent, FunctionAgent("inner", lambda task: f"done:{task}"))
-    return MiddlewareAgent("mw", inner, [mw])
+    return MiddlewareAgent("mw", FunctionAgent("inner", lambda task: f"done:{task}"), [mw])
 
 
 def _before_step_returns_none(mw: Middleware) -> None:

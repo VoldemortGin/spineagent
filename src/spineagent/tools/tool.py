@@ -28,9 +28,15 @@ class ToolResult:
 
 @runtime_checkable
 class Tool(Protocol):
-    """tool 协议:有名字;给一段输入参数,拿回一个带 provenance 的结果。"""
+    """tool 协议:有名字;给一段输入参数,拿回一个带 provenance 的结果。
 
-    name: str
+    name 为【只读 property】而非可写变量(理由同 Agent 协议):使「具体工具传进 Tool 形参」在
+    mypy --strict 下不触发 property-vs-变量的 variance 冲突;可写属性(如 EchoTool.name 类属性)
+    亦满足只读要求,任一实现皆兼容。
+    """
+
+    @property
+    def name(self) -> str: ...
 
     def run(self, arg: str) -> ToolResult: ...
 

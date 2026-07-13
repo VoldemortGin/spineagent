@@ -45,9 +45,14 @@ class Agent(Protocol):
 
     step 可选接收一个 TraceSink:实现只允许往里记元数据(code/计数/耗时),绝不记任务/
     输出正文——隐私 by construction,由 corespine 的 InProcessPrivacyTraceSink 兜底。
+
+    name 声明为【只读 property】而非可写变量:所有具体 agent 都以 @property 暴露 name,若协议记为
+    可写变量,mypy --strict 会把「具体 agent 传进 Agent 形参」判为 variance 冲突(property 只读 vs
+    变量可写)。只读 property 更贴合实现、且可写属性亦满足只读要求,故任一实现皆兼容。
     """
 
-    name: str
+    @property
+    def name(self) -> str: ...
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult: ...
 
