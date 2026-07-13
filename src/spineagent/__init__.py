@@ -60,6 +60,7 @@ from spineagent.conformance import (
     POLICY_INVARIANTS,
     SANDBOX_INVARIANTS,
     SKILL_INVARIANTS,
+    STREAMING_INVARIANTS,
     TOOL_INVARIANTS,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
@@ -231,5 +232,6 @@ __all__ = [
     "SKILL_INVARIANTS",
     "MIDDLEWARE_INVARIANTS",
     "ARTIFACT_INVARIANTS",
+    "STREAMING_INVARIANTS",
     "__version__",
 ]

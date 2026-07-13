@@ -7,6 +7,10 @@ MAX_TOKENS …)、content 是 block 数组(取 text block)、usage 层级不同(
 
 import-clean:顶层【绝不】import cohere;真实 SDK 仅在未注入 client 时经 lazy_extra_import 延迟拉取
 ([cohere] extra),缺则「pip install spineagent[cohere]」友好报错。映射可注入 fake client 离线单测。
+
+流式:本适配器暂不实现 StreamingLLMProvider——Cohere 原生流式(ClientV2.chat_stream 的事件)形状
+与 OpenAI 块不同,留待需要时按其 SDK 接;不实现即 isinstance(p, StreamingLLMProvider) 如实报 False
+(不加一个会撒谎的桩)。
 """
 
 from typing import Any

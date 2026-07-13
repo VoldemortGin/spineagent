@@ -38,9 +38,15 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
 """
 
 import json
+from typing import Protocol, runtime_checkable
 
 from corespine.conformance.harness import InvariantPack
-from corespine.llm.provider import ChatCompletion, LLMProvider
+from corespine.llm.provider import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    LLMProvider,
+    StreamingLLMProvider,
+)
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
@@ -214,6 +220,43 @@ LLM_INVARIANTS: InvariantPack[LLMProvider] = (
     .add("finish_reason_in_allowed_domain", _finish_reason_in_allowed_domain)
     .add("usage_fields_are_non_negative", _usage_fields_are_non_negative)
     .add("tool_calls_round_trip", _tool_calls_round_trip)
+)
+
+
+# ---- Streaming 不变量(StreamingLLMProvider 叠加协议)-----------------------------------------
+# 流式等价不变量【同时】要 stream_chat 与 chat,故绑到一个「既是 LLMProvider 又是
+# StreamingLLMProvider」的组合协议上(避免在 chat / stream_chat 二选一的单协议里 cast)。
+@runtime_checkable
+class _StreamingChatProvider(LLMProvider, StreamingLLMProvider, Protocol):
+    """既能 chat 又能 stream_chat 的 provider(流式等价不变量需二者并用)。"""
+
+
+def _stream_chunks_are_wellformed(provider: _StreamingChatProvider) -> None:
+    chunks = list(provider.stream_chat(_LLM_MESSAGES))
+    assert chunks, "stream_chat 必须至少吐一块"
+    for chunk in chunks:
+        assert isinstance(chunk, ChatCompletionChunk), "每块必须是 ChatCompletionChunk"
+        assert chunk.choices, "每块 choices 必须非空"
+    finishes = [c.finish_reason for ch in chunks for c in ch.choices if c.finish_reason]
+    assert finishes, "流末必须有 finish_reason"
+    assert all(f in _FINISH_REASONS for f in finishes), f"finish_reason 越界:{finishes}"
+
+
+def _stream_concat_equals_chat(provider: _StreamingChatProvider) -> None:
+    # 核心等价:流式各块 delta.content 顺序拼接 == 非流式 chat() 的 message.content。
+    streamed = "".join(
+        c.delta.content or ""
+        for chunk in provider.stream_chat(_LLM_MESSAGES)
+        for c in chunk.choices
+    )
+    full = provider.chat(_LLM_MESSAGES).choices[0].message.content or ""
+    assert streamed == full, f"流式拼接 {streamed!r} 必须等于非流式 {full!r}"
+
+
+STREAMING_INVARIANTS: InvariantPack[_StreamingChatProvider] = (
+    InvariantPack("streaming")
+    .add("stream_chunks_are_wellformed", _stream_chunks_are_wellformed)
+    .add("stream_concat_equals_chat", _stream_concat_equals_chat)
 )
 
 

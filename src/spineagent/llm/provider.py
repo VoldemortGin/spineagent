@@ -13,17 +13,28 @@ messages/tools),拿回 OpenAI 形状的 ChatCompletion。OpenAICompatProvider �
 AnthropicProvider 在【内部】把 OpenAI messages/tools 转成 Anthropic 原生形状、再把 Anthropic 的
 响应(text / tool_use blocks / stop_reason / usage)转回 OpenAI ChatCompletion——用户无感、不 shim。
 
+【流式】两者【额外】实现 corespine 的 StreamingLLMProvider 叠加协议(stream_chat → 逐块吐
+ChatCompletionChunk):OpenAICompatProvider 近 1:1 直传 SDK 流式块;AnthropicProvider 把 Anthropic
+事件流翻译成 OpenAI 形状的块。二者各 chunk 的 delta.content 顺序拼接 == 非流式 chat() 的 content
+(确定性等价,由 conformance 钉死)。消费者用 `isinstance(p, StreamingLLMProvider)` 探测能力。
+Cohere / Gemini / Bedrock 的原生流式事件【形状各异】,暂不接入流式(不加会撒谎的桩:isinstance
+如实报 False),各在其模块记明留待需要时按各自 SDK 接。
+
 【import-clean】本模块顶层【绝不】import anthropic / openai;真实 SDK 仅在【未注入 client】且构造
 适配器时经 corespine.lazy_extra_import 延迟 import,缺 extra 给「pip install spineagent[…]」友好报错。
 映射逻辑可注入 fake client 离线单测,真实路径只是那一行延迟 import。
 """
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 from corespine.llm.provider import (
     ChatCompletion,
+    ChatCompletionChunk,
     Choice,
+    ChoiceDelta,
+    ChunkChoice,
     FunctionCall,
     LLMProvider,
     MockProvider,
@@ -143,6 +154,51 @@ class AnthropicProvider:
             id=getattr(response, "id", ""),
         )
 
+    def stream_chat(
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+    ) -> Iterator[ChatCompletionChunk]:
+        """流式:开 stream=True,把 Anthropic 事件流【翻译】成 corespine ChatCompletionChunk。
+
+        实现 StreamingLLMProvider 叠加协议。Anthropic 事件形状与 OpenAI 不同,故按事件类型翻译:
+        message_start → 首块(role);content_block_delta 的 text_delta → content 块;message_delta
+        的 stop_reason → 末块(finish_reason 经 _ANTHROPIC_FINISH 映射)。仅翻译文本增量(tool_use
+        流式更复杂,留待需要时再长);各文本增量顺序拼接 == chat() 的 content。
+        """
+        system, convo = _openai_messages_to_anthropic(messages)
+        kwargs = dict(self._extra)
+        if tools:
+            kwargs["tools"] = [_openai_tool_to_anthropic(t) for t in tools]
+        try:
+            stream = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=system,
+                messages=convo,
+                stream=True,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"Anthropic 流式调用失败:{exc}") from exc
+
+        def _chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> ChatCompletionChunk:
+            return ChatCompletionChunk(
+                choices=(ChunkChoice(index=0, delta=delta, finish_reason=finish_reason),),
+                model=self._model,
+            )
+
+        for event in stream:
+            etype = getattr(event, "type", None)
+            if etype == "message_start":
+                yield _chunk(ChoiceDelta(role="assistant"))
+            elif etype == "content_block_delta":
+                delta: Any = getattr(event, "delta", None)
+                if getattr(delta, "type", None) == "text_delta":
+                    yield _chunk(ChoiceDelta(content=delta.text))
+            elif etype == "message_delta":
+                stop = getattr(getattr(event, "delta", None), "stop_reason", None)
+                if stop is not None:
+                    yield _chunk(ChoiceDelta(), finish_reason=_ANTHROPIC_FINISH.get(stop, "stop"))
+
 
 class OpenAICompatProvider:
     """走官方 openai SDK 的 LLMProvider 适配器,可配 base_url 覆盖一切「OpenAI 兼容」端点。
@@ -225,6 +281,45 @@ class OpenAICompatProvider:
             created=getattr(response, "created", 0),
             object=getattr(response, "object", "chat.completion"),
         )
+
+    def stream_chat(
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+    ) -> Iterator[ChatCompletionChunk]:
+        """流式:开 stream=True,把 openai SDK 逐块吐的 chunk 规整成 corespine ChatCompletionChunk。
+
+        实现 StreamingLLMProvider 叠加协议——OpenAI 原生流式与规范同形(delta.role/content +
+        finish_reason),故近 1:1 直传。各 chunk 的 delta.content 顺序拼接 == chat() 的 content。
+        """
+        kwargs = dict(self._extra)
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            stream = self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                max_tokens=self._max_tokens,
+                stream=True,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
+            raise ProviderError(f"OpenAI 兼容端点流式调用失败:{exc}") from exc
+        for chunk in stream:
+            yield ChatCompletionChunk(
+                choices=tuple(
+                    ChunkChoice(
+                        index=getattr(c, "index", i),
+                        delta=ChoiceDelta(
+                            role=getattr(c.delta, "role", None),
+                            content=getattr(c.delta, "content", None),
+                        ),
+                        finish_reason=getattr(c, "finish_reason", None),
+                    )
+                    for i, c in enumerate(chunk.choices)
+                ),
+                model=getattr(chunk, "model", self._model),
+                id=getattr(chunk, "id", ""),
+                created=getattr(chunk, "created", 0),
+            )
 
 
 def _openai_tool_to_anthropic(tool: dict[str, Any]) -> dict[str, Any]:

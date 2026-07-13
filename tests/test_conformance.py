@@ -38,6 +38,7 @@ from spineagent.conformance import (
     POLICY_INVARIANTS,
     SANDBOX_INVARIANTS,
     SKILL_INVARIANTS,
+    STREAMING_INVARIANTS,
     TOOL_INVARIANTS,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
@@ -253,6 +254,97 @@ LLM_SUITE = ConformanceSuite(
 )
 
 
+# ---- Streaming fake client:chat(非流式)与 stream(流式)【文本一致】,故拼接必等于非流式 ----
+_STREAM_TEXT = "hello streaming world"
+
+
+class _StreamFakeOpenAI:
+    """伪 openai:stream=True 逐块吐 delta(role→content 片段→stop);非流式回同一整段文本。"""
+
+    def __init__(self) -> None:
+        self.chat = SimpleNamespace(completions=self)
+
+    def create(self, *, model, messages, max_tokens, stream=False, tools=None, **extra):
+        if stream:
+
+            def _c(role=None, content=None, finish=None):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(role=role, content=content),
+                            finish_reason=finish,
+                        )
+                    ],
+                    model=model,
+                    id="cmpl_stream",
+                    created=0,
+                )
+
+            return iter(
+                [
+                    _c(role="assistant"),
+                    _c(content="hello streaming "),
+                    _c(content="world"),
+                    _c(finish="stop"),
+                ]
+            )
+        message = SimpleNamespace(role="assistant", content=_STREAM_TEXT, tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(index=0, message=message, finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+            model=model,
+            id="cmpl_1",
+            created=0,
+            object="chat.completion",
+        )
+
+
+class _StreamFakeAnthropic:
+    """伪 anthropic:stream=True 吐 message_start / text_delta×2 / message_delta(stop);非流式回同段文本。"""
+
+    def __init__(self) -> None:
+        self.messages = self
+
+    def create(self, *, model, max_tokens, system, messages, stream=False, tools=None, **extra):
+        if stream:
+            return iter(
+                [
+                    SimpleNamespace(type="message_start"),
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        delta=SimpleNamespace(type="text_delta", text="hello streaming "),
+                    ),
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        delta=SimpleNamespace(type="text_delta", text="world"),
+                    ),
+                    SimpleNamespace(
+                        type="message_delta", delta=SimpleNamespace(stop_reason="end_turn")
+                    ),
+                    SimpleNamespace(type="message_stop"),
+                ]
+            )
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=_STREAM_TEXT)],
+            stop_reason="end_turn",
+            model="claude-x",
+            id="msg_1",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=2),
+        )
+
+
+# Streaming conformance:MockProvider(已实现流式)+ 两个实现了叠加协议的适配器(注入流式 fake client)。
+STREAMING_SUITE = ConformanceSuite(
+    {
+        "mock": MockProvider,
+        "openai": lambda: OpenAICompatProvider("gpt-x", client=_StreamFakeOpenAI()),
+        "anthropic": lambda: AnthropicProvider(client=_StreamFakeAnthropic()),
+    },
+    STREAMING_INVARIANTS,
+)
+
+
 @pytest.mark.parametrize(**AGENT_SUITE.parametrize_kwargs())
 def test_agent_conformance(case):
     """每个 agent 实现 × 每条 agent 不变量 各跑一格(6 × 3 = 18 格全绿)。"""
@@ -299,6 +391,13 @@ def test_artifact_conformance(case):
 def test_llm_provider_conformance(case):
     """每个 LLMProvider(mock + 5 后端,各注入 fake client)× 每条 llm 不变量 各跑一格
     (6 × 4 = 24 格全绿)。零真实 API:全部经 fake client 离线驱动。"""
+    case()
+
+
+@pytest.mark.parametrize(**STREAMING_SUITE.parametrize_kwargs())
+def test_streaming_conformance(case):
+    """每个 StreamingLLMProvider(mock + openai + anthropic,注入流式 fake client)× 每条 streaming
+    不变量 各跑一格(3 × 2 = 6 格全绿)。核心:流式拼接 == 非流式。"""
     case()
 
 

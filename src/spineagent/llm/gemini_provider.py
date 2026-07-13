@@ -8,6 +8,10 @@ finishReason 映射、role model→assistant、usageMetadata 重映射)。reason
 
 一个适配器同覆盖 AI Studio 与 Vertex 上的 Gemini(仅 client 构造不同)。import-clean:顶层零 SDK,
 未注入 client 时经 lazy_extra_import 拉 [gemini] extra(google-genai)。映射可注入 fake client 离线单测。
+
+流式:本适配器暂不实现 StreamingLLMProvider——Gemini 原生流式(generate_content_stream 的 chunk)
+形状与 OpenAI 块不同,留待需要时按其 SDK 接;不实现即 isinstance(p, StreamingLLMProvider) 如实报
+False(不加一个会撒谎的桩)。
 """
 
 import json

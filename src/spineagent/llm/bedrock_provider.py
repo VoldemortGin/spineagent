@@ -8,6 +8,10 @@ stopReason 映射、usage 重映射)。
 
 import-clean:顶层零 SDK,未注入 client 时经 lazy_extra_import 拉 [bedrock] extra(boto3);SigV4 由
 boto3 处理。映射可注入 fake client 离线单测。
+
+流式:本适配器暂不实现 StreamingLLMProvider——Bedrock 原生流式(converse_stream 的事件流)形状与
+OpenAI 块不同,留待需要时按其 SDK 接;不实现即 isinstance(p, StreamingLLMProvider) 如实报 False
+(不加一个会撒谎的桩)。
 """
 
 import json
