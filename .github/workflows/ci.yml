@@ -34,7 +34,7 @@ jobs:
       # pyproject 里指向 ../corespine 的本地 path source,该 source 只服务本地开发)。
       - name: Install (spineagent[dev]; corespine from PyPI)
         run: |
-          uv venv .venv
+          uv venv --clear .venv
           VIRTUAL_ENV="$(pwd)/.venv" uv pip install --no-sources -e ".[dev]"
 
       # 四道门各自独立成步,失败时一眼看出是 格式 / lint / 类型 / 测试哪一关红(对称 corespine CI)。
