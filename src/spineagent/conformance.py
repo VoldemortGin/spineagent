@@ -453,9 +453,7 @@ ARTIFACT_INVARIANTS: InvariantPack[ArtifactSink] = (
 # 只验任何 ApprovalGate 都该守的形状 / 三态域 / 幂等 / 摘要不含正文。用一次带敏感值的工具调用构造
 # 请求:任何 gate 看到的 request 都只该携带 schema 指纹与计数,绝不含参数值——各 gate 专属的策略
 # 语义(auto 的模式匹配 / manual 的挂起-恢复)归各实现单测(见 tests/test_approval.py)。
-_APPROVAL_REQUEST = make_approval_request(
-    "tool_call", "delete_file", {"path": _SENSITIVE_MARKER}
-)
+_APPROVAL_REQUEST = make_approval_request("tool_call", "delete_file", {"path": _SENSITIVE_MARKER})
 
 
 def _review_returns_a_decision(gate: ApprovalGate) -> None:

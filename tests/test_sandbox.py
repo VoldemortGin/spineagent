@@ -4,6 +4,8 @@ conformance 里已把「无网络出口 / 上限生效 / 结果带 provenance」
 这里补 InProcessSandbox 专属的行为断言(白名单语义、各失败原因码、env 绑定、real 后端桩)。
 """
 
+from collections.abc import Iterator, Mapping
+
 import pytest
 from corespine.errors import SeamError
 
@@ -35,6 +37,58 @@ def test_integer_float_is_cleaned():
 def test_env_bindings_are_the_only_names():
     result = InProcessSandbox().run("x + y", env={"x": 2, "y": 5})
     assert result.output == "7"
+
+
+def test_custom_mapping_is_rejected_without_invoking_user_code():
+    invoked = False
+
+    class HostileMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            nonlocal invoked
+            invoked = True
+            raise AssertionError("custom mapping must not be queried")
+
+        def __iter__(self) -> Iterator[str]:
+            nonlocal invoked
+            invoked = True
+            raise AssertionError("custom mapping must not be iterated")
+
+        def __len__(self) -> int:
+            nonlocal invoked
+            invoked = True
+            raise AssertionError("custom mapping length must not be read")
+
+    result = InProcessSandbox().run("x", env=HostileMapping())
+
+    assert not result.ok
+    assert result.error == "disallowed"
+    assert not invoked
+
+
+def test_custom_container_value_is_rejected_without_invoking_user_code():
+    invoked = False
+
+    class HostileList(list[object]):
+        def __len__(self) -> int:
+            nonlocal invoked
+            invoked = True
+            raise AssertionError("custom container length must not be read")
+
+        def __iter__(self) -> Iterator[object]:
+            nonlocal invoked
+            invoked = True
+            raise AssertionError("custom container must not be iterated")
+
+        def __str__(self) -> str:
+            nonlocal invoked
+            invoked = True
+            raise AssertionError("custom container must not be rendered")
+
+    result = InProcessSandbox().run("x", env={"x": HostileList([1])})
+
+    assert not result.ok
+    assert result.error == "disallowed"
+    assert not invoked
 
 
 def test_unbound_name_is_refused():
@@ -70,6 +124,15 @@ def test_fstring_renders():
     assert result.output == "hi bob"
 
 
+def test_repeated_large_fstring_value_is_rejected_before_join():
+    code = 'f"' + "{x}" * 1_000 + '"'
+    result = InProcessSandbox().run(code, env={"x": "a" * 32_000})
+
+    assert not result.ok
+    assert result.error == "limit_exceeded"
+    assert result.usage.ops < 10  # 第二个片段即拒绝，不遍历余下片段或物化完整结果
+
+
 def test_syntax_error_is_contained():
     result = InProcessSandbox().run("1 +")
     assert not result.ok
@@ -94,6 +157,28 @@ def test_max_output_chars_limit_takes_effect():
     assert not result.ok
     assert result.error == "limit_exceeded"
     assert result.output == "12"  # 截断到上限
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "'x' * 1000000000",
+        "1000000000 * 'x'",
+        "2 ** 1000000000",
+        "[0] * 1000000000",
+        "['x' * 60000] * 10000",
+    ],
+)
+def test_high_cost_expression_is_rejected_before_materialization(code):
+    result = InProcessSandbox().run(code)
+    assert not result.ok
+    assert result.error == "limit_exceeded"
+
+
+def test_bounded_repetition_and_power_still_work():
+    sandbox = InProcessSandbox()
+    assert sandbox.run("'ab' * 3").output == "ababab"
+    assert sandbox.run("2 ** 10").output == "1024"
 
 
 def test_timeout_folds_into_limits_without_crashing():

@@ -158,7 +158,9 @@ def _seeded_agent(gate, *, gated_tools, tool_for_step):
     """把 DynamicToolMiddleware(播种 ctx.tools)套在审批 middleware 外层,内层是会「执行」的 agent。"""
     inner = FunctionAgent("inner", lambda t: "did-risky-thing")
     seed = DynamicToolMiddleware(default=tuple(tool_for_step))
-    return MiddlewareAgent("guarded", inner, [seed, ApprovalMiddleware(gate, gated_tools=gated_tools)])
+    return MiddlewareAgent(
+        "guarded", inner, [seed, ApprovalMiddleware(gate, gated_tools=gated_tools)]
+    )
 
 
 def test_default_config_is_zero_behavior_change():

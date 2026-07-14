@@ -154,7 +154,9 @@ def test_all_cooled_forces_retry_of_cooled_downstreams():
     # 窗口内(两个都还冷却着)但 gated 已自愈:强制回退这轮应把 gated 也试到并成功。
     clock.advance(5.0)
     gated.open = True
-    assert fp.chat(_MSGS).choices[0].message.content == "gated", "全冷却时应强制重试并回退到已自愈者"
+    assert fp.chat(_MSGS).choices[0].message.content == "gated", (
+        "全冷却时应强制重试并回退到已自愈者"
+    )
 
 
 def test_exhausted_error_aggregates_reasons_without_leaking_credentials():
@@ -193,7 +195,11 @@ def test_negative_cooldown_rejected():
 # ---- 流式:能力诚实 + 首块前失败可回退 -------------------------------------------------------
 def _chunk(*, role=None, content=None, finish=None) -> ChatCompletionChunk:
     return ChatCompletionChunk(
-        choices=(ChunkChoice(index=0, delta=ChoiceDelta(role=role, content=content), finish_reason=finish),)
+        choices=(
+            ChunkChoice(
+                index=0, delta=ChoiceDelta(role=role, content=content), finish_reason=finish
+            ),
+        )
     )
 
 
@@ -239,9 +245,7 @@ def test_stream_chat_fails_over_before_first_chunk():
     clock = _FakeClock()
     p0, p1 = _StreamFlaky("p0", fail=True), _StreamFlaky("p1", fail=False)
     fp = make_failover_provider([p0, p1], now_fn=clock)
-    text = "".join(
-        c.delta.content or "" for chunk in fp.stream_chat(_MSGS) for c in chunk.choices
-    )
+    text = "".join(c.delta.content or "" for chunk in fp.stream_chat(_MSGS) for c in chunk.choices)
     assert text == "p1", "首块前抛可重试错应干净回退到下一家的流"
 
 

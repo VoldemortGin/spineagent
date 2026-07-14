@@ -17,7 +17,7 @@ type: application
 # chart 自身版本（与应用版本解耦）。
 version: 0.1.0
 # 应用版本 = 当前 pyproject.toml 的 version。
-appVersion: "0.0.3"
+appVersion: "0.2.0"
 keywords:
   - multi-agent
   - agent

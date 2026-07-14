@@ -118,7 +118,9 @@ class FailoverProvider:
         self._cooldown_until[idx] = 0.0
         self._cursor = (idx + 1) % len(self._providers)
 
-    def _on_failure(self, idx: int, exc: BaseException, now: float, failures: dict[int, str]) -> None:
+    def _on_failure(
+        self, idx: int, exc: BaseException, now: float, failures: dict[int, str]
+    ) -> None:
         """某下游撞可重试错:记录(脱敏)原因并置其冷却截止时刻。"""
         self._cooldown_until[idx] = now + self._cooldown_seconds
         label = type(self._providers[idx]).__name__
@@ -127,7 +129,9 @@ class FailoverProvider:
     def _exhausted(self, failures: dict[int, str]) -> FailoverExhaustedError:
         """把逐个下游的(已脱敏)失败原因拼成一条清晰的聚合错误。"""
         reasons = "; ".join(failures[i] for i in sorted(failures))
-        return FailoverExhaustedError(f"全部 {len(self._providers)} 个下游 provider 均失败:{reasons}")
+        return FailoverExhaustedError(
+            f"全部 {len(self._providers)} 个下游 provider 均失败:{reasons}"
+        )
 
     def chat(
         self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None

@@ -20,8 +20,8 @@
 #   (不发 Release 即不触发)。
 #
 # ── 切一个 release ───────────────────────────────────────────────────────────────────
-# 在 pyproject.toml bump `version`(须【大于】PyPI 现有的 0.0.3,如 0.0.4;PyPI 拒绝重传同版本),
-# 提交,然后发布一个 GitHub Release(tag 如 v0.0.4)。
+# 在 pyproject.toml 把 `version` 从 PyPI 现有的 0.1.0 bump 到本次 0.2.0
+# (PyPI 拒绝重传同版本),提交,然后发布一个 GitHub Release(tag v0.2.0)。
 name: Release
 
 on:

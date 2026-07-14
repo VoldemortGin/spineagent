@@ -17,9 +17,10 @@ Call / 非白名单 Name),用「AST 节点预算」作为确定性的 CPU 代理
 """
 
 import ast
+import math
 import operator
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -61,6 +62,15 @@ class Limits:
 # 缺省上限:离线默认路径开箱即用的温和护栏(可被 run() 的 limits / timeout 覆盖)。
 DEFAULT_LIMITS = Limits(timeout_seconds=5.0, max_output_chars=64_000, max_ops=100_000)
 
+# InProcessSandbox 与宿主进程共享内存，节点数预算本身挡不住少量 AST 节点制造巨值
+# （如 ``"x" * 10**9`` / ``2 ** 10**9``）。这些硬上限先于真实运算检查，属于
+# 进程内参照实现不可关闭的安全边界；需要更大计算面的调用方应换 OS 级沙箱后端。
+_MAX_CODE_CHARS = 64_000
+_MAX_VALUE_CHARS = 64_000
+_MAX_COLLECTION_ITEMS = 10_000
+_MAX_INT_BITS = 8_192
+_MAX_POWER_EXPONENT = 10_000
+
 
 @dataclass(frozen=True)
 class SandboxResult:
@@ -99,7 +109,7 @@ class Sandbox(Protocol):
         *,
         timeout: float | None = None,
         limits: Limits | None = None,
-        env: Mapping[str, object] | None = None,
+        env: object | None = None,
     ) -> SandboxResult: ...
 
 
@@ -171,6 +181,85 @@ class _LimitExceeded(Exception):
     """求值超出某个资源上限(节点预算 max_ops)。"""
 
 
+def _plain_int(value: Any) -> bool:
+    """bool 是 int 子类，但不按大整数运算参与预测。"""
+    return type(value) is int
+
+
+def _sequence_repeat_operands(
+    left: Any, right: Any
+) -> tuple[str | bytes | list[Any] | tuple[Any, ...] | None, int | None]:
+    """规整 ``sequence * int`` / ``int * sequence`` 两种重复形状。"""
+    sequence_types = {str, bytes, list, tuple}
+    if type(left) in sequence_types and _plain_int(right):
+        return left, right
+    if _plain_int(left) and type(right) in sequence_types:
+        return right, left
+    return None, None
+
+
+def _bounded_render_cost(
+    value: Any,
+    remaining: int = _MAX_VALUE_CHARS,
+    stack: set[int] | None = None,
+) -> int:
+    """保守估算 ``str(value)`` 物化成本，并递归拒绝非 JSON-like / 循环巨值。"""
+    stack = stack if stack is not None else set()
+
+    def charge(cost: int) -> int:
+        if cost > remaining:
+            raise _LimitExceeded(f"值的渲染成本超过 {_MAX_VALUE_CHARS}")
+        return cost
+
+    value_type = type(value)
+    if value is None or value_type is bool:
+        return charge(5)
+    if value_type is int:
+        if value.bit_length() > _MAX_INT_BITS:
+            raise _LimitExceeded(f"整数位数超过 {_MAX_INT_BITS}")
+        return charge((value.bit_length() * 3) // 10 + 3)
+    if value_type is float:
+        if not math.isfinite(value):
+            raise _LimitExceeded("不允许非有限浮点值")
+        return charge(32)
+    if value_type is complex:
+        if not (math.isfinite(value.real) and math.isfinite(value.imag)):
+            raise _LimitExceeded("不允许非有限复数值")
+        return charge(70)
+    if value_type is str:
+        return charge(len(value) + 2)
+    if value_type is bytes:
+        return charge(len(value) * 4 + 3)
+    if value_type is slice:
+        total = 8
+        for part in (value.start, value.stop, value.step):
+            total += _bounded_render_cost(part, remaining - total, stack)
+        return charge(total)
+    if value_type not in {list, tuple, set, frozenset, dict}:
+        raise _Disallowed("只允许 JSON-like 标量/容器值，不允许自定义对象")
+    if len(value) > _MAX_COLLECTION_ITEMS:
+        raise _LimitExceeded(f"容器元素数超过 {_MAX_COLLECTION_ITEMS}")
+
+    identity = id(value)
+    if identity in stack:
+        raise _Disallowed("不允许循环引用容器")
+    stack.add(identity)
+    try:
+        total = 5 if value_type in {set, frozenset} and not value else 2
+        items = value.items() if value_type is dict else value
+        for item in items:
+            if value_type is dict:
+                key, child = item
+                total += _bounded_render_cost(key, remaining - total, stack) + 2
+                total += _bounded_render_cost(child, remaining - total, stack) + 2
+            else:
+                total += _bounded_render_cost(item, remaining - total, stack) + 2
+            charge(total)
+        return charge(total)
+    finally:
+        stack.remove(identity)
+
+
 class _Evaluator:
     """一棵【纯表达式白名单 AST】的递归求值器,带节点预算(确定性 CPU 代理)。
 
@@ -179,7 +268,7 @@ class _Evaluator:
     / 非白名单 Name(挡 open / __import__)一律拒绝——【构造即保证】无网络出口、无文件系统逃逸。
     """
 
-    def __init__(self, env: Mapping[str, object], max_ops: int | None) -> None:
+    def __init__(self, env: dict[str, object], max_ops: int | None) -> None:
         self._env = env
         self._max_ops = max_ops
         self.ops = 0
@@ -191,7 +280,14 @@ class _Evaluator:
         handler = _HANDLERS.get(type(node))
         if handler is None:
             raise _Disallowed(f"不允许的表达式节点:{type(node).__name__}")
-        return handler(self, node)
+        value = handler(self, node)
+        self._ensure_bounded(value)
+        return value
+
+    @staticmethod
+    def _ensure_bounded(value: Any) -> None:
+        """递归拒绝巨值，确保最终 ``str(value)`` 之前已有总预算。"""
+        _bounded_render_cost(value)
 
     # 各节点处理器(签名统一 (self, node) -> Any)。
 
@@ -207,7 +303,45 @@ class _Evaluator:
         op = _BIN_OPS.get(type(node.op))
         if op is None:
             raise _Disallowed(f"不允许的二元运算符:{type(node.op).__name__}")
-        return op(self.eval(node.left), self.eval(node.right))
+        left = self.eval(node.left)
+        right = self.eval(node.right)
+        self._guard_expensive_binop(node.op, left, right)
+        return op(left, right)
+
+    @staticmethod
+    def _guard_expensive_binop(op: ast.operator, left: Any, right: Any) -> None:
+        """在物化结果前拒绝可预测的巨型幂、重复与拼接。"""
+        if isinstance(op, ast.Pow) and isinstance(right, int) and not isinstance(right, bool):
+            if abs(right) > _MAX_POWER_EXPONENT:
+                raise _LimitExceeded(f"幂指数绝对值超过 {_MAX_POWER_EXPONENT}")
+            if right >= 0 and isinstance(left, int) and not isinstance(left, bool):
+                predicted_bits = max(1, left.bit_length()) * right
+                if predicted_bits > _MAX_INT_BITS:
+                    raise _LimitExceeded(f"幂运算结果位数超过 {_MAX_INT_BITS}")
+
+        if isinstance(op, ast.Mult):
+            sequence, count = _sequence_repeat_operands(left, right)
+            if sequence is not None and count is not None:
+                limit = (
+                    _MAX_VALUE_CHARS
+                    if isinstance(sequence, (str, bytes))
+                    else _MAX_COLLECTION_ITEMS
+                )
+                if count > 0 and len(sequence) > limit // count:
+                    raise _LimitExceeded(f"序列重复结果大小超过 {limit}")
+            if _plain_int(left) and _plain_int(right):
+                if left.bit_length() + right.bit_length() > _MAX_INT_BITS + 1:
+                    raise _LimitExceeded(f"整数乘法结果位数超过 {_MAX_INT_BITS}")
+
+        if isinstance(op, ast.Add) and type(left) is type(right):
+            if isinstance(left, (str, bytes)) and len(left) + len(right) > _MAX_VALUE_CHARS:
+                raise _LimitExceeded(f"文本拼接结果长度超过 {_MAX_VALUE_CHARS}")
+            if isinstance(left, (list, tuple)) and len(left) + len(right) > _MAX_COLLECTION_ITEMS:
+                raise _LimitExceeded(f"容器拼接结果元素数超过 {_MAX_COLLECTION_ITEMS}")
+
+        # Python 的字符串 % 格式支持超大宽度（如 "%1000000000s"），少量 AST 即可分配巨量内存。
+        if isinstance(op, ast.Mod) and isinstance(left, (str, bytes)):
+            raise _Disallowed("不允许字符串 % 格式化")
 
     def _unaryop(self, node: ast.UnaryOp) -> Any:
         op = _UNARY_OPS.get(type(node.op))
@@ -280,7 +414,17 @@ class _Evaluator:
         return func(*args, **kwargs)
 
     def _joinedstr(self, node: ast.JoinedStr) -> Any:
-        return "".join(str(self.eval(part)) for part in node.values)
+        parts: list[str] = []
+        total_chars = 0
+        for part_node in node.values:
+            part = self.eval(part_node)
+            if type(part) is not str:
+                raise _Disallowed("f-string 片段必须是普通 str")
+            if len(part) > _MAX_VALUE_CHARS - total_chars:
+                raise _LimitExceeded(f"f-string 结果长度超过 {_MAX_VALUE_CHARS}")
+            parts.append(part)
+            total_chars += len(part)
+        return "".join(parts)
 
     def _formattedvalue(self, node: ast.FormattedValue) -> Any:
         value = self.eval(node.value)
@@ -315,7 +459,7 @@ _HANDLERS: dict[type[ast.AST], Callable[[_Evaluator, Any], Any]] = {
 
 def _format_output(value: Any) -> str:
     """把求值结果规整成文本:整数值的 float 去掉多余 .0,其余 str()。"""
-    if isinstance(value, float) and value.is_integer():
+    if type(value) is float and value.is_integer():
         return str(int(value))
     return str(value)
 
@@ -337,15 +481,35 @@ class InProcessSandbox:
         *,
         timeout: float | None = None,
         limits: Limits | None = None,
-        env: Mapping[str, object] | None = None,
+        env: object | None = None,
     ) -> SandboxResult:
         eff = _effective_limits(timeout, limits)
-        namespace: Mapping[str, object] = env or {}
         started = time.perf_counter()
+        evaluator = _Evaluator({}, eff.max_ops)
+        if type(code) is not str:
+            return self._fail("disallowed", "code 必须是普通 str", evaluator, started)
+        if env is not None and type(env) is not dict:
+            return self._fail("disallowed", "env 必须是普通 dict", evaluator, started)
+        namespace = {} if env is None else env.copy()
+        if any(type(name) is not str for name in namespace):
+            return self._fail("disallowed", "env 的键必须是普通 str", evaluator, started)
+        try:
+            _bounded_render_cost(namespace)
+        except _Disallowed as exc:
+            return self._fail("disallowed", str(exc), evaluator, started)
+        except _LimitExceeded as exc:
+            return self._fail("limit_exceeded", str(exc), evaluator, started)
         evaluator = _Evaluator(namespace, eff.max_ops)
+        if len(code) > _MAX_CODE_CHARS:
+            return self._fail(
+                "limit_exceeded",
+                f"代码长度超过 {_MAX_CODE_CHARS}",
+                evaluator,
+                started,
+            )
         try:
             tree = ast.parse(code, mode="eval")
-        except SyntaxError as exc:
+        except (SyntaxError, ValueError, RecursionError) as exc:
             return self._fail("syntax", f"语法错误:{exc}", evaluator, started)
         try:
             value = evaluator.eval(tree.body)
