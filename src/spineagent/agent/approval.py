@@ -35,7 +35,7 @@ import json
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from enum import Enum
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from corespine.errors import CorespineError
@@ -48,7 +48,7 @@ from spineagent.agent.middleware import StepContext, middlewares
 APPROVAL_TOOL_CALL = "tool_call"
 
 
-class Decision(str, Enum):
+class Decision(StrEnum):
     """审批三态决议:放行 / 拒绝 / 待定(继承 str 便于落库 / 记 trace / 序列化)。"""
 
     APPROVED = "approved"

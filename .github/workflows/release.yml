@@ -1,7 +1,7 @@
 # Release → PyPI via Trusted Publishing (OIDC — NO stored token / secret).
 #
 # 与家族 corespine / ragspine / pdfspine 的发布模型对齐:发布 GitHub Release 时触发,`gate`
-# 跑与 ci.yml 同形的四道门(ruff format + ruff + mypy --strict + pytest,跨 3.10/3.11/3.12),
+# 跑与 ci.yml 同形的四道门(ruff format + ruff + mypy --strict + pytest,3.14),
 # 全绿后 `publish` 才 build sdist + wheel 并上传 `spineagent` 分发包。发布版本以 pyproject.toml
 # 的 version 为准(与 tag 保持同步),不从 tag 推导。
 #
@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        python: ["3.10", "3.11", "3.12"]
+        python: ["3.14"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Build sdist + wheel
         run: |
           python -m pip install -U build

@@ -24,18 +24,12 @@ manifest.toml 示例:
 加载器,零数据库、零网络——与家族「纯 registry 缝」一致。
 """
 
-import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
 from spineagent.sandbox.seam import Sandbox
 from spineagent.skills.skill import FixtureSkill, Skill, SkillSpec, skill_registry
-
-# TOML 解析:3.11+ 用标准库 tomllib;3.10 回退到轻量纯 Python 的 tomli(见 pyproject 条件依赖)。
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # pragma: no cover —— 仅 3.10 走此分支;CI 在 3.11+ 上跑
-    import tomli as tomllib
 
 _MANIFEST_NAME = "manifest.toml"
 _DEFAULT_SCRIPT = "skill.py"

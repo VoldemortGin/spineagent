@@ -45,7 +45,7 @@ src/spineagent/
   agent/approval.py         审批门 / Wait 缝(对标 n8n Send-and-Wait 概念):ApprovalGate 协议(review(ApprovalRequest)→ Decision 三态 approved/rejected/pending)+ ApprovalRequest(只带 code/确定性 id/工具名/参数 schema 指纹+计数,绝不含参数正文)+ 离线默认 AutoApprovalGate(工具名 glob allow/deny 策略表,永不 pending)/ ManualApprovalGate(进程内挂起:review 登记待审、resolve 落决议+铸一次性 resume token、redeem 消费重放必败)+ 可插拔一次性 ResumeTokenStore(默认 InMemoryResumeTokenStore,只存 sha256 哈希)+ make_approval_gate/approval_gates Registry;ApprovalMiddleware 插进 middleware 链:approved 放行、rejected 抛 ApprovalRejected 断路、pending 抛 ApprovalPending 挂起(编排层经 error_to_dict 归一进 AgentResult.error;resolve 后重跑 step 恢复,复用决议幂等,零新增循环机制),默认 gated_tools 空=零行为变化(opt-in);决议幂等,trace 只记 code/计数/决议
   sandbox/seam.py           Sandbox 缝:协议(run(code, *, timeout, limits) -> SandboxResult)+ 离线确定性默认 InProcessSandbox(受限白名单 AST 求值器,构造即保证无网络出口 / 无文件系统逃逸,ops / output 上限)+ sandboxes Registry;真实硬隔离后端 subprocess / container 走 [sandbox] extra 延迟 import
   skills/skill.py           Skill 缝:SkillSpec(manifest)+ 协议(describe() 确定性 schema / invoke(args) 带 provenance)+ 离线默认 FixtureSkill(脚本经 Sandbox 隔离执行)+ skill_registry Registry
-  skills/bundle.py          SkillBundle:manifest.toml + 脚本文件的目录加载器(tomllib,3.10 回退 tomli)
+  skills/bundle.py          SkillBundle:manifest.toml + 脚本文件的目录加载器(tomllib)
   skills/as_tool.py         skill_as_function_tool:把 Skill 桥成 FunctionTool,直接进 FunctionCallingAgent
   tools/tool.py             Tool 协议 + EchoTool / CalcTool + tool_registry(spec 选工具 + entry-point 第三方工具发现,group corespine.tool);注:运行时可把 ragspine RAG 插为 Tool
   tools/function_tool.py    FunctionTool(带 JSON-schema、接 dict 参数,给真 function-calling 用)+ @function_tool 装饰器(从签名自动推 schema)
@@ -68,6 +68,6 @@ VIRTUAL_ENV="$(pwd)/.venv" uv pip install -e ".[dev]"
 
 ## 约定
 
-- Python **3.10+** 类型注解;import 顺序 **stdlib > 三方 > 本地**;简体中文 docstring/注释,匹配家族风格。
+- Python **3.14** 类型注解;import 顺序 **stdlib > 三方 > 本地**;简体中文 docstring/注释,匹配家族风格。
 - **TDD**——测试即规格;**最小改动**——只改需求要求的部分。
 - **深层、按领域分组**的布局:文件路径先定位职责,再读文件名。

@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12"]
+        python: ["3.14"]
     steps:
       - name: Checkout spineagent
         uses: actions/checkout@v4

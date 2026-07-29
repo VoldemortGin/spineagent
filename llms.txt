@@ -7,7 +7,7 @@
 
 - pip 安装名:`spineagent`(真实后端选装 extra,见下)
 - import 名:`import spineagent`
-- Python:>= 3.10
+- Python:>= 3.14, < 3.15
 - 依赖:`corespine`(唯一运行时依赖;spineagent 复用其 `LLMProvider` 缝、`TraceSink`
   隐私 observability、`Registry` 缝工厂、`SeamError` / `error_to_dict` 错误形状)
 

@@ -1,11 +1,11 @@
 [project]
 name = "spineagent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Spine 家族的通用多 agent 协作框架:agent / tool / 编排 + MCP / A2A 协议缝(离线优先,依赖 corespine)。"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.14,<3.15"
 authors = [{ name = "lin han" }]
 keywords = [
     "multi-agent",
@@ -25,9 +25,7 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 # 默认路径只依赖薄核 corespine,零网络、零重依赖、离线可跑。真实协议 SDK 经下方可选
@@ -38,13 +36,10 @@ dependencies = [
     # 的静态半边互补。守护式 import(见 src/spineagent/__init__.py)使其缺失时仍可离线
     # 运行,但列为核心依赖以保证质量门默认开启。
     "beartype>=0.18",
-    # SkillBundle 读 manifest.toml:3.11+ 用标准库 tomllib;3.10 回退到轻量纯 Python 的 tomli
-    # (无网络、import-clean 安全)。3.11+ 环境不装(marker 求值为假)。
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "ruff>=0.9.0", "mypy>=1.11"]
+dev = ["pytest>=8.0.0", "ruff>=0.12", "mypy>=1.12"]
 # 协议真实后端的占位 extra:仅在显式选用时安装,默认离线路径永不触碰。
 mcp = ["mcp"]
 a2a = ["a2a-sdk"]
@@ -80,7 +75,7 @@ corespine = { path = "../corespine", editable = true }
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py314"
 # src 布局:把 src/ 标为第一方根,isort(I 规则)才能把 `import spineagent` 正确归到一方分组。
 src = ["src"]
 
@@ -89,7 +84,7 @@ select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]  # 行宽不作硬门槛(中文注释易超 100 列);其余风格 / import 序 / 死代码照常 gate。
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.14"
 strict = true
 files = ["src/spineagent"]
 
@@ -105,8 +100,6 @@ module = [
     "mcp.*",
     "a2a.*",
     "docker.*",
-    # tomli 仅 3.10 回退分支 import(3.11+ 用标准库 tomllib);dev 环境多在 3.11+ 不装其 stub。
-    "tomli",
 ]
 ignore_missing_imports = true
 
@@ -116,11 +109,4 @@ testpaths = ["tests"]
 # importlib 导入模式:不依赖 __init__.py / sys.path 改写,与 src 布局 + 现代 pytest 推荐一致。
 addopts = "--import-mode=importlib"
 # warning 即错误:任何 DeprecationWarning / ResourceWarning 等都让测试红,逼早修而非埋雷。
-# 精确豁免一条:beartype 0.18 把 `Action: TypeAlias = ToolCall | Finish`(PEP 613)告警为
-# 「已被 PEP 695 取代」。但 PEP 695 的 `type X = ...` 语法仅 3.12+ 可用,而本包支持 3.10+;
-# 改写成 NewType 又会破坏联合类型给 mypy --strict 的语义(beartype 自己的告警文案亦如此自嘲)。
-# 故【按类别精确 ignore 这一条】,其余 warning 仍一律 error。
-filterwarnings = [
-    "error",
-    "ignore::beartype.roar.BeartypeDecorHintPep613DeprecationWarning",
-]
+filterwarnings = ["error"]

@@ -12,8 +12,8 @@
 #
 # 忽略规则见同目录 .dockerignore(详见 deploy/README.md 的 .dockerignore 说明)。
 
-# uv 官方镜像:自带 Python 3.11 + uv,贴合家族「uv 管环境」的约定。
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+# uv 官方镜像:自带 Python 3.14 + uv,贴合家族「uv 管环境」的约定。
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 
 WORKDIR /app
 

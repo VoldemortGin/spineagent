@@ -41,7 +41,7 @@ class Artifact:
     @classmethod
     def from_text(
         cls, name: str, text: str, *, mime: str = "text/plain", producer: str = ""
-    ) -> "Artifact":
+    ) -> Artifact:
         """从文本构造 Artifact(UTF-8 编码进字节;mime 默认 text/plain)。"""
         return cls(name=name, data=text.encode("utf-8"), mime=mime, producer=producer)
 

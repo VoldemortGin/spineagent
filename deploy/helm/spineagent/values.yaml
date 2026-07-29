@@ -67,7 +67,7 @@ secrets:
 extraEnv: {}
 
 # ---- 容器安全上下文 -----------------------------------------------------------
-# 基础镜像（uv:python3.11-bookworm-slim）默认以 root 跑且不落盘，这里不强加 fsGroup（无卷需改属主）。
+# 基础镜像（uv:python3.14-bookworm-slim）默认以 root 跑且不落盘，这里不强加 fsGroup（无卷需改属主）。
 # 如你的集群有 PodSecurity 限制，可在此填 runAsNonRoot / runAsUser 等。
 podSecurityContext: {}
 

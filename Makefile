@@ -1,7 +1,7 @@
 # spineagent —— 一键开发 / CI 命令(始终从包根跑)。
 #
 # `make` 或 `make help` 列出全部目标。默认走包内 venv;可覆盖解释器:
-#   make test PYTHON=python3.12
+#   make test PYTHON=python3.14
 #
 # 跨平台:用 $(VENV)/$(PYTHON) 变量(对齐家族 ragspine 的写法)。
 

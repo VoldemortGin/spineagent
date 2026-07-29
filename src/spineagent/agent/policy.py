@@ -18,7 +18,7 @@ decide 是【无状态纯函数】:循环状态全由入参 history 携带,同�
 """
 
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from corespine.errors import SeamError
 from corespine.seam.registry import Registry
@@ -40,7 +40,7 @@ class Finish:
 
 
 # 一个决策动作:调工具,或收尾。isinstance 分发(PEP 604 联合)。
-Action: TypeAlias = ToolCall | Finish
+type Action = ToolCall | Finish
 
 
 @dataclass(frozen=True)

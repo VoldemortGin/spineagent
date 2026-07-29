@@ -538,7 +538,7 @@ class InProcessSandbox:
         )
 
     def _fail(
-        self, reason: str, message: str, evaluator: "_Evaluator", started: float
+        self, reason: str, message: str, evaluator: _Evaluator, started: float
     ) -> SandboxResult:
         return SandboxResult(
             sandbox=self.name,
@@ -549,7 +549,7 @@ class InProcessSandbox:
         )
 
     @staticmethod
-    def _usage(evaluator: "_Evaluator", started: float, output_chars: int) -> ResourceUsage:
+    def _usage(evaluator: _Evaluator, started: float, output_chars: int) -> ResourceUsage:
         return ResourceUsage(
             ops=evaluator.ops,
             output_chars=output_chars,
