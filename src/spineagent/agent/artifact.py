@@ -15,6 +15,8 @@ provenance 的元数据引用】(重字节留在 sink 里),与 AgentResult 已�
                              字节存进 blob、元数据随 ArtifactRef 返回,取回时据 ref 重建 Artifact。
 """
 
+from __future__ import annotations
+
 import hashlib
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable

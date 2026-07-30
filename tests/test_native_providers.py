@@ -39,7 +39,7 @@ def _installed(module: str) -> bool:
     """模块是否可导入(find_spec 对缺父包的点路径会抛异常,这里一律吞成 False)。"""
     try:
         return importlib.util.find_spec(module) is not None
-    except ImportError, ValueError:
+    except (ImportError, ValueError):
         return False
 
 

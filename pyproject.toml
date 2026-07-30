@@ -1,11 +1,11 @@
 [project]
 name = "spineagent"
-version = "0.3.0"
+version = "0.3.1"
 description = "Spine 家族的通用多 agent 协作框架:agent / tool / 编排 + MCP / A2A 协议缝(离线优先,依赖 corespine)。"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12"
 authors = [{ name = "lin han" }]
 keywords = [
     "multi-agent",
@@ -25,6 +25,8 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
@@ -75,7 +77,7 @@ corespine = { path = "../corespine", editable = true }
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py312"
 # src 布局:把 src/ 标为第一方根,isort(I 规则)才能把 `import spineagent` 正确归到一方分组。
 src = ["src"]
 
@@ -84,7 +86,7 @@ select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]  # 行宽不作硬门槛(中文注释易超 100 列);其余风格 / import 序 / 死代码照常 gate。
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 strict = true
 files = ["src/spineagent"]
 

@@ -68,6 +68,6 @@ VIRTUAL_ENV="$(pwd)/.venv" uv pip install -e ".[dev]"
 
 ## 约定
 
-- Python **3.14** 类型注解;import 顺序 **stdlib > 三方 > 本地**;简体中文 docstring/注释,匹配家族风格。
+- Python **3.12+** 类型注解;import 顺序 **stdlib > 三方 > 本地**;简体中文 docstring/注释,匹配家族风格。
 - **TDD**——测试即规格;**最小改动**——只改需求要求的部分。
 - **深层、按领域分组**的布局:文件路径先定位职责,再读文件名。
