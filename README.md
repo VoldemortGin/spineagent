@@ -4,6 +4,10 @@ Spine 家族的**通用多 agent 协作框架**(见 [ADR 0001](../docs/adr/0001-
 agent / tool / 编排 + **MCP / A2A** 等 agent 协议缝。依赖薄核 `corespine`,复用其缝元模式与
 observability / config 形状;**默认路径离线可跑、import-clean、零网络 SDK**。
 
+## Spine 家族 / Spine family
+
+本仓库是 Spine 家族的成员之一（角色：L1 引擎）。家族全部成员、分层、依赖方向、依赖形式与当前差距见 [`docs/spine-family.md`](docs/spine-family.md)；该文件在每个家族仓库中的副本内容相同，真源在家族根目录 `~/startup/spine/docs/spine-family.md`，用根目录 `make family-doc-sync` 同步。
+
 > 通用 ≠ 地基。真正的核是更薄的 `corespine`,spineagent 是它的兄弟消费者,**不**含任何 RAG 概念。
 > 详见 [`CLAUDE.md`](CLAUDE.md) 宪章。
 >

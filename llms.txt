@@ -20,6 +20,7 @@
 - `docs/llms/api.md` — 完整公开 API:每个导出的真实签名 + 契约 + 一句话,按 agent / tool / orchestration / protocol / llm 分节
 - `docs/llms/recipes.md` — 可运行最小示例(离线优先,用 `MockProvider`):建并跑 agent、工具循环、顺序/并行/流水线编排、装真实 LLM 后端怎么接
 - `docs/llms/gotchas.md` — 陷阱:provider 输出是 OpenAI ChatCompletion 形状、真实后端要装对应 extra、离线默认 MockProvider、`SeamError` 表示缝未接入
+- `docs/spine-family.md` — Spine 家族成员、分层、依赖方向与实际依赖形式(非本包 API,跨仓关系用)
 
 ## 心智模型(一句话)
 

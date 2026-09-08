@@ -1,5 +1,7 @@
 # CLAUDE.md — spineagent(宪章)
 
+> 家族关系与依赖：先读 [`docs/spine-family.md`](docs/spine-family.md)（每仓副本相同，真源在家族根目录）。
+
 Spine 家族的 AI / 人类协作契约。先读家族 `../README.md` 与
 `../docs/adr/0001-spine-family-boundaries-and-dependency-direction.md`,本文件是 spineagent 的操作指南。
 
