@@ -16,6 +16,7 @@ from typing import Any, Protocol, runtime_checkable
 from corespine.errors import CorespineError, SeamError
 from corespine.seam.registry import Registry, lazy_extra_import
 
+from spineagent.agent.trust import untrusted
 from spineagent.tools.tool import ToolResult
 
 # 真实官方 MCP SDK 的 import 名(装了 spineagent[mcp] 才有);默认离线路径绝不 import 它。
@@ -112,7 +113,8 @@ class McpClientTool:
                 tool=self.name,
                 result_key=self._result_key,
             )
-        return ToolResult(tool=self.name, output=str(result[self._result_key]))
+        # 对端返回是数据:标为不可信(见 agent/trust.py)。
+        return ToolResult(tool=self.name, output=untrusted(str(result[self._result_key])))
 
 
 def load_mcp_sdk() -> Any:

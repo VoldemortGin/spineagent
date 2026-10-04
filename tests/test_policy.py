@@ -114,3 +114,16 @@ def test_interleaved_prose_preserved_in_order_on_finish():
     action = SyntaxToolPolicy().decide(task, tools=("calc",), history=history)
     assert isinstance(action, Finish)
     assert action.answer == "intro line\nmiddle prose\noutro prose\n4"
+
+
+def test_trust_invariant_flags_a_policy_that_parses_data():
+    # 显式打开旧行为的 policy 必须被信任边界不变量如实标红(证明这格真的有牙齿)。
+    from corespine.conformance.harness import ConformanceSuite
+
+    from spineagent.conformance import POLICY_INVARIANTS
+
+    suite = ConformanceSuite(
+        {"legacy": lambda: SyntaxToolPolicy(parse_untrusted=True)}, POLICY_INVARIANTS
+    )
+    failed = {r.invariant for r in suite.run() if not r.passed}
+    assert failed == {"untrusted_data_is_never_an_instruction"}

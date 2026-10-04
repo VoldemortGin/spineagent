@@ -533,7 +533,7 @@ def test_tool_conformance(case):
 
 @pytest.mark.parametrize(**POLICY_SUITE.parametrize_kwargs())
 def test_policy_conformance(case):
-    """每个 policy 实现 × 每条 tool-policy 不变量 各跑一格(1 × 4 = 4 格全绿)。"""
+    """每个 policy 实现 × 每条 tool-policy 不变量 各跑一格(1 × 5 = 5 格全绿)。"""
     case()
 
 

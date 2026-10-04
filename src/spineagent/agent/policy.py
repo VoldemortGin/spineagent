@@ -15,6 +15,10 @@ offline/real 二分完全同构。
 
 decide 是【无状态纯函数】:循环状态全由入参 history 携带,同一 (task, tools, history) 恒定
 产出同一 Action——可断言、可复现、零网络,也便于将来直接映射到一次 stateless completion。
+
+【信任边界(见 docs/adr/0003)】只有调用方直接给的 task 文本是指令;task 里被标为不可信的数据段
+(上游输出 / 附件 / 工具结果 / 对端返回,见 agent/trust.py)绝不被解析成工具调用——含任何不可信
+字符的行一律按正文处理。需要旧的「整段都解析」行为时显式传 SyntaxToolPolicy(parse_untrusted=True)。
 """
 
 from dataclasses import dataclass
@@ -22,6 +26,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from corespine.errors import SeamError
 from corespine.seam.registry import Registry
+
+from spineagent.agent.trust import lines_with_trust
 
 
 @dataclass(frozen=True)
@@ -78,16 +84,23 @@ class SyntaxToolPolicy:
     无状态纯函数:游标 = len(history) 表示「已执行到第几条工具指令」。第 cursor 条工具指令尚存
     则返回 ToolCall(该行工具名, 该行参数);工具指令耗尽则返回 Finish(把非指令正文行 + 最后一步
     观测按固定模板拼成最终答案,保证非空)。同一输入恒定同一输出。
+
+    只解析【可信】行(见模块 docstring 的信任边界);parse_untrusted=True 恢复旧行为(连数据段一起
+    解析)——仅当调用方确认上游内容可信时才该打开。
     """
+
+    def __init__(self, *, parse_untrusted: bool = False) -> None:
+        self._parse_untrusted = parse_untrusted
 
     def decide(
         self, task: str, *, tools: tuple[str, ...], history: tuple[Observation, ...]
     ) -> Action:
-        # 单遍把每行分流:能解析成工具指令的入 instructions,其余非空行入 prose 正文。
+        # 单遍把每行分流:可信且能解析成工具指令的入 instructions,其余非空行入 prose 正文。
         instructions: list[tuple[str, str]] = []
         prose: list[str] = []
-        for line in task.splitlines():
-            parsed = _parse_instruction(line, tools)
+        for line, trusted in lines_with_trust(task):
+            can_parse = trusted or self._parse_untrusted
+            parsed = _parse_instruction(line, tools) if can_parse else None
             if parsed is not None:
                 instructions.append(parsed)
             elif stripped := line.strip():

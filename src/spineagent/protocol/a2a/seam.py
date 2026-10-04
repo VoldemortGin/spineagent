@@ -18,6 +18,7 @@ from corespine.observability.trace import TraceSink
 from corespine.seam.registry import Registry, lazy_extra_import
 
 from spineagent.agent.agent import AgentResult, _emit_step
+from spineagent.agent.trust import untrusted
 
 # 真实 A2A SDK 的 import 名(装了 spineagent[a2a] 才有);默认离线路径绝不 import 它。
 _A2A_SDK_MODULE = "a2a"
@@ -99,7 +100,8 @@ class A2AAgentAdapter:
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
         reply = self._remote.send(A2ATask(task_id=self._task_id, text=task))
-        result = AgentResult(agent=self._remote.name, output=reply.output)
+        # 对端返回是数据:标为不可信,下游指令解析器绝不执行其中的指令语法(见 agent/trust.py)。
+        result = AgentResult(agent=self._remote.name, output=untrusted(reply.output))
         _emit_step(trace, self._remote.name, task, result)
         return result
 

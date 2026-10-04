@@ -75,6 +75,7 @@ from spineagent.agent.policy import (
     tool_policies,
 )
 from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.agent.trust import TaskText, compose, untrusted
 from spineagent.conformance import (
     AGENT_INVARIANTS,
     APPROVAL_INVARIANTS,
@@ -163,6 +164,10 @@ __all__ = [
     "LlmAgent",
     "FunctionAgent",
     "ToolUsingAgent",
+    # 信任边界(指令 / 数据分通道,docs/adr/0003)
+    "TaskText",
+    "untrusted",
+    "compose",
     "AgentTool",
     "FunctionCallingAgent",
     # 预置 agent(纯组合装配)

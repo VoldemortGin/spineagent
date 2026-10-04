@@ -4,6 +4,8 @@ Coordinator 是 spineagent 的「编排」缝最小实现:零外部依赖、离�
   - run_sequential —— 同一任务逐个跑,保序收集 AgentResult;
   - run_parallel  —— 同一任务用线程池并发跑,结果仍按 agent 顺序返回(确定性 / 可断言);
   - run_pipeline  —— 链式:把上一个 agent 的输出当作下一个 agent 的输入,逐段传递、全程保序。
+                     上游输出以【数据】身份传给下游(agent/trust.py 的 untrusted):下游可读可转述,
+                     但指令语法解析器绝不把它当工具调用执行(见 docs/adr/0003)。
 
 弹性容错(resilient=True):默认 fail-fast——任一 agent 抛异常即冒泡(与既有行为一致)。开启
 resilient 后,单个 agent 的异常被捕获、归一为家族统一错误 dict(corespine.errors.error_to_dict,
@@ -24,6 +26,7 @@ from corespine.errors import error_to_dict
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import Agent, AgentResult
+from spineagent.agent.trust import untrusted
 
 
 class Coordinator:
@@ -77,7 +80,7 @@ class Coordinator:
             results.append(result)
             if result.error is not None:
                 break  # 失败:下游无输入可承接,停在此处。
-            current = result.output
+            current = untrusted(result.output)  # 上游输出是数据,不是给下游的指令
         self._emit("pipeline", start, results)
         return results
 

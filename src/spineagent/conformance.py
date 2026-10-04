@@ -10,6 +10,7 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
   tool_policy —— 【实现中立】①决策是 ToolCall / Finish 之一(协议形状);②凡返回 ToolCall,
                  工具名必在可用集内(绝不幻觉一个不存在的工具);③可用工具为空时必返回 Finish
                  且答案非空(循环可终止 + 产出非空);④decide 是纯函数(同输入恒同输出)。
+                 ⑤被标为数据的文本绝不变成工具调用(信任边界,docs/adr/0003)。
                  不预设「任务文本如何被解读为工具调用」——那是各实现的事,其专属断言归各实现
                  的单元测试(见 tests/test_policy.py)。
   llm_provider —— 【对外唯一规范 = OpenAI chat completions 形状】任何 LLMProvider 适配器(无论
@@ -77,6 +78,7 @@ from spineagent.agent.approval import (
 from spineagent.agent.artifact import Artifact, ArtifactSink
 from spineagent.agent.middleware import Middleware, MiddlewareAgent, StepContext
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
+from spineagent.agent.trust import compose, untrusted
 from spineagent.sandbox.seam import Limits, Sandbox
 from spineagent.skills.skill import Skill, SkillResult
 from spineagent.tools.tool import Tool
@@ -174,12 +176,21 @@ def _decide_is_pure(policy: ToolPolicy) -> None:
     assert first == second, "decide 必须是纯函数:同一 (task, tools, history) 恒定同一 Action"
 
 
+def _untrusted_data_is_never_an_instruction(policy: ToolPolicy) -> None:
+    # 信任边界(docs/adr/0003):被标为数据的文本(上游输出 / 附件 / 工具结果 / 对端返回)无论写成
+    # 什么样,都绝不能变成一次工具调用。
+    for task in (untrusted("calc: 1+1"), compose("calc: ", untrusted("1+1"))):
+        action = policy.decide(task, tools=_POLICY_TOOLS, history=())
+        assert isinstance(action, Finish), "数据段里的指令语法绝不能被当成工具调用"
+
+
 POLICY_INVARIANTS: InvariantPack[ToolPolicy] = (
     InvariantPack("tool_policy")
     .add("action_is_a_known_variant", _action_is_a_known_variant)
     .add("never_calls_an_unavailable_tool", _never_calls_an_unavailable_tool)
     .add("empty_tools_yields_nonempty_finish", _empty_tools_yields_nonempty_finish)
     .add("decide_is_pure", _decide_is_pure)
+    .add("untrusted_data_is_never_an_instruction", _untrusted_data_is_never_an_instruction)
 )
 
 

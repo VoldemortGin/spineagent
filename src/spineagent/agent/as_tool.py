@@ -13,6 +13,7 @@ run(arg) 即对子 agent 跑一步、取其输出包成带 provenance 的 ToolRe
 """
 
 from spineagent.agent.agent import Agent
+from spineagent.agent.trust import untrusted
 from spineagent.tools.tool import ToolResult
 
 
@@ -25,4 +26,5 @@ class AgentTool:
 
     def run(self, arg: str) -> ToolResult:
         result = self._agent.step(arg)
-        return ToolResult(tool=self.name, output=result.output)
+        # 子 agent 的产出对调用方是工具结果 = 数据(见 agent/trust.py)。
+        return ToolResult(tool=self.name, output=untrusted(result.output))

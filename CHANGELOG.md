@@ -14,6 +14,9 @@
   降到毫秒级);`timeout` 现在真正生效(按节点检查的协作式 deadline,超时判 `limit_exceeded`)。
 - `CalcTool`:表达式长度 ≤ 4096、嵌套深度 ≤ 100,幂 / 乘法结果位数复用 sandbox 的昂贵二元运算
   守卫;越界立即抛 `ValueError`。
+- 指令 / 数据分通道(ADR 0003):pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
+  `McpClientTool` / `A2AAgentAdapter` 的返回都标为数据(`TaskText`),`SyntaxToolPolicy` 不再把其中的
+  `<tool>: <arg>` 当指令执行。
 
 ### Fixed
 
@@ -31,6 +34,9 @@
 
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
+- `spineagent.agent.trust`:`TaskText` / `untrusted` / `compose` / `lines_with_trust`;
+  `SyntaxToolPolicy(parse_untrusted=...)`;`POLICY_INVARIANTS` 新增
+  `untrusted_data_is_never_an_instruction`。
 - `FunctionCallingAgent(fail_fast=..., include_error_message=...)`、`McpProtocolError`、
   `spineagent.tools.tool.index_tools_by_name`。
 - `InProcessSandbox(clock=...)`:可注入时钟(默认 `time.monotonic`)。
@@ -58,3 +64,5 @@
 - `FunctionCallingAgent` 缺省不再让工具异常冒泡(需要旧行为传 `fail_fast=True`)。
 - `McpClientTool` 缺结果键时抛 `McpProtocolError` 而非 `KeyError`。
 - 重名工具从「后者静默覆盖前者」变为构造期 `ValueError`。
+- `SyntaxToolPolicy` 缺省不再解析被标为数据的文本:依赖「pipeline 上游输出驱动下游执行工具」的
+  调用方需显式 `SyntaxToolPolicy(parse_untrusted=True)`;`SummaryMiddleware` 的摘要也属数据。

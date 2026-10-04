@@ -26,6 +26,7 @@ from corespine.observability.trace import TraceSink
 from spineagent.agent.agent import AgentResult
 from spineagent.agent.approval import enforce_tool_approval
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
+from spineagent.agent.trust import compose, untrusted
 from spineagent.tools.tool import Tool, index_tools_by_name
 
 # 触顶 max_steps 又无任何观测可作答时的固定兜底文案(保证产出非空)。
@@ -68,12 +69,24 @@ class ToolUsingAgent:
                 _emit_finish(trace, self._name, len(history), answer)
                 return AgentResult(agent=self._name, output=answer)
             # 把 $prev 替换为上一步观测输出后执行该工具,观测追加进历史。
-            arg = action.arg.replace("$prev", history[-1].output if history else "")
+            arg = _splice_prev(action.arg, history[-1].output if history else "")
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
             enforce_tool_approval(action.tool, {"arg": arg})
             result = self._tools[action.tool].run(arg)
             history.append(Observation(tool=action.tool, arg=arg, output=result.output))
             _emit_tool_step(trace, self._name, len(history) - 1, action.tool, arg, result.output)
+
+
+def _splice_prev(arg: str, prev: str) -> str:
+    """把 $prev 替换为上一步观测;拼进来的观测是【数据】(工具结果),以不可信段保留标记。"""
+    pieces = arg.split("$prev")
+    if len(pieces) == 1:
+        return arg
+    data = untrusted(prev)
+    parts: list[str] = [pieces[0]]
+    for piece in pieces[1:]:
+        parts.extend((data, piece))
+    return compose(*parts)
 
 
 def _emit_tool_step(

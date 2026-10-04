@@ -19,6 +19,7 @@ from corespine.observability.trace import TraceSink
 from corespine.seam.registry import Registry
 
 from spineagent.agent.agent import Agent, AgentResult
+from spineagent.agent.trust import compose, untrusted
 
 
 @dataclass
@@ -157,7 +158,7 @@ class SummaryMiddleware:
                 orig_chars=len(ctx.task),
                 summary_chars=len(summary),
             )
-        ctx.task = summary
+        ctx.task = untrusted(summary)  # 模型生成的摘要是数据,不再承载可执行的指令语法
 
     def after_step(self, ctx: StepContext, result: AgentResult) -> AgentResult:
         return result
@@ -208,7 +209,8 @@ class AttachmentMiddleware:
         contents = list(self._attachments.values())
         ctx.attachments = contents
         header = "\n".join(f"[附件 {name}]\n{body}" for name, body in self._attachments.items())
-        ctx.task = f"{header}\n\n{ctx.task}"
+        # 附件内容是数据:以不可信段前置,调用方原 task(可能本身已带数据段)保持原信任标记。
+        ctx.task = compose(untrusted(header), "\n\n", ctx.task)
         if ctx.trace is not None:
             ctx.trace.emit(
                 "mw_attachment",
