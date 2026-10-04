@@ -23,6 +23,10 @@ PENDING);resolve 首次落决议,重复以【相同】决议 resolve 幂等(各�
 redeem 校验 + 标记消费,重放(再次 redeem 同一 token)必抛 InvalidResumeToken——泄露的 token 也
 无从二次恢复。
 
+【执行闸裁决(钉死,见 docs/adr/0002)】审批是【工具调用点上的强制闸】,不是对 ctx.tools 声明的
+检查:执行点在每一次真实调用工具前调 enforce_tool_approval(真实工具名, 参数);request id 由
+(code, 工具名, schema 指纹, 规范化参数值的 sha256)派生,不依赖步序;门故障 fail-closed。
+
 隐私:本缝实现【自身不发射 trace】(同 credential / trigger 缝);request 只带定位摘要,payload
 正文到不了任何字段。要观测在【审批 middleware】里记 code / 计数 / 决议,绝不记参数正文。
 """
@@ -33,16 +37,20 @@ import fnmatch
 import hashlib
 import json
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, overload, runtime_checkable
 
 from corespine.errors import CorespineError
+from corespine.observability.trace import TraceSink
 from corespine.seam.registry import Registry
 
 from spineagent.agent.agent import AgentResult
 from spineagent.agent.middleware import StepContext, middlewares
+from spineagent.tools.function_tool import FunctionTool
+from spineagent.tools.tool import Tool, ToolResult
 
 # 内置审批类别 code(domain-neutral;调用方用它路由 / 计数)。
 APPROVAL_TOOL_CALL = "tool_call"
@@ -94,6 +102,12 @@ class ApprovalConflict(ApprovalError):
     code = "approval.conflict"
 
 
+class ApprovalGateError(ApprovalError):
+    """审批门自身故障(review 抛异常 / 返回非 Decision):fail-closed,受审批工具一律不执行。"""
+
+    code = "approval.gate_error"
+
+
 # ---- 请求摘要 + 确定性派生(绝不含参数正文)-----------------------------------------------------
 
 
@@ -116,16 +130,26 @@ class ApprovalRequest:
     arg_count: int = 0
 
 
-def _fingerprint(names_or_args: Sequence[str] | Mapping[str, object]) -> str:
-    """据参数 schema 形状(键名 + 值类型)或一组名字派生确定性指纹——绝不含任何值 / 正文。"""
-    if isinstance(names_or_args, Mapping):
-        shape: list[list[str]] = sorted(
-            [str(k), type(v).__name__] for k, v in names_or_args.items()
-        )
-    else:
-        shape = sorted([str(n), ""] for n in names_or_args)
+def _fingerprint(args: Mapping[str, object]) -> str:
+    """据参数 schema 形状(键名 + 值类型)派生确定性指纹——绝不含任何值 / 正文。"""
+    shape = sorted([str(k), type(v).__name__] for k, v in args.items())
     raw = json.dumps(shape, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _value_digest(args: Mapping[str, object]) -> str:
+    """规范化参数(键排序 + 紧凑 JSON)后取 sha256——只用作 request id 的派生材料,绝不落明文。
+
+    非 JSON 值退回 repr:它若不稳定,只会让请求「对不上旧批准」而要求重新审批(偏向 fail-closed)。
+    """
+    raw = json.dumps(
+        {str(k): v for k, v in args.items()},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=repr,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _request_id(code: str, tool: str, fingerprint: str, nonce: str) -> str:
@@ -140,17 +164,20 @@ def make_approval_request(
     arguments: Mapping[str, object] | None = None,
     *,
     nonce: str = "",
+    bind_values: bool = False,
 ) -> ApprovalRequest:
     """从工具名 + 参数字典构造一次待审批请求(只取 schema 指纹与计数,绝不落参数值)。
 
     nonce 让调用方在需要「按次审批」时强制区分 schema 相同的两次调用;缺省 "" 时 schema 相同的
-    请求折叠成同一 id(决议可复用,幂等)。
+    请求折叠成同一 id(决议可复用,幂等)。bind_values=True 时把【规范化参数值的 sha256】也折进
+    request id(仍不落明文):参数一变即是新请求、须重新审批——工具调用点上的执行闸用的就是它。
     """
     args = dict(arguments or {})
     fp = _fingerprint(args)
+    salt = nonce if not bind_values else f"{nonce}:{_value_digest(args)}"
     return ApprovalRequest(
         code=code,
-        id=_request_id(code, tool, fp, nonce),
+        id=_request_id(code, tool, fp, salt),
         tool=tool,
         arg_fingerprint=fp,
         arg_count=len(args),
@@ -340,43 +367,159 @@ def make_approval_gate(spec: str, **kwargs: object) -> ApprovalGate:
     return approval_gates.make(spec, **kwargs)
 
 
+# ---- 工具调用点上的执行闸 --------------------------------------------------------------------
+#
+# 审批不是对 ctx.tools 声明的检查,而是【真实执行点】上的强制闸:FunctionCallingAgent / ToolUsingAgent
+# 在每一次真正调用工具函数之前调 enforce_tool_approval(真实工具名, 真实参数)。门经两条通道到达执行点:
+#   1. 动态作用域(ApprovalMiddleware):before_step 把一枚 _ApprovalGuard 压进 contextvar,内层 agent
+#      (含嵌套的 AgentTool / ChainAgent / 闭包里的 agent)在同一上下文里执行工具时都能看到它;
+#      Coordinator.run_parallel 把调用方上下文复制进每个工作线程,故并行编排下闸同样生效。
+#   2. 静态绑定(require_approval):把闸直接包进工具本身——不依赖任何上下文,裸线程 / 第三方 agent
+#      执行它也绕不过去。
+# 未配置任何审批时,执行点只做一次 contextvar 读取即返回(零行为变化)。
+
+
+@dataclass(frozen=True)
+class _ApprovalGuard:
+    """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code(+ 可选 trace 落点)。"""
+
+    gate: ApprovalGate
+    gated: frozenset[str]
+    code: str = APPROVAL_TOOL_CALL
+    trace: TraceSink | None = None
+    agent: str = ""
+    step: int = 0
+
+    def check(self, tool: str, arguments: Mapping[str, object]) -> None:
+        """对一次真实工具调用审批:approved 返回;rejected / pending / 门故障一律抛错(不执行)。"""
+        if tool not in self.gated:
+            return
+        request = make_approval_request(self.code, tool, arguments, bind_values=True)
+        try:
+            decision = self.gate.review(request)
+        except Exception as exc:  # noqa: BLE001 —— fail-closed:门的任何故障都等同「未批准」
+            raise ApprovalGateError(
+                "审批门故障,受审批工具不执行(fail-closed)",
+                request_id=request.id,
+                tool=tool,
+                cause=type(exc).__name__,
+            ) from exc
+        if not isinstance(decision, Decision):
+            raise ApprovalGateError(
+                "审批门返回了非 Decision 结果,受审批工具不执行(fail-closed)",
+                request_id=request.id,
+                tool=tool,
+            )
+        if self.trace is not None:
+            self.trace.emit(
+                "mw_approval",
+                agent=self.agent,
+                step=self.step,
+                gated_count=1,
+                decision=decision.value,
+            )
+        if decision is Decision.APPROVED:
+            return
+        if decision is Decision.REJECTED:
+            raise ApprovalRejected(
+                "审批被拒:受审批工具调用被断路", request_id=request.id, tool=tool
+            )
+        raise ApprovalPending("审批待定:受审批工具调用待人类拍板", request_id=request.id, tool=tool)
+
+
+_ACTIVE_GUARDS: ContextVar[tuple[_ApprovalGuard, ...]] = ContextVar(
+    "spineagent_approval_guards", default=()
+)
+
+
+def enforce_tool_approval(tool: str, arguments: Mapping[str, object]) -> None:
+    """工具执行点在【每一次】真实调用工具前调它:按当前生效的全部审批配置逐一审批。
+
+    未配置审批时只读一次 contextvar 即返回(零行为变化);命中受审批工具时:approved 放行,
+    rejected 抛 ApprovalRejected、pending 抛 ApprovalPending、门故障抛 ApprovalGateError——调用方
+    据此【不执行】该工具。自定义 agent 若自己执行工具,也应在调用前调它(或改用 require_approval)。
+    """
+    for guard in _ACTIVE_GUARDS.get():
+        guard.check(tool, arguments)
+
+
+def _push_guard(guard: _ApprovalGuard) -> Callable[[], None]:
+    """把一枚审批配置压进当前上下文,返回对应的弹出回调(须在同一上下文里调用)。"""
+    token = _ACTIVE_GUARDS.set((*_ACTIVE_GUARDS.get(), guard))
+    return lambda: _ACTIVE_GUARDS.reset(token)
+
+
+class _ApprovalGatedTool:
+    """require_approval 对单串参 Tool 的包装:run 前先过闸(参数按 {"arg": arg} 规范化)。"""
+
+    def __init__(self, tool: Tool, guard: _ApprovalGuard) -> None:
+        self._tool = tool
+        self._guard = guard
+
+    @property
+    def name(self) -> str:
+        return self._tool.name
+
+    def run(self, arg: str) -> ToolResult:
+        self._guard.check(self._tool.name, {"arg": arg})
+        return self._tool.run(arg)
+
+
+class _GuardedCall:
+    """require_approval 对 FunctionTool 的包装函数:调用底层函数前先按真实 kwargs 过闸。"""
+
+    def __init__(self, name: str, func: Callable[..., Any], guard: _ApprovalGuard) -> None:
+        self._name = name
+        self._func = func
+        self._guard = guard
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self._guard.check(self._name, kwargs)
+        return self._func(**kwargs)
+
+
+@overload
+def require_approval(
+    tool: FunctionTool, gate: ApprovalGate, *, code: str = APPROVAL_TOOL_CALL
+) -> FunctionTool: ...
+@overload
+def require_approval(tool: Tool, gate: ApprovalGate, *, code: str = APPROVAL_TOOL_CALL) -> Tool: ...
+def require_approval(
+    tool: FunctionTool | Tool, gate: ApprovalGate, *, code: str = APPROVAL_TOOL_CALL
+) -> FunctionTool | Tool:
+    """把审批闸【绑进工具本身】:无论哪个 agent、哪条线程执行它,调用前都先过闸。
+
+    与 ApprovalMiddleware(动态作用域)互补:这条通道不依赖 contextvar,裸线程 / 第三方 agent 也
+    绕不过去。两者叠加时同一调用会被同一 gate 审两次,决议幂等,结果一致。
+    """
+    guard = _ApprovalGuard(gate=gate, gated=frozenset({tool.name}), code=code)
+    if isinstance(tool, FunctionTool):
+        return replace(tool, func=_GuardedCall(tool.name, tool.func, guard))
+    return _ApprovalGatedTool(tool, guard)
+
+
 # ---- 审批 middleware(插进现有 middleware 链)-------------------------------------------------
 
 
-def _request_for_step(code: str, gated_names: Sequence[str]) -> ApprovalRequest:
-    """据本步激活的受审批工具名集构造一次待审批请求。
-
-    request id 【刻意排除步序计数器】——只由 (code, 工具集, schema 指纹) 派生,故挂起的 run 在
-    resolve 后重跑 step(步序会自增)仍稳定命中同一 request id 与已落决议,无需持久化 agent 循环
-    续体。代价是:同一 (code, 工具集) 的决议会被记住并幂等复用;要按次审批就换 code / 换 gate。
-    """
-    tool = ",".join(gated_names)
-    fp = _fingerprint(gated_names)
-    return ApprovalRequest(
-        code=code,
-        id=_request_id(code, tool, fp, ""),
-        tool=tool,
-        arg_fingerprint=fp,
-        arg_count=len(gated_names),
-    )
-
-
 class ApprovalMiddleware:
-    """审批门 middleware:步执行前,若本步激活了受审批工具,则询问 ApprovalGate 再决定放行 / 断路。
+    """审批门 middleware:把审批配置下沉到本步内【每一次真实工具调用】的执行点上。
 
-    approved -> 放行(before_step 返回 None,内层 Agent 照常跑);rejected -> 抛 ApprovalRejected
-    (断路:内层 Agent 不跑;编排层弹性模式经 corespine.error_to_dict 把它归一进 AgentResult.error,
-    即「类型化错误返回给 agent 循环」——不 panic、不裸吞);pending -> 抛 ApprovalPending 挂起 run,
-    等 out-of-band resolve 后凭 resume token 重跑本步(届时 gate 已落决议、review 返回 approved)。
+    before_step 把 (gate, gated_tools) 压进当前上下文的审批作用域,MiddlewareAgent 在本步结束(含
+    抛错)时弹出。作用域内,任何执行点(FunctionCallingAgent / ToolUsingAgent / 嵌套 agent /
+    run_parallel 的工作线程)在调用受审批工具前都按「真实工具名 + 规范化参数」向 gate review:
+    approved -> 执行;rejected -> 抛 ApprovalRejected(工具不执行);pending -> 抛 ApprovalPending 挂起
+    run,等 out-of-band resolve 后重跑本步(同一工具 + 同一参数命中已落决议,放行);门故障 ->
+    抛 ApprovalGateError(fail-closed)。编排层弹性模式经 corespine.error_to_dict 把它们归一进
+    AgentResult.error。
 
-    【为何是「抛类型化错误」而非同步阻塞 / 新增续体机制(裁决 + 理由)】同步阻塞会冻住线程等人,
-    不可接受;而给 agent 循环加「挂起 / 恢复续体」是对 ToolUsingAgent / FunctionCallingAgent /
-    MiddlewareAgent 的大改。家族既有的断路手段正是【抛类型化 CorespineError -> 编排层捕获进
-    AgentResult.error】(见 AgentResult docstring 与 Coordinator resilient)。pending 复用这条缝:
-    抛一个可重试的、带 request_id 的 ApprovalPending,由调用方 resolve 后重跑 step 恢复——step 可
-    安全重跑正因 gate 的决议幂等(review 稳定)。这【零新增】agent 循环机制,纯组合既有模式。
+    【为何不再检查 ctx.tools】ctx.tools 只是「声明的可用面」,与内层 agent 真正执行什么无关:不播种
+    它、或重跑使步序变化,旧闸就看不见工具而放行(fail-open)。见 docs/adr/0002。
 
-    默认 gated_tools 为空 => before_step 恒早退,零行为变化(opt-in);哪些工具需审批由策略配置。
+    【为何是「抛类型化错误」而非同步阻塞 / 新增续体机制】同 ADR 0001:pending 抛可重试、带 request_id
+    的 ApprovalPending,调用方 resolve 后重跑 step 恢复;决议幂等使重跑安全。
+
+    默认 gated_tools 为空 => before_step 恒早退,零行为变化(opt-in)。若在 MiddlewareAgent 之外手动
+    调 before_step 却不跑 ctx.cleanups,作用域会留在当前上下文里——只会多拦、不会少拦(偏 fail-closed)。
     隐私:trace 只记 code / 计数 / 决议,绝不记工具参数正文。
     """
 
@@ -392,32 +535,17 @@ class ApprovalMiddleware:
         self._code = code
 
     def before_step(self, ctx: StepContext) -> None:
-        gated_here = sorted(t for t in ctx.tools if t in self._gated)
-        if not gated_here:
-            return  # 本步未激活任何受审批工具:零行为变化
-        request = _request_for_step(self._code, gated_here)
-        decision = self._gate.review(request)
-        if ctx.trace is not None:
-            ctx.trace.emit(
-                "mw_approval",
-                agent=ctx.agent,
-                step=ctx.step,
-                gated_count=len(gated_here),
-                decision=decision.value,
-            )
-        if decision is Decision.APPROVED:
-            return
-        if decision is Decision.REJECTED:
-            raise ApprovalRejected(
-                f"审批被拒:本步 {len(gated_here)} 个受审批工具被断路",
-                request_id=request.id,
-                tool=request.tool,
-            )
-        raise ApprovalPending(
-            f"审批待定:本步 {len(gated_here)} 个受审批工具待人类拍板",
-            request_id=request.id,
-            tool=request.tool,
+        if not self._gated:
+            return  # 未配置受审批工具:零行为变化
+        guard = _ApprovalGuard(
+            gate=self._gate,
+            gated=self._gated,
+            code=self._code,
+            trace=ctx.trace,
+            agent=ctx.agent,
+            step=ctx.step,
         )
+        ctx.cleanups.append(_push_guard(guard))
 
     def after_step(self, ctx: StepContext, result: AgentResult) -> AgentResult:
         return result

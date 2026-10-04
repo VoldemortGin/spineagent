@@ -8,9 +8,9 @@ middleware 的放行/断路/挂起三路、以及默认配置下的零行为变�
 import pytest
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
-from spineagent.agent.agent import FunctionAgent
 from spineagent.agent.approval import (
     ApprovalConflict,
+    ApprovalGateError,
     ApprovalMiddleware,
     ApprovalPending,
     ApprovalRejected,
@@ -20,15 +20,22 @@ from spineagent.agent.approval import (
     InvalidResumeToken,
     ManualApprovalGate,
     approval_gates,
+    enforce_tool_approval,
     make_approval_gate,
     make_approval_request,
+    require_approval,
 )
+from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.middleware import (
     DynamicToolMiddleware,
     MiddlewareAgent,
-    StepContext,
     middlewares,
 )
+from spineagent.agent.policy import SyntaxToolPolicy
+from spineagent.agent.tool_using import ToolUsingAgent
+from spineagent.conformance import ScriptedToolCallProvider
+from spineagent.tools.function_tool import FunctionTool
+from spineagent.tools.tool import ToolResult
 
 _SENTINEL = "绝密参数值SENTINEL"
 
@@ -151,76 +158,233 @@ def test_approval_middleware_registered():
     assert isinstance(mw, ApprovalMiddleware)
 
 
-# ---- ApprovalMiddleware:放行 / 断路 / 挂起 三路 ---------------------------------------------
+# ---- ApprovalMiddleware:放行 / 断路 / 挂起 三路(端到端:真实 FunctionCallingAgent + 真实工具)----
+# 旧版这组测试的内层是假执行的 FunctionAgent(只返回一串 "did-risky-thing"),闸只检查 ctx.tools
+# 的声明,所以测不出「声明面不含工具 / 重跑步序变了」时真实工具照常执行(fail-open)。现在一律用
+# 真实 FunctionCallingAgent + 离线脚本化 provider + 带副作用计数的真实工具函数,断言执行次数。
 
 
-def _seeded_agent(gate, *, gated_tools, tool_for_step):
-    """把 DynamicToolMiddleware(播种 ctx.tools)套在审批 middleware 外层,内层是会「执行」的 agent。"""
-    inner = FunctionAgent("inner", lambda t: "did-risky-thing")
-    seed = DynamicToolMiddleware(default=tuple(tool_for_step))
-    return MiddlewareAgent(
-        "guarded", inner, [seed, ApprovalMiddleware(gate, gated_tools=gated_tools)]
+class _Deleter:
+    """带副作用计数的真实工具函数。"""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    def __call__(self, path: str) -> str:
+        self.paths.append(path)
+        return "deleted"
+
+
+def _delete_tool(deleter: _Deleter) -> FunctionTool:
+    return FunctionTool(
+        "delete_file",
+        "删除文件",
+        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        func=deleter,
     )
 
 
-def test_default_config_is_zero_behavior_change():
-    # 空 gated_tools:同一输入,加不加审批 middleware 输出 + trace code 序列全等(回归对照)。
-    def make_inner() -> FunctionAgent:
-        return FunctionAgent("inner", lambda t: f"out:{t}")
+def _fc(deleter: _Deleter, path: str = "/x") -> FunctionCallingAgent:
+    script = ScriptedToolCallProvider([("delete_file", {"path": path})], final="finished")
+    return FunctionCallingAgent("fc", script, [_delete_tool(deleter)])
 
-    plain = MiddlewareAgent("g", make_inner(), [DynamicToolMiddleware(default=("delete_file",))])
+
+def test_trigger_no_dynamic_tool_middleware_still_blocks():
+    # 触发一(修复前 fail-open):没有 DynamicToolMiddleware 播种 ctx.tools 时,旧闸看不见工具,
+    # delete_file 照常执行。现在闸在真实执行点上:执行次数必须为 0。
+    deleter = _Deleter()
+    gate = AutoApprovalGate(deny=["*"])
+    agent = MiddlewareAgent(
+        "g", _fc(deleter), [ApprovalMiddleware(gate, gated_tools=["delete_file"])]
+    )
+    with pytest.raises(ApprovalRejected):
+        agent.step("go")
+    assert deleter.paths == []
+
+
+def test_trigger_rerun_with_dynamic_tool_does_not_bypass():
+    # 触发二(修复前 fail-open):DynamicToolMiddleware({0: [...]}) 只在步序 0 宣告工具,第一次被拒后
+    # 原样重跑(步序变 1)即绕过并执行。现在 request id 不依赖步序,重跑多少次都不执行。
+    deleter = _Deleter()
+    gate = AutoApprovalGate(deny=["*"])
+    agent = MiddlewareAgent(
+        "g",
+        _fc(deleter),
+        [
+            DynamicToolMiddleware({0: ["delete_file"]}),
+            ApprovalMiddleware(gate, gated_tools=["delete_file"]),
+        ],
+    )
+    for _ in range(3):
+        with pytest.raises(ApprovalRejected):
+            agent.step("go")
+    assert deleter.paths == []
+
+
+def test_default_config_is_zero_behavior_change():
+    # 空 gated_tools:同一输入,加不加审批 middleware 输出 + trace code 序列 + 执行次数全等(回归对照)。
+    d1, d2 = _Deleter(), _Deleter()
+    plain = MiddlewareAgent("g", _fc(d1), [DynamicToolMiddleware(default=("delete_file",))])
     guarded = MiddlewareAgent(
         "g",
-        make_inner(),
+        _fc(d2),
         [DynamicToolMiddleware(default=("delete_file",)), ApprovalMiddleware(AutoApprovalGate())],
     )
     s1, s2 = InProcessPrivacyTraceSink(), InProcessPrivacyTraceSink()
     r_plain = plain.step("go", trace=s1)
     r_guarded = guarded.step("go", trace=s2)
-    assert r_plain.output == r_guarded.output
-    assert s1.codes() == s2.codes()  # 审批门未激活任何工具 -> 未发 mw_approval,行为零变化
+    assert r_plain.output == r_guarded.output == "finished"
+    assert s1.codes() == s2.codes()  # 未配置审批 -> 未发 mw_approval,行为零变化
+    assert d1.paths == d2.paths == ["/x"]
 
 
 def test_approved_passes_through():
+    deleter = _Deleter()
     gate = AutoApprovalGate(allow=["delete_file"])
-    agent = _seeded_agent(gate, gated_tools=["delete_file"], tool_for_step=["delete_file"])
-    assert agent.step("go").output == "did-risky-thing"
+    agent = MiddlewareAgent(
+        "g", _fc(deleter), [ApprovalMiddleware(gate, gated_tools=["delete_file"])]
+    )
+    assert agent.step("go").output == "finished"
+    assert deleter.paths == ["/x"]
 
 
 def test_rejected_short_circuits():
+    deleter = _Deleter()
     gate = AutoApprovalGate(deny=["delete_file"])
-    agent = _seeded_agent(gate, gated_tools=["delete_file"], tool_for_step=["delete_file"])
+    agent = MiddlewareAgent(
+        "g", _fc(deleter), [ApprovalMiddleware(gate, gated_tools=["delete_file"])]
+    )
     with pytest.raises(ApprovalRejected) as ei:
-        agent.step("go")  # 断路:内层 FunctionAgent 不跑
+        agent.step("go")  # 断路:真实工具不执行
     assert ei.value.code == "approval.rejected" and ei.value.retryable is False
+    assert deleter.paths == []
 
 
 def test_pending_suspends_then_resumes():
+    deleter = _Deleter()
     gate = ManualApprovalGate()
-    agent = _seeded_agent(gate, gated_tools=["delete_file"], tool_for_step=["delete_file"])
-    # 首跑:挂起(request 待审)。
+    agent = MiddlewareAgent(
+        "g", _fc(deleter), [ApprovalMiddleware(gate, gated_tools=["delete_file"])]
+    )
+    # 首跑:挂起(request 待审),工具未执行。
     with pytest.raises(ApprovalPending) as ei:
         agent.step("go")
     request_id = ei.value.context["request_id"]
     assert ei.value.retryable is True
+    assert deleter.paths == []
+    assert [r.id for r in gate.pending()] == [request_id]
     # out-of-band 批准 -> 铸一次性 resume token -> redeem 授权恢复。
     token = gate.resolve(request_id, Decision.APPROVED)
     assert gate.redeem(token).request_id == request_id
-    # 重跑本步:gate 已落决议(review 幂等命中同一 request id)-> 放行,内层执行。
-    assert agent.step("go").output == "did-risky-thing"
+    # 重跑本步:同一工具 + 同一参数命中已落决议 -> 放行,真实工具执行恰好一次。
+    assert agent.step("go").output == "finished"
+    assert deleter.paths == ["/x"]
+
+
+def test_approval_binds_to_arguments_not_just_tool_name():
+    # 批准只对指纹相同(工具名 + 规范化参数)的调用有效:模型改了参数就必须重新审批。
+    deleter = _Deleter()
+    gate = ManualApprovalGate()
+    mw = ApprovalMiddleware(gate, gated_tools=["delete_file"])
+    with pytest.raises(ApprovalPending) as ei:
+        MiddlewareAgent("g", _fc(deleter, "/safe"), [mw]).step("go")
+    gate.resolve(ei.value.context["request_id"], Decision.APPROVED)
+    with pytest.raises(ApprovalPending):
+        MiddlewareAgent("g", _fc(deleter, "/etc"), [mw]).step("go")
+    assert deleter.paths == []
+
+
+def test_gate_exception_fails_closed():
+    class Broken:
+        name = "broken"
+
+        def review(self, request):
+            raise RuntimeError("审批后端挂了")
+
+    deleter = _Deleter()
+    agent = MiddlewareAgent(
+        "g", _fc(deleter), [ApprovalMiddleware(Broken(), gated_tools=["delete_file"])]
+    )
+    with pytest.raises(ApprovalGateError) as ei:
+        agent.step("go")
+    assert ei.value.code == "approval.gate_error"
+    assert deleter.paths == []
+
+
+def test_gate_returning_non_decision_fails_closed():
+    class Sloppy:
+        name = "sloppy"
+
+        def review(self, request):
+            return "yes"  # 不是 Decision:绝不当作放行
+
+    deleter = _Deleter()
+    agent = MiddlewareAgent(
+        "g", _fc(deleter), [ApprovalMiddleware(Sloppy(), gated_tools=["delete_file"])]
+    )
+    with pytest.raises(ApprovalGateError):
+        agent.step("go")
+    assert deleter.paths == []
+
+
+def test_guard_scope_is_released_after_step_even_on_error():
+    # 审批作用域只覆盖被包裹的那一步:步内抛错后作用域照样释放,不污染之后的无审批调用。
+    deleter = _Deleter()
+    gate = AutoApprovalGate(deny=["*"])
+    with pytest.raises(ApprovalRejected):
+        MiddlewareAgent(
+            "g", _fc(deleter), [ApprovalMiddleware(gate, gated_tools=["delete_file"])]
+        ).step("go")
+    assert _fc(deleter).step("go").output == "finished"  # 无审批配置的 agent:照常执行
+    assert deleter.paths == ["/x"]
+
+
+def test_enforce_without_any_configuration_is_noop():
+    enforce_tool_approval("delete_file", {"path": "/x"})  # 未配置审批:零行为变化,不抛
+
+
+def test_require_approval_wraps_plain_tool():
+    class Nuke:
+        name = "nuke"
+
+        def __init__(self) -> None:
+            self.hits = 0
+
+        def run(self, arg):
+            self.hits += 1
+            return ToolResult(tool=self.name, output="boom")
+
+    nuke = Nuke()
+    gated = require_approval(nuke, AutoApprovalGate(deny=["nuke"]))
+    assert gated.name == "nuke"
+    agent = ToolUsingAgent("tu", SyntaxToolPolicy(), [gated])
+    with pytest.raises(ApprovalRejected):
+        agent.step("nuke: now")
+    assert nuke.hits == 0
+
+
+def test_make_approval_request_bind_values():
+    a = make_approval_request("tool_call", "rm", {"path": "/a"}, bind_values=True)
+    b = make_approval_request("tool_call", "rm", {"path": "/b"}, bind_values=True)
+    a2 = make_approval_request("tool_call", "rm", {"path": "/a"}, bind_values=True)
+    assert a.id != b.id and a.id == a2.id
+    assert a.arg_fingerprint == b.arg_fingerprint  # schema 指纹仍只覆盖键名 + 值类型
+    assert "/a" not in (a.code + a.id + a.tool + a.arg_fingerprint)
 
 
 # ---- 隐私:审批 trace 只记 code / 计数 / 决议,绝不记参数正文 --------------------------------
 
 
 def test_approval_trace_is_privacy_safe():
+    deleter = _Deleter()
     gate = AutoApprovalGate(deny=["delete_file"])
-    mw = ApprovalMiddleware(gate, gated_tools=["delete_file"])
+    agent = MiddlewareAgent(
+        "g", _fc(deleter, _SENTINEL), [ApprovalMiddleware(gate, gated_tools=["delete_file"])]
+    )
     sink = InProcessPrivacyTraceSink()
-    ctx = StepContext(agent="g", task=f"删除 {_SENTINEL}", trace=sink, tools=["delete_file"])
     with pytest.raises(ApprovalRejected):
-        mw.before_step(ctx)
-    assert sink.codes() == ["mw_approval"]
+        agent.step(f"删除 {_SENTINEL}", trace=sink)
+    assert "mw_approval" in sink.codes()
     for event in sink.events:
         assert not {k for k in event.fields if k.strip().lower() in FORBIDDEN_KEYS}
         for value in event.fields.values():

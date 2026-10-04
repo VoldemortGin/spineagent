@@ -29,6 +29,9 @@ class StepContext:
     attachments 是 middleware 之间 + 与外层协作的显式共享面;step 是本 Agent 已迈出的步序(供
     DynamicToolMiddleware 按步调度);extras 留给自定义 middleware 传递零散元数据。绝不把这些正文
     写进 trace——trace 只记它们的计数 / 长度。
+
+    cleanups 是 before_step 登记的收尾回调(如 ApprovalMiddleware 弹出审批作用域):MiddlewareAgent
+    在本步结束时【无论成败】逆序执行它们。注意 tools 只是声明面,不是执行闸——审批在真实执行点上做。
     """
 
     agent: str
@@ -38,6 +41,7 @@ class StepContext:
     tools: list[str] = field(default_factory=list)
     attachments: list[str] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
+    cleanups: list[Callable[[], None]] = field(default_factory=list)
 
 
 @runtime_checkable
@@ -74,11 +78,16 @@ class MiddlewareAgent:
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
         ctx = StepContext(agent=self._name, task=task, trace=trace, step=self._step_index)
         self._step_index += 1
-        for mw in self._middlewares:
-            mw.before_step(ctx)
-        result = self._agent.step(ctx.task, trace=ctx.trace)
-        for mw in reversed(self._middlewares):
-            result = mw.after_step(ctx, result)
+        try:
+            for mw in self._middlewares:
+                mw.before_step(ctx)
+            result = self._agent.step(ctx.task, trace=ctx.trace)
+            for mw in reversed(self._middlewares):
+                result = mw.after_step(ctx, result)
+        finally:
+            # 无论成败都逆序跑 before_step 登记的收尾(如弹出审批作用域),绝不让作用域泄漏出本步。
+            for cleanup in reversed(ctx.cleanups):
+                cleanup()
         # 重盖 provenance:对外产出者是本组合 agent(子 agent 名是内部细节)。
         return replace(result, agent=self._name)
 

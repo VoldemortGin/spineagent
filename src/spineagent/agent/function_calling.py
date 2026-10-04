@@ -20,6 +20,7 @@ from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult
+from spineagent.agent.approval import enforce_tool_approval
 from spineagent.tools.function_tool import FunctionTool, InvalidToolArguments
 
 # 触顶 max_steps 仍未出最终文本时的兜底文案(保证产出非空)。
@@ -92,9 +93,12 @@ class FunctionCallingAgent:
                     # JSONDecodeError / TypeError 冒泡崩掉整轮。
                     try:
                         validated = tool.parse_arguments(arguments)
-                        output = tool.invoke(validated)
                     except InvalidToolArguments as exc:
                         output = f"error: {exc}"
+                    else:
+                        # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
+                        enforce_tool_approval(tool.name, validated)
+                        output = tool.invoke(validated)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 _emit_tool_step(trace, self._name, index, tc.function.name, arguments, output)
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。

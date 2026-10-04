@@ -21,6 +21,7 @@ from corespine.llm.provider import LLMProvider, MockProvider
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.approval import ApprovalError
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.orchestration.coordinator import Coordinator
 from spineagent.tools.function_tool import FunctionTool
@@ -77,11 +78,18 @@ class DeepResearchAgent:
         retriever = FunctionCallingAgent(
             f"{self._name}.retriever", self._provider, self._tools, system=self._retriever_system
         )
+        approval_errors: dict[int, ApprovalError] = {}
         retrieval_agents = [
-            FunctionAgent(f"{self._name}.retrieve.{i}", _bind_query(retriever, sq))
+            FunctionAgent(
+                f"{self._name}.retrieve.{i}", _bind_query(retriever, sq, i, approval_errors)
+            )
             for i, sq in enumerate(subqueries)
         ]
         findings = Coordinator(retrieval_agents, trace=trace).run_parallel("", resilient=True)
+        # 审批挂起 / 拒绝不是「某条检索失败」:不能被弹性模式吞掉后照常综合,须原样上抛给调用方
+        # (HITL:resolve 后重跑本步)。多条时取子查询序最靠前的一条,确定性。
+        if approval_errors:
+            raise approval_errors[min(approval_errors)]
 
         # 3) 综合:把并行发现拼成 prompt,走 provider 产出最终答案。
         digest = "\n\n".join(f"[发现 {i + 1}] {f.output}" for i, f in enumerate(findings))
@@ -96,12 +104,31 @@ class DeepResearchAgent:
         return AgentResult(agent=self._name, output=final.output, usage=final.usage)
 
 
-def _bind_query(retriever: FunctionCallingAgent, subquery: str) -> Callable[[str], str]:
+def _bind_query(
+    retriever: FunctionCallingAgent,
+    subquery: str,
+    index: int,
+    approval_errors: dict[int, ApprovalError],
+) -> Callable[[str], str]:
     """把「共享检索 agent + 某个子查询」绑成一个 (task->text) 纯函数(供 FunctionAgent 包装)。
 
     忽略传入 task(并行时 Coordinator 对所有 agent 传同一空任务),对绑定的子查询跑检索、取其输出。
     """
-    return lambda _task: retriever.step(subquery).output
+    return lambda _task: _retrieve(retriever, subquery, index, approval_errors)
+
+
+def _retrieve(
+    retriever: FunctionCallingAgent,
+    subquery: str,
+    index: int,
+    approval_errors: dict[int, ApprovalError],
+) -> str:
+    """跑一条检索;审批错误按子查询序登记后照常上抛(由 step 在并行收集后原样重抛)。"""
+    try:
+        return retriever.step(subquery).output
+    except ApprovalError as exc:
+        approval_errors[index] = exc
+        raise
 
 
 def _emit(trace: TraceSink | None, name: str, subqueries: int, findings: int, output: str) -> None:

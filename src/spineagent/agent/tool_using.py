@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult
+from spineagent.agent.approval import enforce_tool_approval
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
 from spineagent.tools.tool import Tool
 
@@ -68,6 +69,8 @@ class ToolUsingAgent:
                 return AgentResult(agent=self._name, output=answer)
             # 把 $prev 替换为上一步观测输出后执行该工具,观测追加进历史。
             arg = action.arg.replace("$prev", history[-1].output if history else "")
+            # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
+            enforce_tool_approval(action.tool, {"arg": arg})
             result = self._tools[action.tool].run(arg)
             history.append(Observation(tool=action.tool, arg=arg, output=result.output))
             _emit_tool_step(trace, self._name, len(history) - 1, action.tool, arg, result.output)

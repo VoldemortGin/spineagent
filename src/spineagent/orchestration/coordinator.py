@@ -15,6 +15,7 @@ resilient 后,单个 agent 的异常被捕获、归一为家族统一错误 dict
 被直接调用时自己的事(见 agent/agent.py 的隐私约定)。
 """
 
+import contextvars
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -49,9 +50,15 @@ class Coordinator:
         """同一任务用线程池并发跑;结果仍按 agent 输入顺序返回(map 保序)。"""
         start = time.perf_counter()
         workers = max_workers or max(1, len(self._agents))
+        # 每个分支在调用方上下文的一份副本里跑:contextvar 承载的审批作用域等随之进入工作线程,
+        # 并行编排下执行闸照样生效(线程池默认不传播上下文)。
+        contexts = [contextvars.copy_context() for _ in self._agents]
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(
-                pool.map(lambda agent: self._run_one(agent, task, resilient), self._agents)
+                pool.map(
+                    lambda pair: pair[0].run(self._run_one, pair[1], task, resilient),
+                    zip(contexts, self._agents, strict=True),
+                )
             )
         self._emit("parallel", start, results)
         return results

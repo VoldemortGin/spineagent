@@ -10,6 +10,7 @@
 再用一个故意把任务正文写进 trace 的「泄露 agent」证明:隐私不变量格子会被 run() 标红。
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,7 @@ from spineagent.agent.approval import (
     ApprovalMiddleware,
     AutoApprovalGate,
     ManualApprovalGate,
+    require_approval,
 )
 from spineagent.agent.artifact import BlobArtifactSink, InProcessArtifactSink
 from spineagent.agent.as_tool import AgentTool
@@ -38,6 +40,7 @@ from spineagent.agent.policy import SyntaxToolPolicy
 from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.conformance import (
     AGENT_INVARIANTS,
+    APPROVAL_ENFORCEMENT_INVARIANTS,
     APPROVAL_INVARIANTS,
     ARTIFACT_INVARIANTS,
     LLM_INVARIANTS,
@@ -47,6 +50,7 @@ from spineagent.conformance import (
     SKILL_INVARIANTS,
     STREAMING_INVARIANTS,
     TOOL_INVARIANTS,
+    ScriptedToolCallProvider,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
 from spineagent.llm.cohere_provider import CohereProvider
@@ -54,11 +58,13 @@ from spineagent.llm.failover_provider import make_failover_provider
 from spineagent.llm.gemini_provider import GeminiProvider
 from spineagent.llm.provider import AnthropicProvider, OpenAICompatProvider
 from spineagent.orchestration.chain import ChainAgent
+from spineagent.orchestration.coordinator import Coordinator
 from spineagent.protocol.a2a.seam import A2AAgentAdapter, OfflineA2AStub
 from spineagent.protocol.mcp.seam import McpClientTool, McpTool, OfflineMcpStub
 from spineagent.sandbox.seam import InProcessSandbox
 from spineagent.skills.skill import FixtureSkill, SkillSpec
-from spineagent.tools.tool import CalcTool, EchoTool
+from spineagent.tools.function_tool import FunctionTool
+from spineagent.tools.tool import CalcTool, EchoTool, ToolResult
 
 
 def _echo_mcp_tool() -> McpClientTool:
@@ -131,6 +137,153 @@ MIDDLEWARE_SUITE = ConformanceSuite(
 APPROVAL_SUITE = ConformanceSuite(
     {"auto": AutoApprovalGate, "manual": ManualApprovalGate},
     APPROVAL_INVARIANTS,
+)
+
+# ---- 审批执行闸 conformance:参数化所有会执行工具的 agent 实现(含中间件组合 / 嵌套 / 并行)------
+# 每个 harness 都用【真实】工具执行路径:真实 FunctionCallingAgent(离线脚本化 provider)/ 真实
+# ToolUsingAgent(SyntaxToolPolicy)+ 真实副作用函数;审批只经公开 API 接上——绝不用假执行的 agent。
+
+
+def _function_tools(tools):
+    return [
+        FunctionTool(
+            name,
+            "",
+            {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+            func=fn,
+        )
+        for name, fn in tools.items()
+    ]
+
+
+class _PlainTool:
+    def __init__(self, name, fn) -> None:
+        self.name = name
+        self._fn = fn
+
+    def run(self, arg):
+        return ToolResult(tool=self.name, output=self._fn(arg))
+
+
+def _fc_agent(calls, tools, name="fc"):
+    script = ScriptedToolCallProvider([(n, {"value": v}) for n, v in calls])
+    return FunctionCallingAgent(name, script, _function_tools(tools))
+
+
+def _tu_agent(calls, tools, name="tu"):
+    return ToolUsingAgent(name, SyntaxToolPolicy(), [_PlainTool(n, f) for n, f in tools.items()])
+
+
+def _tu_task(calls):
+    return "\n".join(f"{n}: {v}" for n, v in calls)
+
+
+def _approval(gate, gated_tools):
+    return [] if gate is None else [ApprovalMiddleware(gate, gated_tools=gated_tools)]
+
+
+class _Harness:
+    """把「怎么造 agent + 用什么 task 驱动」参数化:build(calls, tools, approval_mws) -> (agent, task)。"""
+
+    def __init__(self, build) -> None:
+        self._build = build
+
+    def run(self, calls, tools, *, gate, gated_tools=()):
+        agent, task = self._build(calls, tools, _approval(gate, gated_tools))
+        agent.step(task)
+
+
+def _h_function_calling(calls, tools, mws):
+    return MiddlewareAgent("g", _fc_agent(calls, tools), mws), "go"
+
+
+def _h_tool_using(calls, tools, mws):
+    return MiddlewareAgent("g", _tu_agent(calls, tools), mws), _tu_task(calls)
+
+
+def _h_dynamic_tool_before(calls, tools, mws):
+    # DynamicToolMiddleware 在外层宣告工具集(含受审批工具),审批在其后。
+    seed = DynamicToolMiddleware({0: ["delete_file"]})
+    return MiddlewareAgent("g", _fc_agent(calls, tools), [seed, *mws]), "go"
+
+
+def _h_dynamic_tool_after_removes(calls, tools, mws):
+    # 审批在前、DynamicToolMiddleware 在后把 ctx.tools 清空:声明面怎么变都不能绕过执行闸。
+    return MiddlewareAgent("g", _fc_agent(calls, tools), [*mws, DynamicToolMiddleware()]), "go"
+
+
+def _h_nested_middleware(calls, tools, mws):
+    inner = MiddlewareAgent("inner", _fc_agent(calls, tools), mws)
+    return MiddlewareAgent("outer", inner, [TokenUsageMiddleware()]), "go"
+
+
+def _h_agent_tool(calls, tools, mws):
+    # 督导 ToolUsingAgent 把真实 FunctionCallingAgent 当工具(AgentTool)派活;审批挂在最外层。
+    worker = AgentTool(_fc_agent(calls, tools, name="worker"))
+    supervisor = ToolUsingAgent("sup", SyntaxToolPolicy(), [worker])
+    return MiddlewareAgent("g", supervisor, mws), "worker: go"
+
+
+def _h_chain(calls, tools, mws):
+    chain = ChainAgent("chain", [FunctionAgent("pre", lambda t: t), _fc_agent(calls, tools)])
+    return MiddlewareAgent("g", chain, mws), "go"
+
+
+def _h_parallel(calls, tools, mws):
+    fc = _fc_agent(calls, tools)
+    fan_out = FunctionAgent("fan", lambda t: Coordinator([fc]).run_parallel(t)[0].output)
+    return MiddlewareAgent("g", fan_out, mws), "go"
+
+
+def _h_deep_research(calls, tools, mws):
+    script = ScriptedToolCallProvider([(n, {"value": v}) for n, v in calls])
+    research = DeepResearchAgent(provider=script, tools=_function_tools(tools))
+    return MiddlewareAgent("g", research, mws), "go"
+
+
+class _StaticWrapperForeignThreadHarness:
+    """审批经 require_approval 绑在工具本身上,agent 在一条【裸线程】里跑(无 contextvar 传播)。"""
+
+    def run(self, calls, tools, *, gate, gated_tools=()):
+        wrapped = [
+            require_approval(t, gate) if gate is not None and t.name in gated_tools else t
+            for t in _function_tools(tools)
+        ]
+        script = ScriptedToolCallProvider([(n, {"value": v}) for n, v in calls])
+        agent = FunctionCallingAgent("fc", script, wrapped)
+        errors: list[BaseException] = []
+
+        def target() -> None:
+            try:
+                agent.step("go")
+            except BaseException as exc:  # noqa: BLE001 — 线程里捕获后在主线程重抛
+                errors.append(exc)
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join()
+        if errors:
+            raise errors[0]
+
+
+APPROVAL_ENFORCEMENT_SUITE = ConformanceSuite(
+    {
+        "function_calling": lambda: _Harness(_h_function_calling),
+        "tool_using": lambda: _Harness(_h_tool_using),
+        "middleware_dynamic_tool_before": lambda: _Harness(_h_dynamic_tool_before),
+        "middleware_dynamic_tool_after": lambda: _Harness(_h_dynamic_tool_after_removes),
+        "nested_middleware": lambda: _Harness(_h_nested_middleware),
+        "agent_tool_nested": lambda: _Harness(_h_agent_tool),
+        "chain": lambda: _Harness(_h_chain),
+        "run_parallel": lambda: _Harness(_h_parallel),
+        "deep_research": lambda: _Harness(_h_deep_research),
+        "static_wrapper_foreign_thread": _StaticWrapperForeignThreadHarness,
+    },
+    APPROVAL_ENFORCEMENT_INVARIANTS,
 )
 
 # ArtifactSink conformance:进程内默认 + 组合 corespine MemoryBlobStore 的 BlobArtifactSink。
@@ -405,6 +558,12 @@ def test_middleware_conformance(case):
 @pytest.mark.parametrize(**APPROVAL_SUITE.parametrize_kwargs())
 def test_approval_conformance(case):
     """每个 ApprovalGate(auto / manual)× 每条 approval 不变量 各跑一格(2 × 4 = 8 格全绿)。"""
+    case()
+
+
+@pytest.mark.parametrize(**APPROVAL_ENFORCEMENT_SUITE.parametrize_kwargs())
+def test_approval_enforcement_conformance(case):
+    """每个会执行工具的 agent 实现 / 组合 × 每条审批执行闸不变量 各跑一格(10 × 5 = 50 格全绿)。"""
     case()
 
 

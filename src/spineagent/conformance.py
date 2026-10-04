@@ -31,6 +31,9 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
                  可 round-trip 取回。
   approval_gate —— ①review 返回 Decision 三态;②gate 有非空名字;③review 幂等(同 request 恒同决议);
                  ④请求摘要不含参数正文(只 schema 指纹 + 计数)。
+  approval_enforcement —— 【执行闸,参数化所有会执行工具的 agent 实现 / 组合】①未获批准的受审批
+                 工具执行次数为 0;②原样重跑不绕过;③改参数须重新审批;④审批门故障时 fail-closed;
+                 ⑤未受审批的工具不受影响。全部用带副作用计数的真实工具函数断言(见 docs/adr/0002)。
   streaming   —— 【叠加协议 StreamingLLMProvider】①stream_chat 各 chunk 是 ChatCompletionChunk 形状、
                  末块 finish_reason 合法;②流式各 chunk 的 delta.content 顺序拼接 == 非流式 chat()
                  的 message.content(确定性等价)。
@@ -40,19 +43,36 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
 """
 
 import json
-from typing import Protocol, runtime_checkable
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Protocol, runtime_checkable
 
 from corespine.conformance.harness import InvariantPack
 from corespine.llm.provider import (
     ChatCompletion,
     ChatCompletionChunk,
+    Choice,
+    FunctionCall,
     LLMProvider,
+    ResponseMessage,
     StreamingLLMProvider,
+    Usage,
 )
+from corespine.llm.provider import ToolCall as LLMToolCall
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
-from spineagent.agent.approval import ApprovalGate, Decision, make_approval_request
+from spineagent.agent.approval import (
+    ApprovalError,
+    ApprovalGate,
+    ApprovalGateError,
+    ApprovalPending,
+    ApprovalRejected,
+    ApprovalRequest,
+    AutoApprovalGate,
+    Decision,
+    ManualApprovalGate,
+    make_approval_request,
+)
 from spineagent.agent.artifact import Artifact, ArtifactSink
 from spineagent.agent.middleware import Middleware, MiddlewareAgent, StepContext
 from spineagent.agent.policy import Finish, Observation, ToolCall, ToolPolicy
@@ -485,4 +505,178 @@ APPROVAL_INVARIANTS: InvariantPack[ApprovalGate] = (
     .add("gate_has_name", _gate_has_name)
     .add("review_is_idempotent", _review_is_idempotent)
     .add("request_digest_carries_no_argument_body", _request_digest_carries_no_argument_body)
+)
+
+
+# ---- 审批执行闸不变量(工具调用点上的强制闸,参数化所有会执行工具的 agent 实现)----------------
+# 只验「审批是工具调用点上的强制闸」:用带副作用计数的真实工具函数断言执行次数,而非检查任何声明。
+# 被测对象是一个 ToolExecutionHarness:它把「一串要尝试的工具调用」交给某个会执行工具的 agent 实现
+# (真实 FunctionCallingAgent / ToolUsingAgent / 嵌套 / 并行 / 中间件组合…)跑一次,审批经公开 API
+# (ApprovalMiddleware 或 require_approval)接上。各 agent 如何被脚本驱动去发起调用是 harness 的事。
+
+
+class ScriptedToolCallProvider:
+    """离线脚本化 LLMProvider:按对话里已有的 assistant 条数依次回放预设 tool_calls,耗尽后出文本。
+
+    无状态(回放序只由入参 messages 决定),故同一 agent 重跑 step 会从头回放同一脚本——正好模拟
+    「resolve 后原样重跑」;也因此可被多线程共享。每条脚本是 (工具名, arguments);arguments 给
+    Mapping 时按 JSON 编码,给 str 时原样作为 arguments 串(可用来注入坏 JSON)。
+    """
+
+    def __init__(
+        self,
+        calls: Sequence[tuple[str, Mapping[str, object] | str]],
+        *,
+        final: str = "done",
+        usage: Usage | None = None,
+    ) -> None:
+        self._calls = list(calls)
+        self._final = final
+        self._usage = usage
+
+    def chat(
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+    ) -> ChatCompletion:
+        index = sum(1 for m in messages if m.get("role") == "assistant")
+        if index < len(self._calls):
+            name, arguments = self._calls[index]
+            raw = arguments if isinstance(arguments, str) else json.dumps(dict(arguments))
+            message = ResponseMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(
+                    LLMToolCall(
+                        id=f"call_{index}", function=FunctionCall(name=name, arguments=raw)
+                    ),
+                ),
+            )
+            choice = Choice(index=0, message=message, finish_reason="tool_calls")
+            return ChatCompletion(choices=(choice,), usage=self._usage)
+        message = ResponseMessage(role="assistant", content=self._final)
+        return ChatCompletion(choices=(Choice(index=0, message=message),), usage=self._usage)
+
+
+@runtime_checkable
+class ToolExecutionHarness(Protocol):
+    """把一串工具调用交给某个会执行工具的 agent 实现真实跑一次(审批经公开 API 接上)。
+
+    - calls:要依次尝试的 (工具名, 单个字符串参数值);
+    - tools:工具名 -> 真实副作用函数(参数值进、文本出),harness 把它包成该 agent 吃的工具形状;
+    - gate / gated_tools:审批配置;gate 为 None 表示未配置审批。
+    审批的拒绝 / 挂起 / 闸故障以异常形式冒出(ApprovalRejected / ApprovalPending / ApprovalGateError)。
+    """
+
+    def run(
+        self,
+        calls: Sequence[tuple[str, str]],
+        tools: Mapping[str, Callable[[str], str]],
+        *,
+        gate: ApprovalGate | None,
+        gated_tools: Sequence[str] = (),
+    ) -> None: ...
+
+
+class _Counter:
+    """带副作用计数的真实工具函数:每执行一次记一笔(参数值),返回固定文本。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __call__(self, value: str) -> str:
+        self.calls.append(value)
+        return "ok"
+
+
+class _ExplodingGate:
+    """review 必抛异常的审批门(模拟外部审批系统故障)。"""
+
+    name = "exploding"
+
+    def review(self, request: ApprovalRequest) -> Decision:
+        raise RuntimeError("approval backend down")
+
+
+def _expect_approval_error(
+    harness: ToolExecutionHarness,
+    error: type[ApprovalError],
+    calls: Sequence[tuple[str, str]],
+    tools: Mapping[str, Callable[[str], str]],
+    gate: ApprovalGate,
+) -> ApprovalError:
+    try:
+        harness.run(calls, tools, gate=gate, gated_tools=["delete_file"])
+    except error as exc:
+        return exc
+    raise AssertionError(f"受审批工具未获批准却没有被 {error.__name__} 拦下")
+
+
+def _unapproved_gated_tool_never_executes(harness: ToolExecutionHarness) -> None:
+    calls = [("delete_file", "/x")]
+    deny = _Counter()
+    _expect_approval_error(
+        harness, ApprovalRejected, calls, {"delete_file": deny}, AutoApprovalGate(deny=["*"])
+    )
+    assert deny.calls == [], "被拒的受审批工具执行次数必须为 0"
+    pending = _Counter()
+    _expect_approval_error(
+        harness, ApprovalPending, calls, {"delete_file": pending}, ManualApprovalGate()
+    )
+    assert pending.calls == [], "待审的受审批工具执行次数必须为 0"
+
+
+def _rerun_does_not_bypass(harness: ToolExecutionHarness) -> None:
+    counter, gate = _Counter(), ManualApprovalGate()
+    ids = {
+        _expect_approval_error(
+            harness, ApprovalPending, [("delete_file", "/x")], {"delete_file": counter}, gate
+        ).context["request_id"]
+        for _ in range(3)
+    }
+    assert counter.calls == [], "原样重跑绝不能绕过审批"
+    assert len(ids) == 1, "request id 不依赖步序:原样重跑必须命中同一请求"
+
+
+def _changed_arguments_require_reapproval(harness: ToolExecutionHarness) -> None:
+    counter, gate = _Counter(), ManualApprovalGate()
+    tools = {"delete_file": counter}
+    first = _expect_approval_error(harness, ApprovalPending, [("delete_file", "/a")], tools, gate)
+    gate.resolve(str(first.context["request_id"]), Decision.APPROVED)
+    harness.run([("delete_file", "/a")], tools, gate=gate, gated_tools=["delete_file"])
+    assert counter.calls == ["/a"], "获批后以相同参数重跑必须执行恰好一次"
+    second = _expect_approval_error(harness, ApprovalPending, [("delete_file", "/b")], tools, gate)
+    assert second.context["request_id"] != first.context["request_id"], "改参数必须是新请求"
+    assert counter.calls == ["/a"], "参数被改后必须重新审批,绝不复用旧批准"
+
+
+def _gate_failure_blocks_execution(harness: ToolExecutionHarness) -> None:
+    counter = _Counter()
+    _expect_approval_error(
+        harness,
+        ApprovalGateError,
+        [("delete_file", "/x")],
+        {"delete_file": counter},
+        _ExplodingGate(),
+    )
+    assert counter.calls == [], "审批门异常时必须 fail-closed:执行次数为 0"
+
+
+def _ungated_tools_are_unaffected(harness: ToolExecutionHarness) -> None:
+    gated, free = _Counter(), _Counter()
+    harness.run(
+        [("read_file", "/x")],
+        {"delete_file": gated, "read_file": free},
+        gate=AutoApprovalGate(deny=["*"]),
+        gated_tools=["delete_file"],
+    )
+    assert free.calls == ["/x"], "未受审批的工具不受审批门影响"
+    assert gated.calls == []
+
+
+APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness] = (
+    InvariantPack("approval_enforcement")
+    .add("unapproved_gated_tool_never_executes", _unapproved_gated_tool_never_executes)
+    .add("rerun_does_not_bypass", _rerun_does_not_bypass)
+    .add("changed_arguments_require_reapproval", _changed_arguments_require_reapproval)
+    .add("gate_failure_blocks_execution", _gate_failure_blocks_execution)
+    .add("ungated_tools_are_unaffected", _ungated_tools_are_unaffected)
 )

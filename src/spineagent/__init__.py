@@ -26,6 +26,7 @@ from spineagent.agent.approval import (
     ApprovalConflict,
     ApprovalError,
     ApprovalGate,
+    ApprovalGateError,
     ApprovalMiddleware,
     ApprovalPending,
     ApprovalRejected,
@@ -38,8 +39,10 @@ from spineagent.agent.approval import (
     ResumeTicket,
     ResumeTokenStore,
     approval_gates,
+    enforce_tool_approval,
     make_approval_gate,
     make_approval_request,
+    require_approval,
 )
 from spineagent.agent.artifact import (
     Artifact,
@@ -194,10 +197,13 @@ __all__ = [
     "ApprovalRejected",
     "ApprovalPending",
     "ApprovalConflict",
+    "ApprovalGateError",
     "InvalidResumeToken",
     "approval_gates",
     "make_approval_gate",
     "make_approval_request",
+    "enforce_tool_approval",
+    "require_approval",
     # tool-policy 缝(会用工具的 agent 的「大脑」)
     "ToolPolicy",
     "ToolCall",
