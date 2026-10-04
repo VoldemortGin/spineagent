@@ -11,7 +11,7 @@ agent 通过本协议在运行时调用 ragspine 做检索。但 spineagent【�
 
 import ast
 import operator
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -41,6 +41,24 @@ class Tool(Protocol):
     def name(self) -> str: ...
 
     def run(self, arg: str) -> ToolResult: ...
+
+
+@runtime_checkable
+class _Named(Protocol):
+    """有名字的东西(Tool / FunctionTool 都满足);仅供 index_tools_by_name 的类型约束。"""
+
+    @property
+    def name(self) -> str: ...
+
+
+def index_tools_by_name[T: _Named](tools: Iterable[T]) -> dict[str, T]:
+    """按工具名建索引(保持插入序);重名直接抛 ValueError——绝不静默让后一个覆盖前一个。"""
+    indexed: dict[str, T] = {}
+    for tool in tools:
+        if tool.name in indexed:
+            raise ValueError(f"重名工具 {tool.name!r}:同一 agent 内工具名必须唯一")
+        indexed[tool.name] = tool
+    return indexed
 
 
 class EchoTool:

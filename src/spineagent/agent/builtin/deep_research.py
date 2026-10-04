@@ -25,6 +25,7 @@ from spineagent.agent.approval import ApprovalError
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.orchestration.coordinator import Coordinator
 from spineagent.tools.function_tool import FunctionTool
+from spineagent.tools.tool import index_tools_by_name
 
 # 分解切分的分隔符(离线默认 planner 用):换行 + 中英文分号。
 _SPLIT_CHARS = ("\n", ";", "；")
@@ -59,7 +60,7 @@ class DeepResearchAgent:
     ) -> None:
         self._name = name
         self._provider = provider if provider is not None else MockProvider()
-        self._tools = list(tools)
+        self._tools = list(index_tools_by_name(tools).values())  # 重名工具在构造时即报错
         self._planner = planner if planner is not None else default_planner
         self._max_subqueries = max_subqueries
         self._retriever_system = retriever_system

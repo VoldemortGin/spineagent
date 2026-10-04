@@ -152,3 +152,22 @@ def test_unwrap_function_tool_bare_body():
         "",
         {"type": "object", "properties": {}},
     )  # 缺 description / parameters 用默认回落
+
+
+def test_malformed_tool_arguments_fall_back_to_raw_without_raising():
+    # OpenAI 兼容端点吐的坏 JSON 原样进了历史:下一轮换到 Anthropic / Gemini / Bedrock 不得抛。
+    for raw in ('{"a": 1', "[1, 2]", "3"):
+        turns = normalize_openai_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": raw}}],
+                }
+            ]
+        )
+        assert turns == [
+            AssistantToolCallsTurn(
+                text=None, tool_calls=(ToolCallPart(id="c1", name="f", arguments={"_raw": raw}),)
+            )
+        ]

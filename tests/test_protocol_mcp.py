@@ -5,6 +5,7 @@ import pytest
 from spineagent.protocol.mcp.seam import (
     McpClient,
     McpClientTool,
+    McpProtocolError,
     McpServer,
     McpTool,
     OfflineMcpStub,
@@ -62,11 +63,11 @@ def test_mcp_client_tool_custom_arg_key_and_result_key():
     assert result.tool == "up"  # provenance
 
 
-def test_mcp_client_tool_missing_result_key_raises_keyerror():
-    # 结果里缺默认 result_key("result")→ 取键时 KeyError(适配层不吞)。
+def test_mcp_client_tool_missing_result_key_is_not_swallowed():
+    # 结果里缺默认 result_key("result")→ 缝的类型化错误(不再是裸 KeyError;适配层仍不吞)。
     stub = OfflineMcpStub()
     stub.register_tool(McpTool("x"), lambda args: {"wrong": 1})
-    with pytest.raises(KeyError):
+    with pytest.raises(McpProtocolError):
         McpClientTool("x", stub).run("a")
 
 
@@ -75,3 +76,11 @@ def test_mcp_client_tool_non_str_result_is_stringified():
     stub = OfflineMcpStub()
     stub.register_tool(McpTool("n"), lambda args: {"result": 42})
     assert McpClientTool("n", stub).run("a").output == "42"
+
+
+def test_mcp_client_tool_missing_result_key_is_typed_error():
+    stub = OfflineMcpStub()
+    stub.register_tool(McpTool("weird"), lambda args: {"unexpected": 1})
+    with pytest.raises(McpProtocolError) as ei:
+        McpClientTool("weird", stub).run("x")
+    assert ei.value.code == "mcp.invalid_result"

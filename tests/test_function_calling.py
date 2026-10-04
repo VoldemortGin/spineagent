@@ -406,3 +406,79 @@ def test_usage_reflects_final_turn_even_when_final_is_none():
     result = FunctionCallingAgent("u", model, [echo]).step("go")
     assert result.output == "fin"
     assert result.usage is None  # 末轮 None 覆写早轮 usage
+
+
+# ---- 工具执行失败路径:异常归一成 tool 消息喂回,不让整轮崩溃 ------------------------------
+
+
+def _boom_tool(exc: BaseException) -> FunctionTool:
+    def boom(x: str) -> str:
+        raise exc
+
+    return FunctionTool(
+        "boom",
+        "总是失败",
+        {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+        func=boom,
+    )
+
+
+def test_tool_exception_is_fed_back_without_message_by_default():
+    model = _ScriptedProvider(_tool("c1", "boom", '{"x": "a"}'), _text("已降级处理"))
+    agent = FunctionCallingAgent("a", model, [_boom_tool(RuntimeError("内部路径 /secret/key"))])
+    result = agent.step("x")
+    assert result.output == "已降级处理"
+    tool_msg = next(m for m in model.calls[1] if m.get("role") == "tool")
+    assert "RuntimeError" in tool_msg["content"]
+    assert "tool.execution_failed" in tool_msg["content"]
+    assert "/secret/key" not in tool_msg["content"]  # 缺省不带异常消息原文
+
+
+def test_tool_exception_message_is_opt_in():
+    model = _ScriptedProvider(_tool("c1", "boom", '{"x": "a"}'), _text("ok"))
+    agent = FunctionCallingAgent(
+        "a", model, [_boom_tool(RuntimeError("可公开的原因"))], include_error_message=True
+    )
+    agent.step("x")
+    tool_msg = next(m for m in model.calls[1] if m.get("role") == "tool")
+    assert "可公开的原因" in tool_msg["content"]
+
+
+def test_fail_fast_keeps_old_behavior():
+    model = _ScriptedProvider(_tool("c1", "boom", '{"x": "a"}'), _text("ok"))
+    agent = FunctionCallingAgent("a", model, [_boom_tool(RuntimeError("x"))], fail_fast=True)
+    with pytest.raises(RuntimeError):
+        agent.step("x")
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), SystemExit(1)])
+def test_process_level_exceptions_are_not_swallowed(exc):
+    model = _ScriptedProvider(_tool("c1", "boom", '{"x": "a"}'), _text("ok"))
+    with pytest.raises(type(exc)):
+        FunctionCallingAgent("a", model, [_boom_tool(exc)]).step("x")
+
+
+def test_skill_error_is_fed_back():
+    from spineagent.skills.as_tool import skill_as_function_tool
+    from spineagent.skills.skill import FixtureSkill, SkillSpec
+
+    spec = SkillSpec(
+        "div",
+        "整除",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+        },
+    )
+    tool = skill_as_function_tool(FixtureSkill(spec, "a // b"))
+    model = _ScriptedProvider(_tool("c1", "div", '{"a": 1, "b": 0}'), _text("除零已处理"))
+    result = FunctionCallingAgent("a", model, [tool]).step("x")
+    assert result.output == "除零已处理"
+    tool_msg = next(m for m in model.calls[1] if m.get("role") == "tool")
+    assert "SkillError" in tool_msg["content"]
+
+
+def test_duplicate_tool_names_are_rejected():
+    with pytest.raises(ValueError, match="重名"):
+        FunctionCallingAgent("a", MockProvider(), [_calc_tool([]), _calc_tool([])])

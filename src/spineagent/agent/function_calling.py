@@ -9,6 +9,11 @@ max_steps。它实现 Agent 协议,故可直接进 Coordinator / 被 AgentTool �
 任意 provider(OpenAI 兼容 / Anthropic / Gemini / Bedrock / Cohere)都不改这里一行——「统一 invoke」。
 离线默认 MockProvider 不回 tool_calls,故它直接出文本(诚实:离线不假装会 function-calling)。
 
+工具执行失败:工具函数抛的任何 Exception(审批错误除外)都归一成一条 tool 消息喂回模型,内容只含
+稳定错误码与异常类型名(缺省不带异常消息原文——消息里可能有路径 / 凭据等敏感内容;
+include_error_message=True 才附上),让循环优雅继续;fail_fast=True 恢复「异常直接冒泡」的旧行为。
+审批错误(ApprovalError)与 KeyboardInterrupt / SystemExit 等非 Exception 一律不吞。
+
 隐私:每步发 tool_step(agent / 步序 / 工具名 / 入参长度 / 输出长度)、收尾发 agent_finish、触顶发
 agent_step_limit——只记 code / 计数,绝不记任务 / 参数 / 输出正文。
 """
@@ -16,15 +21,20 @@ agent_step_limit——只记 code / 计数,绝不记任务 / 参数 / 输出正�
 from collections.abc import Iterable
 from typing import Any
 
+from corespine.errors import CorespineError
 from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult
-from spineagent.agent.approval import enforce_tool_approval
+from spineagent.agent.approval import ApprovalError, enforce_tool_approval
 from spineagent.tools.function_tool import FunctionTool, InvalidToolArguments
+from spineagent.tools.tool import index_tools_by_name
 
 # 触顶 max_steps 仍未出最终文本时的兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without a final answer)"
+
+# 工具执行失败的稳定错误码(非 CorespineError 时使用;CorespineError 用它自己的 code)。
+TOOL_EXECUTION_FAILED = "tool.execution_failed"
 
 
 class FunctionCallingAgent:
@@ -38,12 +48,16 @@ class FunctionCallingAgent:
         *,
         system: str = "",
         max_steps: int = 8,
+        fail_fast: bool = False,
+        include_error_message: bool = False,
     ) -> None:
         self._name = name
         self._model = model
-        self._tools = {tool.name: tool for tool in tools}
+        self._tools = index_tools_by_name(tools)
         self._system = system
         self._max_steps = max_steps
+        self._fail_fast = fail_fast
+        self._include_error_message = include_error_message
 
     @property
     def name(self) -> str:
@@ -98,13 +112,31 @@ class FunctionCallingAgent:
                     else:
                         # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
                         enforce_tool_approval(tool.name, validated)
-                        output = tool.invoke(validated)
+                        output = self._invoke(tool, validated)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 _emit_tool_step(trace, self._name, index, tc.function.name, arguments, output)
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)
         return AgentResult(self._name, _NO_OUTPUT, usage=last_usage)
+
+    def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> str:
+        """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。"""
+        if self._fail_fast:
+            return tool.invoke(arguments)
+        try:
+            return tool.invoke(arguments)
+        except ApprovalError:
+            raise  # 嵌套 agent 里的审批挂起 / 拒绝必须冒到调用方(HITL 恢复靠它)
+        except Exception as exc:  # noqa: BLE001 —— 工具失败喂回模型,不让整轮崩溃
+            return _tool_error_text(exc, include_message=self._include_error_message)
+
+
+def _tool_error_text(exc: Exception, *, include_message: bool) -> str:
+    """工具失败的喂回文本:稳定错误码 + 异常类型名;仅显式开启时才附异常消息原文。"""
+    code = exc.code if isinstance(exc, CorespineError) else TOOL_EXECUTION_FAILED
+    text = f"error: tool failed [code={code} type={type(exc).__name__}]"
+    return f"{text}: {exc}" if include_message else text
 
 
 def _usage_dict(usage: Any) -> dict[str, int] | None:

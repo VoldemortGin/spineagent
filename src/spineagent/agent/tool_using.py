@@ -26,7 +26,7 @@ from corespine.observability.trace import TraceSink
 from spineagent.agent.agent import AgentResult
 from spineagent.agent.approval import enforce_tool_approval
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
-from spineagent.tools.tool import Tool
+from spineagent.tools.tool import Tool, index_tools_by_name
 
 # 触顶 max_steps 又无任何观测可作答时的固定兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without finishing)"
@@ -45,7 +45,7 @@ class ToolUsingAgent:
     ) -> None:
         self._name = name
         self._policy = policy
-        self._tools = {tool.name: tool for tool in tools}
+        self._tools = index_tools_by_name(tools)
         # 工具名集合(传给 policy 用以避免幻觉一个不存在的工具);顺序 = 插入序。
         self._tool_names = tuple(self._tools)
         self._max_steps = max_steps

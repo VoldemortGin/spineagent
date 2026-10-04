@@ -112,6 +112,7 @@ from spineagent.protocol.a2a.seam import (
 from spineagent.protocol.mcp.seam import (
     McpClient,
     McpClientTool,
+    McpProtocolError,
     McpServer,
     McpTool,
     OfflineMcpStub,
@@ -242,6 +243,7 @@ __all__ = [
     "McpServer",
     "McpTool",
     "McpClientTool",
+    "McpProtocolError",
     "OfflineMcpStub",
     "mcp_clients",
     "load_mcp_sdk",

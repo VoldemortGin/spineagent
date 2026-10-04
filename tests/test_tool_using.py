@@ -107,3 +107,8 @@ def test_policy_decide_returns_action_union():
         "calc: 1+1", tools=("calc",), history=(Observation("calc", "1+1", "2"),)
     )
     assert done.answer  # Finish.answer 非空
+
+
+def test_duplicate_tool_names_are_rejected():
+    with pytest.raises(ValueError, match="重名"):
+        ToolUsingAgent("a", SyntaxToolPolicy(), [CalcTool(), CalcTool()])

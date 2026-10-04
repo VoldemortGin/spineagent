@@ -97,7 +97,7 @@ def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[Turn]:
                     ToolCallPart(
                         id=tc["id"],
                         name=fn["name"],
-                        arguments=json.loads(fn.get("arguments") or "{}"),
+                        arguments=_decode_arguments(fn.get("arguments") or "{}"),
                     )
                 )
             turns.append(
@@ -114,6 +114,19 @@ def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[Turn]:
                 )
             )
     return turns
+
+
+def _decode_arguments(raw: str) -> dict[str, Any]:
+    """把历史里的 tool-call arguments 串解码成 dict;坏 JSON / 非对象一律回落 {"_raw": 原串}。
+
+    OpenAI 兼容端点可能吐坏 JSON,agent 会把原串存进历史;下一轮换到 Anthropic / Gemini / Bedrock
+    时绝不能因此抛 JSONDecodeError。三家共享这一处解码,故回落表示在各适配器间一致。
+    """
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        return {"_raw": raw}
+    return decoded if isinstance(decoded, dict) else {"_raw": raw}
 
 
 def join_system(turns: list[Turn]) -> str:

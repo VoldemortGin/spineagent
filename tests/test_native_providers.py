@@ -382,3 +382,26 @@ def test_native_program_error_in_mapping_propagates_not_swallowed():
 
     with pytest.raises(KeyError):
         BedrockConverseProvider("m", client=_BadBedrock()).chat([{"role": "user", "content": "hi"}])
+
+
+def test_malformed_history_arguments_do_not_break_native_adapters():
+    # OpenAI 兼容端点吐了坏 JSON、agent 把原串存进历史;下一轮换到原生适配器时三家都不得抛,
+    # 且一致地把它表示成 {"_raw": <原串>}。
+    from spineagent.llm.bedrock_provider import _openai_messages_to_bedrock
+    from spineagent.llm.gemini_provider import _openai_messages_to_gemini
+    from spineagent.llm.provider import _openai_messages_to_anthropic
+
+    bad = [dict(m) for m in HISTORY]
+    bad[2] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "calc", "arguments": '{"x": '}}
+        ],
+    }
+    _, anthropic = _openai_messages_to_anthropic(bad)
+    assert {"_raw": '{"x": '} in [
+        b.get("input") for m in anthropic for b in m["content"] if isinstance(b, dict)
+    ]
+    for converted in (_openai_messages_to_gemini(bad), _openai_messages_to_bedrock(bad)):
+        assert '"_raw"' in json.dumps(converted, ensure_ascii=False, default=str)

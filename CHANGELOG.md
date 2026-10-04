@@ -15,10 +15,24 @@
 - `CalcTool`:表达式长度 ≤ 4096、嵌套深度 ≤ 100,幂 / 乘法结果位数复用 sandbox 的昂贵二元运算
   守卫;越界立即抛 `ValueError`。
 
+### Fixed
+
+- `FunctionCallingAgent`:工具函数抛异常(含 `SkillError`)不再让整轮 `step()` 崩溃,而是归一成
+  tool 消息喂回模型(只含稳定错误码 `tool.execution_failed` / CorespineError 的 code 与异常类型名;
+  消息原文需 `include_error_message=True`);`fail_fast=True` 保留旧行为;审批错误与
+  `KeyboardInterrupt` / `SystemExit` 不吞。
+- 历史里坏 JSON 的 tool-call arguments 不再让 Anthropic / Gemini / Bedrock 适配器抛
+  `JSONDecodeError`,统一回落为 `{"_raw": <原串>}`。
+- `McpClientTool` 遇到缺 `result` 键的结果抛 `McpProtocolError`(code `mcp.invalid_result`)。
+- `FunctionCallingAgent` / `ToolUsingAgent` / `DeepResearchAgent` 传入重名工具时构造即抛
+  `ValueError`,不再静默覆盖。
+
 ### Added
 
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
+- `FunctionCallingAgent(fail_fast=..., include_error_message=...)`、`McpProtocolError`、
+  `spineagent.tools.tool.index_tools_by_name`。
 - `InProcessSandbox(clock=...)`:可注入时钟(默认 `time.monotonic`)。
 - conformance:`SANDBOX_INVARIANTS` 新增 `timeout_takes_effect`。
 - conformance:`APPROVAL_ENFORCEMENT_INVARIANTS` + `ToolExecutionHarness` 协议 +
@@ -41,3 +55,6 @@
 - `InProcessSandbox.run(timeout=...)` / `Limits.timeout_seconds` 从「只记录」变为强制:求值超过
   timeout(缺省 `DEFAULT_LIMITS` 为 5 秒)判失败。
 - `CalcTool` 拒绝超过上述上限的表达式(此前会长时间计算或抛 `RecursionError`)。
+- `FunctionCallingAgent` 缺省不再让工具异常冒泡(需要旧行为传 `fail_fast=True`)。
+- `McpClientTool` 缺结果键时抛 `McpProtocolError` 而非 `KeyError`。
+- 重名工具从「后者静默覆盖前者」变为构造期 `ValueError`。

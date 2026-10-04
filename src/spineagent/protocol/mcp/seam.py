@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from corespine.errors import SeamError
+from corespine.errors import CorespineError, SeamError
 from corespine.seam.registry import Registry, lazy_extra_import
 
 from spineagent.tools.tool import ToolResult
@@ -74,6 +74,12 @@ class OfflineMcpStub:
         return self._handlers[name](arguments)
 
 
+class McpProtocolError(CorespineError):
+    """MCP 对端返回了不符约定的结果(如缺 result 键 / 不是对象)。只带键名,不带结果正文。"""
+
+    code = "mcp.invalid_result"
+
+
 class McpClientTool:
     """跨缝适配器:把一个 MCP client 的具名工具桥成 spineagent Tool(实现 Tool 协议)。
 
@@ -100,6 +106,12 @@ class McpClientTool:
 
     def run(self, arg: str) -> ToolResult:
         result = self._client.call_tool(self.name, {self._arg_key: arg})
+        if not isinstance(result, dict) or self._result_key not in result:
+            raise McpProtocolError(
+                f"MCP 工具 {self.name!r} 的结果缺少 {self._result_key!r} 键",
+                tool=self.name,
+                result_key=self._result_key,
+            )
         return ToolResult(tool=self.name, output=str(result[self._result_key]))
 
 

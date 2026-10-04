@@ -57,3 +57,13 @@ def test_injected_provider_is_used_for_synthesis():
     agent = DeepResearchAgent(provider=MockProvider(prefix="inj"))
     out = agent.step("只有一个问题").output
     assert out.startswith("[inj:")
+
+
+def test_duplicate_tool_names_rejected_at_construction():
+    import pytest
+
+    from spineagent.tools.function_tool import FunctionTool
+
+    tool = FunctionTool("search", "", {}, func=lambda: "x")
+    with pytest.raises(ValueError, match="重名"):
+        DeepResearchAgent(tools=[tool, tool])
