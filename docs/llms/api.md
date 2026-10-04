@@ -16,7 +16,10 @@
 ## agent
 
 ### `class AgentResult`
-`AgentResult(agent: str, output: str, usage: dict[str, int] | None = None, error: dict[str, object] | None = None, artifacts: tuple[ArtifactRef, ...] = ())`
+`AgentResult(agent: str, output: str, usage: dict[str, int] | None = None, error: dict[str, object] | None = None, artifacts: tuple[ArtifactRef, ...] = (), held_approvals: tuple[dict[str, str], ...] = ())`
+- `held_approvals`:`FunctionCallingAgent(on_approval="feed_back")` 本步没执行、而是喂回模型的审批挂起 / 拒绝,每项
+  `{"code", "request_id", "scope", "tool"}`,给调用方(不是模型)完成审批;`MiddlewareAgent` 原样保留,其它组合 agent
+  不汇总(审批人侧以 `gate.pending()` 为准)。
 - frozen dataclass。一次 agent 步的结果。`agent` = provenance(产出它的 agent 名)。
 - 属性 `ok -> bool`:`self.error is None`。
 - 契约:成功路径 `error is None`;`error` 仅由编排层弹性模式(`Coordinator(..., resilient=True)`)
@@ -51,15 +54,17 @@
 - 实现 `Agent` 协议,可直接进 `Coordinator` / `ChainAgent` / 被 `AgentTool` 包成工具。
 
 ### `class FunctionCallingAgent`
-`FunctionCallingAgent(name: str, model: LLMProvider, tools: Iterable[FunctionTool], *, system: str = "", max_steps: int = 8, fail_fast: bool = False, include_error_message: bool = False, approve_before_execute: bool = True, on_approval: Literal["raise", "feed_back"] = "raise")`
+`FunctionCallingAgent(name: str, model: LLMProvider, tools: Iterable[FunctionTool], *, system: str = "", max_steps: int = 8, fail_fast: bool = False, include_error_message: bool = False, approve_before_execute: bool = True, on_approval: Literal["raise", "feed_back"] = "raise", max_tool_calls_per_turn: int = 64)`
 - `step(task, *, trace=None) -> AgentResult`:**真 LLM** 原生 function-calling 多步循环——把每个
   `FunctionTool.schema()` 喂给 `model.chat(messages, tools=...)`;模型回 `tool_calls` 则逐个
   `parse_arguments` 校验 → `enforce_tool_approval` 审批 → `invoke`、以 OpenAI `tool` 角色消息喂回、
   再 chat;无 tool_calls 则出文本收尾。触顶 `max_steps` 兜底非空。`usage` 为各轮累加。
 - 审批(ADR 0002 决策 5 / 5a):`approve_before_execute=True`(缺省)时**先审后行**——一轮 tool_calls 执行任何一个
   之前先预检整轮,有任何受审批调用未获批则整轮一个都不执行;`on_approval="feed_back"` 时本执行点的挂起 / 拒绝
-  作为 tool 结果(`error: approval required [code=... request_id=...]`)喂回模型而不抛。处在 `ApprovalMiddleware`
-  的步里时,因审批挂起而在同一作用域重跑会复用已执行调用的记录结果(步内记账),不重放副作用。
+  作为 tool 结果(`error: approval required [code=... request_id=...]`,不含作用域)喂回模型而不抛,同时记进
+  `AgentResult.held_approvals`(每项 `{"code", "request_id", "scope", "tool"}`,给调用方完成审批)。`raise` 模式下
+  挂起后重跑整个 run 是**至少一次**语义:此前各轮已执行过的工具会再次执行(库不复用任何跨 run 的结果)。
+  一轮 tool_calls 超过 `max_tool_calls_per_turn` 时整轮不执行、不送审,每个调用喂回 `code=tool.too_many_calls`。
 - 工具失败:工具函数抛的 `Exception`(审批错误除外)归一成 tool 消息
   `error: tool failed [code=<code> type=<异常类型名>]` 喂回模型(`code` 为 CorespineError 的 code,否则
   `tool.execution_failed`);`include_error_message=True` 才附异常消息原文(截断到 300 字符);`fail_fast=True` 恢复冒泡。
@@ -289,11 +294,12 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - 组合式容错 provider:包裹一组下游,做 (a) 轮询分摊 + (b) 失败后按分类冷却出错的那一家 +
   (c) 全冷却时强制按序回退,全失败抛 `FailoverExhaustedError`(聚合各下游原因,经凭据脱敏,绝不含 key)。
 - 只 catch `retryable_errors`(默认 `ProviderError`),交给 `failover_policy` 给出
-  `FailoverDecision(fallback: bool, cooldown: bool)`;逻辑错(KeyError/ValueError…)照常上抛,不被吞。缺省
+  `FailoverDecision(fallback: bool, cooldown: bool, suspect_request: bool = False)`;逻辑错(KeyError/ValueError…)照常上抛,不被吞。缺省
   `default_failover_policy`(保守,可注入替换):瞬时故障(网络 / 超时 / 408 / 425 / 429 / 5xx)→ 回退 + 冷却该家;
   401 / 402 / 403 / 404 或消息含余额 / 配额 / 计费 / 模型不存在 / 鉴权 → 回退 + **只冷却出错的那一家**;上下文超长
-  与其它无法判定的 4xx → 回退但**不冷却**(全池都失败也不会把池子冷却掉);`BadRequestProviderError` →
-  不回退、不冷却,直接上抛。游标 / 冷却表加锁,可跨线程共享。
+  与其它无法判定的 4xx → 疑似请求本身有问题(`FailoverDecision.suspect_request=True`):不冷却,**最多再试 1 家**,
+  那家也以同类 4xx 拒绝则抛 `BadRequestProviderError`(一条畸形请求最多 2 次计费调用),以别的错误失败则停止并抛
+  `FailoverExhaustedError`;`BadRequestProviderError` → 不回退、不冷却,直接上抛。游标 / 冷却表加锁,可跨线程共享。
 - 不在顶层导出:`from spineagent.llm.failover_provider import FailoverProvider, FailoverDecision, default_failover_policy, make_failover_provider`。
 
 ### `ProviderError` / `NonRetryableProviderError` / `BadRequestProviderError` / `provider_error_from`
@@ -303,7 +309,9 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   5xx / 取不到状态码 → `ProviderError(retryable=True)`;其余 4xx(400 / 401 / 403 / 404 / 413 / 422 …)→
   `NonRetryableProviderError`(code `provider.non_retryable`,`retryable=False`)。状态码进 `context["status"]`。
 - `BadRequestProviderError(NonRetryableProviderError)`(code `provider.bad_request`):确知请求本身畸形、换谁都
-  不行——适配器**不会**自动判定出它(离线无法核实各家错误码,宁可多试一家),由确知的下游 / 自定义分类显式使用。
+  不行。来源:`provider_error_from` 遇到 400 / 422 且 vendor 错误体的稳定字段明确指出参数校验失败时(目前只有
+  OpenAI 风格错误体:`type == "invalid_request_error"` 且带 `param`、`code` 不是上下文超长 / 模型 / 配额类;其它家
+  无法据稳定字段区分「参数错」与「上下文超长」,保守地不判定);`FailoverProvider` 连续两家同类 4xx 时;自定义分类。
 - `make_failover_provider(providers, **kw) -> FailoverProvider`:诚实选类——【全下游都实现
   `StreamingLLMProvider`】才返回带 `stream_chat` 的 `StreamingFailoverProvider`,混编则返回不带
   `stream_chat` 的基类(`isinstance(p, StreamingLLMProvider)` 如实报 False)。`now_fn` 可注入以确定性测试冷却。
@@ -347,8 +355,8 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 ### `class MiddlewareAgent`
 `MiddlewareAgent(name: str, agent: Agent, middlewares: Iterable[Middleware])`
 - 洋葱链:before 正序 → 内层 `agent.step(ctx.task, trace=ctx.trace)` → after 逆序 → provenance 重盖为本名。
-  步序取号加锁(线程安全)。整步在调用方 `contextvars` 上下文的**副本**里跑:middleware 压进的作用域(审批、
-  记账)结构上只活在本步里,不会泄漏给同一线程里之后的请求。收尾失败的汇总:本步自身抛错时以本步的错误为准
+  步序取号加锁(线程安全)。整步在调用方 `contextvars` 上下文的**副本**里跑:middleware 压进的作用域(审批
+  配置、审批作用域)结构上只活在本步里,不会泄漏给同一线程里之后的请求。收尾失败的汇总:本步自身抛错时以本步的错误为准
   (收尾失败只作为 `__notes__` 附注,只含异常类型名);本步成功而收尾失败时,单个失败原样抛出、多个抛
   `ExceptionGroup`(`KeyboardInterrupt` 等非 `Exception` 优先)。
 
@@ -364,48 +372,56 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 ## approval 缝(审批门 / Wait,ADR 0001 / 0002)
 
 - `Decision`(StrEnum):`APPROVED` / `REJECTED` / `PENDING`。
-- `ApprovalRequest(code, id, tool, arg_fingerprint="", arg_count=0, scope="", preview=())`:定位摘要不含参数值;
-  `scope` 是作用域(已折进 `id`);`preview` 是给审批人看的 `(键, 脱敏截断后的值)` 元组(不进 trace / repr / 相等比较)。
-- `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False, scope="", redact=None) -> ApprovalRequest`:
-  `bind_values=True` 时把规范化参数值的 sha256 折进 `id`(参数一变即新请求);`scope` 折进 `id`;给 `redact` 才生成预览。
-- `default_redactor(key, value) -> str`:键名命中敏感词表(password / secret / token / api_key / auth / cookie / session …)
-  整值打码为 `***`,其余 repr / 紧凑 JSON 渲染并截断到 200 字符。脱敏钩子类型 `Redactor = Callable[[str, object], str]`。
+- `ApprovalRequest(code, id, tool, arg_fingerprint="", arg_count=0, scope="", canonical_arguments="", preview=())`:
+  定位摘要(code / id / 工具名 / schema 指纹 / 计数 / 作用域)+ 给审批人的内容。`canonical_arguments` 是完整规范化参数
+  (键排序紧凑 JSON,正是 `id` 所哈希的内容),`arguments() -> dict` 解析出一份新 dict——**审批人据完整参数做决定**。
+  `preview` 是列表展示用的 `(键, 值文本)` 元组:缺省不打码;长值只截断一次,注明「省略 N 字符」与该值的 sha256 前缀。
+  `canonical_arguments` / `preview` 不进 `repr` / trace;`preview` 不参与相等比较。
+- `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False, scope="", sensitive_args=()) -> ApprovalRequest`:
+  `bind_values=True` 时把完整规范化参数的 sha256 折进 `id`(参数一变即新请求);`scope` 折进 `id`;`sensitive_args`
+  声明 preview 里要打码的参数路径(点号穿过 dict,如 `"password"`、`"body.to_token"`;显示为 `***(sha256:<前缀>)`)。
 - `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(纯查询,幂等)。
-  `ConsumableApprovalGate`(Protocol):额外 `consume(request) -> bool`,执行闸在执行前核销一次放行额度。
+  `ConsumableApprovalGate`(Protocol):额外 `consume(request) -> bool`,执行闸在**执行前**核销一次放行额度(工具随后
+  抛异常,这次批准也已用掉)。可核销的门会产生需要人工决议的待审请求,**必须有显式作用域**。
 - `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,
-  永不 pending;不可核销(常驻策略放行)。
-- `ManualApprovalGate(*, token_store=None, max_requests=1024, request_ttl=3600.0, now_fn=time.monotonic)`:
-  `review` 登记待审(满了先清过期再淘汰最早的);`resolve(request_id, decision, *, uses=1, ttl_seconds=None) -> str`
-  只接受**已登记、未过期**的请求(否则 `UnknownApprovalRequest`),返回一次性 resume token;`uses=1` 缺省只放行一次、
-  `uses=N` 放行 N 次、`uses=None` 为显式可选的幂等模式(有效期内不限次,有重放风险);`consume(request) -> bool`;
-  `redeem(token) -> ResumeTicket`(重放抛 `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`(带预览)。
-- `ResumeTokenStore` / `InMemoryResumeTokenStore` / `ResumeTicket(request_id, decision, scope="")`:ticket 只是 resume
-  句柄(告诉你在哪个作用域重跑),不是执行凭据;批准在执行点核销,重放 ticket 不会多执行。
+  永不 pending;不可核销(常驻策略放行);不需要作用域。
+- `ManualApprovalGate(*, token_store=None, max_requests=1024, max_pending_per_scope=64, request_ttl=3600.0, now_fn=time.monotonic)`:
+  `review` 登记待审;每个作用域最多 `max_pending_per_scope` 条待审、全表最多 `max_requests` 条,到上限时**拒绝新请求**
+  (抛 `ApprovalGateError`,fail-closed),绝不淘汰既有的待审 / 已批准条目。`resolve(request_id, decision, *, uses=1,
+  ttl_seconds=None) -> str` 只接受**已登记、未过期**的请求(否则 `UnknownApprovalRequest`),返回一次性 resume token;
+  `uses=1` 缺省只放行一次、`uses=N` 放行 N 次、`uses=None` 为显式可选的幂等模式(有效期内不限次,有重放风险);
+  `consume(request) -> bool`(请求须与登记时逐字段相等,含完整参数);`redeem(token) -> ResumeTicket`(重放抛
+  `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`(带完整参数与 preview)。
+- `ResumeTokenStore` / `InMemoryResumeTokenStore(*, max_tokens=1024, ttl=3600.0, now_fn=time.monotonic)` /
+  `ResumeTicket(request_id, decision)`:ticket 只是 resume 句柄,不是执行凭据;批准在执行点核销,重放 ticket 不会多执行。
+  token 存储有界(超出时最早签发的未兑现 token 失效)、过期、加锁,兑现即删除。
 - `approval_scope(scope: str)`(上下文管理器)/ `current_approval_scope() -> str | None`:设置 / 读取当前上下文的审批作用域。
-- 步内记账:`ToolCallLedger`(Protocol:`lookup(scope, key)` / `record(scope, key, output)` / `discard(scope)`)、
-  `InMemoryToolCallLedger(*, max_scopes=256, max_entries=1024, ttl=3600.0, now_fn=time.monotonic)`;
-  `begin_tool_call(tool, arguments) -> RecordedCall`(执行点领取槽位:`replay` 非 None 时直接复用、不执行;成功后
-  `record(output)`)。只在带受审批工具的 `ApprovalMiddleware` 步里生效,且只对「因审批挂起而结束」的步保留。
+  **作用域是调用方给的不透明字符串,必须在共享同一个门的所有调用方之间唯一**(建议 租户 id + 会话 id);同作用域 + 同工具
+  + 同参数就是同一个请求、共用同一个批准(定义内行为)。
 - `preflight_tool_approvals(calls: Sequence[tuple[str, Mapping, object | None]], *, available=()) -> list[ApprovalError | None]`:
   执行前预检一批调用(只 review、不核销;待审的被登记),返回与输入对齐的「错误或 None」。
-- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call", scope=None, redact=None, ledger=None)`:before_step 把审批配置与作用域
-  压进当前上下文(`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 + 规范化参数 + 作用域」review 并核销。
-  作用域:`scope=` > 外层 `approval_scope` > 缺省每次 step 新建(并传给嵌套 agent)。`gated_tools` 须是确切名字:含通配符 /
-  空名在构造时抛 `ApprovalConfigError`;能推断被包裹 agent 的工具清单时,对应不到已知工具的名字在首个工具执行前抛
-  `ApprovalConfigError`。缺省 `gated_tools` 空 = 零行为变化。`ledger` 缺省按审批门共享一份进程内记账。
+- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call", scope=None, sensitive_args=None, strict_names=False)`:
+  before_step 把审批配置与作用域压进当前上下文(`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 +
+  规范化参数 + 作用域」review 并核销。作用域:`scope=` > 外层 `approval_scope`;**门可核销而两者都没有时,before_step
+  在内层 agent 运行前抛 `ApprovalConfigError`**(不生成隐式作用域);同步门不需要。`sensitive_args`:`{工具名: [参数路径]}`。
+  `gated_tools` 须是确切名字:含通配符 / 空名在构造时抛 `ApprovalConfigError`;能推断被包裹 agent 的工具清单时,只差
+  大小写 / 分隔符的名字抛 `ApprovalConfigError`,找不到的名字发一次 `UserWarning`(`strict_names=True` 时改为报错)。
+  缺省 `gated_tools` 空 = 零行为变化。每次受审批调用恰好一条 `mw_approval` trace(只记 code / 计数 / 决议)。
 - `enforce_tool_approval(tool: str, arguments, *, target=None, available=()) -> None`:执行点在调用工具前调它;
   approved(并核销)返回,rejected 抛 `ApprovalRejected`,pending 抛 `ApprovalPending`(`context["request_id"]` /
-  `context["scope"]`),门抛异常或返回非 `Decision` 抛 `ApprovalGateError`(fail-closed)。`target` = 被执行的工具对象
-  (自带 `require_approval` 闸时同一个门不重复审);`available` = 本执行点已注册工具名(检测近似名写错)。
-- `require_approval(tool, gate, *, code="tool_call", scope=None, redact=None) -> FunctionTool | Tool`:把闸绑进工具对象
-  本身,不依赖上下文(裸线程 / 第三方 agent / 别名注册都绕不过)——**安全场景首选**。
+  `context["scope"]`),门抛异常或返回非 `Decision` 抛 `ApprovalGateError`(fail-closed;门自己抛的 `ApprovalError`
+  原样上抛)。`target` = 被执行的工具对象(自带 `require_approval` 闸时同一个门不重复审);`available` = 本执行点
+  已注册工具名(检测近似名写错)。
+- `require_approval(tool, gate, *, code="tool_call", scope=None, sensitive_args=()) -> FunctionTool | Tool`:把闸绑进工具
+  对象本身,不依赖上下文(裸线程 / 第三方 agent / 别名注册都绕不过)——**安全场景首选**。`scope` 不给时取**执行时**外层的
+  `approval_scope`(模块级共享的工具对象就这么用);两者都没有而门可核销时,调用时抛 `ApprovalConfigError`、不执行。
 - `spineagent.tools.tool.reachable_tool_names(obj) -> frozenset[str] | None`:agent / 工具在本地能执行到的工具名(经可选
   `tool_inventory()`);推断不了返回 `None`。
 - 错误:`ApprovalError`(基类)/ `ApprovalRejected`(`approval.rejected`,不可重试)/ `ApprovalPending`
   (`approval.pending`,可重试)/ `ApprovalGateError`(`approval.gate_error`)/ `ApprovalConfigError`(`approval.config_error`,
   也是 `ValueError`)/ `UnknownApprovalRequest`(`approval.unknown_request`)/ `ApprovalConflict` / `InvalidResumeToken`。
-- 批准语义(ADR 0002 决策 4):缺省一次性消费、绑定作用域、只能批准已存在的请求;恢复 = 在同一作用域里重跑 step
-  (`with approval_scope(exc.context["scope"]): agent.step(task)`)。
+- 批准语义(ADR 0002 决策 4):缺省一次性消费、绑定显式作用域、只能批准已存在的请求;恢复 = 批准后在同一作用域里重跑
+  这个 run——**至少一次**:此前已执行过的工具会再次执行(工具应幂等;不想重跑就用 `on_approval="feed_back"`)。
 - `approval_gates` / `make_approval_gate(spec, **kw)`:内置 `auto` / `manual`。
 
 ---
@@ -421,17 +437,22 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 
 ## sandbox 缝
 
-- `Limits(timeout_seconds: float | None = None, max_output_chars: int | None = None, max_ops: int | None = None)`;
-  `DEFAULT_LIMITS = Limits(5.0, 64_000, 100_000)`。
+- `Limits(timeout_seconds: float | None = None, max_output_chars: int | None = None, max_ops: int | None = None, max_memory_bytes: int | None = None)`;
+  `DEFAULT_LIMITS = Limits(5.0, 64_000, 100_000, 32 * 2**20)`。
 - `SandboxResult(sandbox, output, returncode=0, usage=ResourceUsage(), error=None)`,`ok` = `returncode == 0`;
-  `error` 为 `disallowed` / `limit_exceeded` / `syntax` / `error`。`ResourceUsage(ops, output_chars, wall_seconds)`。
+  `error` 为 `disallowed` / `limit_exceeded` / `syntax` / `error`。`ResourceUsage(ops, output_chars, wall_seconds, memory_bytes)`。
 - `InProcessSandbox(*, clock: Callable[[], float] = time.monotonic)`;`run(code, *, timeout=None, limits=None, env=None) -> SandboxResult`:
   受限白名单表达式求值器(无 Import / Attribute / 任意调用),工作量预算、值大小上限、输出上限;`timeout`
   为**协作式 deadline**(每个节点前后各查一次时钟,超时判 `limit_exceeded`)。协作式超时**无法中断单个内建
   调用**:单次求值的代价上界来自**先验规模守卫**(整数位数 / 文本长度 / 容器元素数 / 嵌套深度上限;幂、序列
   重复与拼接按结果规模预判;`round` 的 `|ndigits|` ≤ 2467;`int()` 的数字串 ≤ 4300 字符;`sum` 只做数值累加)
-  与**工作量预算**(`max_ops`:节点 1 单位,大操作按输入 / 结果规模折算,如 `sorted(x)` 记 `len(x)`;
-  `max_ops=None` 时仍有 100 万单位的硬上限)。`ResourceUsage.ops` 即消耗的工作量单位。
+  、**工作量预算**(`max_ops`:节点 1 单位,大操作按输入 / 结果规模折算,如 `sorted(x)` 记 `len(x)`、文本按存储字节
+  折算;`max_ops=None` 时仍有 100 万单位的硬上限)与**内存预算**(`max_memory_bytes`:每个节点产生的值按估算字节——
+  `sys.getsizeof` 口径,宽字符串按实际宽度,容器递归——在产生的那一刻累加并检查,容器字面量 / 调用实参逐个元素求值时
+  就会停下;缺省 32 MiB,`None` 时仍有 128 MiB 的硬上限;累计口径,不随临时值释放回退)。`ResourceUsage.ops` /
+  `memory_bytes` 即消耗的工作量单位 / 估算字节。`MemoryError` / `RecursionError`(含解析器栈溢出)一律容住为
+  `limit_exceeded`。支持 `{**d}`(只展开 dict);调用里的 `**` 展开明确拒绝(`disallowed`);长的左结合链(`1+…+n`)
+  迭代求值。
 - `sandboxes` Registry:`in_process`;`subprocess` / `container` 是**占位、尚未实现**(`subprocess` 必抛
   `SeamError`;`container` 缺 `[sandbox]` extra 抛 `ImportError`,装了也必抛 `SeamError`)。`load_container_sdk()`。
 
@@ -468,10 +489,12 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - `LLM_INVARIANTS` / `STREAMING_INVARIANTS`:OpenAI 形状 / finish_reason 取值域 / usage 非负 /
   tool_call 往返;流式各块形状 + 流式拼接 == 非流式。
 - `SANDBOX_INVARIANTS`:provenance / 产出非空 / 记账非负 / 上限生效 / 无网络出口 / `timeout_takes_effect` /
-  `amplifying_expression_is_bounded`(值放大型表达式必须在超时量级内被拒 / 被终止)。
+  `amplifying_expression_is_bounded`(值放大型表达式必须在超时量级内被拒 / 被终止)/ `memory_is_bounded`(超出
+  `max_memory_bytes` 时在上限附近判 `limit_exceeded`,不先全部物化)。
 - `SKILL_INVARIANTS`、`MIDDLEWARE_INVARIANTS`、`ARTIFACT_INVARIANTS`、`APPROVAL_INVARIANTS`。
 - `APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness]`(名 `approval_enforcement`):
-  `unapproved_gated_tool_never_executes`、`rerun_does_not_bypass`、`changed_arguments_require_reapproval`、
+  `unapproved_gated_tool_never_executes`、`pending_gate_requires_explicit_scope`、`rerun_does_not_bypass`、
+  `changed_arguments_require_reapproval`、
   `approval_is_consumed_once`、`approval_is_scope_bound`、`gate_failure_blocks_execution`、
   `ungated_tools_are_unaffected`——全部用带副作用计数的真实工具函数断言。
 - `TOOL_TRACE_INVARIANTS: InvariantPack[ToolExecutionHarness]`(名 `tool_trace`):`unknown_tool_name_is_not_traced`。

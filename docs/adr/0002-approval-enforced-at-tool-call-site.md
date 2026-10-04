@@ -1,6 +1,6 @@
 # ADR 0002 — 审批是工具调用点上的强制闸(取代 ADR 0001 决策 3 的「步前声明检查」)
 
-- 状态:已接受(2026-10-04 修订:批准语义改为一次性消费 + 作用域,见「修订记录」)
+- 状态:已接受(2026-10-04 两次修订:批准语义改为一次性消费 + 显式作用域;移除步内记账,重跑为至少一次;见「修订记录」)
 - 日期:2026-10-04
 - 相关:ADR 0001(审批门 / Wait 缝);`agent/approval.py`、`agent/middleware.py`、
   `agent/function_calling.py`、`agent/tool_using.py`、`orchestration/coordinator.py`
@@ -128,7 +128,8 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
    `request_id` / `scope`)。异常从执行点一路冒到调用方;`AgentTool` 嵌套照常上抛;`DeepResearchAgent`
    不让弹性并行把审批错误吞成一条失败发现,而是在收集后原样重抛。`FunctionCallingAgent(on_approval=
    "feed_back")` 是调用方显式选择的**不中断模式**:本执行点的挂起 / 拒绝作为 tool 结果(只含 code 与
-   request id)喂回模型,整步不抛、不重跑;审批人照样在 `pending()` 里看到请求。
+   request id,不含作用域)喂回模型,整步不抛、不重跑;调用方从 `AgentResult.held_approvals` 拿到
+   `request_id` / `scope` 去审批,审批人照样在 `pending()` 里看到请求;批准后由**下一个任务**执行该调用。
 5a. **挂起后的重跑语义:同一轮内不重放,跨轮至少一次(修订)。** 恢复靠「批准后在同一作用域里重跑这个 run」。
    审查复现:一步里 `send_email` 在前、受审批工具在后,pending 时重跑 3 次、resolve 后再跑 1 次,`send_email` 共执行
    4 次。第二轮曾为此加过「步内记账」(按作用域字符串记录已执行调用的结果、重跑时复用),复审证明它本身是漏洞:
@@ -159,6 +160,8 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 函数断言:
 
 1. 未获批准(rejected / pending)的受审批工具执行次数为 0;
+1a. 会产生待审请求的门没有显式作用域时抛 `ApprovalConfigError`,执行次数为 0、不登记待审请求
+    (`pending_gate_requires_explicit_scope`);
 2. 原样重跑不绕过,且同一作用域里三次重跑命中同一 request id;
 3. 获批后在同一作用域同参重跑恰好执行一次;改参数得到新 request id 并重新挂起;
 4. 一次批准只放行一次:同一 run 里重复的同参调用与之后的重跑都重新挂起(`approval_is_consumed_once`);
@@ -178,17 +181,21 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 - 自定义 agent 若自己执行工具,须在调用前调 `enforce_tool_approval`,或只接受经
   `require_approval` 包装过的工具。
 - request id 是参数值的哈希而非明文;对低熵参数(如 `yes` / `no`)可被字典猜测,request id 不是
-  参数保密手段。(参数预览本来就给审批人看,见决策 4。)
+  参数保密手段。(完整参数本来就给审批人看,见决策 4。)
+- 作用域唯一性由调用方保证:两个调用方误用同一个作用域字符串时,「同工具 + 同参数」的调用共用同一个请求与批准
+  (库无从区分);不同参数的调用仍各自需要批准。
+- 挂起后重跑是至少一次语义(决策 5a):一个 run 里有多个受审批调用分布在不同轮次时,`raise` 模式下每次重跑都会把
+  此前已执行、已核销的受审批调用重新挂起(需要再批一次,且批准后会再执行一次)。这类多动作流程用 `feed_back` 模式。
 - 按名字 gate 对别名注册不设防;推断不了工具清单的不透明 agent 只能检测「近似名」写错,完全写错
   的名字(如把 `delete_file` 写成 `rm`)在不透明 agent 下仍无法发现——用 `require_approval`。
 
 ## 后果
 
-- `ApprovalMiddleware` 不再在步前依据 `ctx.tools` 抛错(那条路径本身就是漏洞来源)。修订后的破坏性
-  变化:批准缺省一次性消费;resume 须回到同一作用域;`resolve` 只接受已登记的请求;受审批名含通配 /
-  对应不到已知工具时报错;`ManualApprovalGate.pending()` 的条目带预览。新增 `ApprovalGateError`、
-  `enforce_tool_approval`、`require_approval`、`make_approval_request(bind_values=)`、
-  `StepContext.cleanups`。行为变化见 CHANGELOG。
+- `ApprovalMiddleware` 不再在步前依据 `ctx.tools` 抛错(那条路径本身就是漏洞来源)。相对 ADR 0001 的破坏性变化:
+  批准缺省一次性消费;会产生待审请求的门必须有显式作用域;`resolve` 只接受已登记的请求;受审批名含通配 / 只差大小写
+  或分隔符时报错;请求表满时拒绝新请求;`ApprovalRequest` 带完整规范化参数与 preview。新增 `ApprovalGateError`、
+  `enforce_tool_approval`、`require_approval`、`make_approval_request(bind_values=)`、`StepContext.cleanups`、
+  `AgentResult.held_approvals`。行为变化见 CHANGELOG。
 - 原 `tests/test_approval.py` 里以 `FunctionAgent` 假执行的中间件测试全部改写为端到端真实路径。
 
 ## 修订记录
@@ -198,3 +205,11 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
   一次批准被同一步 / 跨 agent 重放 12 次、可离线预先批准、审批人看不到参数值、写错的工具名静默放行。
   本 ADR 尚未随版本发布,故就地修订而不另开编号(ADR 0002 取代 ADR 0001 决策 3 时用的是新编号,
   那是因为 0001 已发布)。
+- 2026-10-04(复审,第三轮——做减法):第二轮新加的机制里有三处带出了新的阻塞问题,本轮删除而不是再加一层:
+  ①**移除步内记账**(决策 5a):它把同一会话里的新任务当成重跑、静默吞掉副作用,并让作用域字符串相同的两个租户
+  互相拿到工具结果;改为「同一轮内不重放 + 跨轮至少一次」,`feed_back` 是无重跑的替代;评估过调用方持有的续跑
+  上下文,因 `Agent.step` 协议无续跑通道且挂起可发生在嵌套 agent 里,代价大,未做。②**移除隐式作用域**(决策 4
+  「作用域」):会产生待审请求的门缺作用域即报配置错误。③**移除按键名猜测的打码与双重截断的 preview**(决策 4
+  「审批人看得到要批准的完整内容」):审批人拿到完整规范化参数,打码改为显式声明。另:请求表满时拒绝新请求而非
+  淘汰别人的、token 存储有界、删除 ticket 作用域旁表、找不到的受审批名降级为一次性警告(`strict_names=True` 可选
+  严格)、每次受审批调用恰好一条 `mw_approval` trace。

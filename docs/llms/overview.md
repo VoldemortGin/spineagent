@@ -84,8 +84,9 @@ agent 在一步里可调用的能力:有 `name`,`run(arg: str) -> ToolResult`(�
   一次性 resume token)。审批是**工具调用点上的强制闸**(ADR 0002):`ApprovalMiddleware` 把审批配置压进
   当前上下文,`FunctionCallingAgent` / `ToolUsingAgent` 在**每一次**真实调用工具前按「工具名 + 规范化参数」
   review;未批准不执行,门故障 fail-closed;`require_approval(tool, gate)` 把闸直接绑进工具本身。批准缺省
-  一次性消费、绑定作用域(会话 / 用户 / run),`ManualApprovalGate.pending()` 带脱敏的参数预览。
-- **sandbox**:`InProcessSandbox` 受限白名单表达式求值器(先验规模守卫、工作量预算、值上限、输出上限;
+  一次性消费、绑定**显式**作用域(会产生待审请求的门缺作用域即报配置错误);审批人经 `request.arguments()` 看到
+  完整参数;挂起后重跑是至少一次语义,不想重跑用 `on_approval="feed_back"`。
+- **sandbox**:`InProcessSandbox` 受限白名单表达式求值器(先验规模守卫、工作量预算、按估算字节的内存预算、值上限、输出上限;
   协作式 timeout 只是第二道闸,打断不了单个内建调用);
   `subprocess` / `container` 是占位、尚未实现。
 - **skills**:manifest + 受限脚本的能力包,脚本经 Sandbox 执行,可桥成 `FunctionTool`。

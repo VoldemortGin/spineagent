@@ -252,7 +252,7 @@ print(llm_providers.names())   # ['anthropic', 'bedrock', 'cohere', 'failover', 
 ```python
 from spineagent import (
     ApprovalMiddleware, ApprovalPending, Decision, FunctionCallingAgent,
-    ManualApprovalGate, MiddlewareAgent, approval_scope, function_tool,
+    ManualApprovalGate, MiddlewareAgent, function_tool,
 )
 from spineagent.conformance import ScriptedToolCallProvider  # 离线:按脚本回 tool_calls
 
@@ -266,10 +266,11 @@ def delete_file(path: str) -> str:
 
 gate = ManualApprovalGate()
 model = ScriptedToolCallProvider([("delete_file", {"path": "/tmp/a"})], final="完成")
+session = "tenant-7:chat-42"   # 作用域必须显式,且在共享这个门的所有调用方之间唯一
 agent = MiddlewareAgent(
     "ops",
     FunctionCallingAgent("worker", model, [delete_file]),
-    [ApprovalMiddleware(gate, gated_tools=["delete_file"])],
+    [ApprovalMiddleware(gate, gated_tools=["delete_file"], scope=session)],
 )
 
 try:
@@ -277,18 +278,27 @@ try:
 except ApprovalPending as exc:            # 真实工具调用前被拦下:delete_file 一次都没执行
     request_id = exc.context["request_id"]
 print(deleted)                            # []
-print(dict(gate.pending()[0].preview))    # {'path': "'/tmp/a'"}  审批人看得到要批的是什么
+[request] = gate.pending()
+print(request.arguments())                # {'path': '/tmp/a'}  审批人看完整参数做决定
 
-token = gate.resolve(request_id, Decision.APPROVED)   # out-of-band 批准(缺省只放行一次)
-ticket = gate.redeem(token)                           # 一次性 resume token,重放必败
-with approval_scope(ticket.scope):                    # 回到同一作用域重跑
-    print(agent.step("清理临时文件").output)   # '完成'(批准在执行时核销)
+gate.resolve(request_id, Decision.APPROVED)   # out-of-band 批准(缺省只放行一次)
+print(agent.step("清理临时文件").output)   # '完成':同一作用域里重跑,批准在执行前核销
 print(deleted)                            # ['/tmp/a']
 ```
 
 参数被改(如 `/etc`)就是新请求,会再次 `ApprovalPending`;同一作用域里再跑一遍也会重新挂起(批准已核销)。
-长驻服务里建议用会话 id 显式设作用域:`ApprovalMiddleware(gate, gated_tools=[...], scope=session_id)`。
-需要不依赖上下文、也挡得住别名注册的保证时,用 `require_approval(delete_file, gate)` 把闸绑进工具本身。
+重跑是**至少一次**:这个 run 里此前已执行过的工具会再执行一次,工具应幂等。不想重跑就用不中断模式:
+
+```python
+fc = FunctionCallingAgent("worker", model, [delete_file], on_approval="feed_back")
+agent = MiddlewareAgent("ops", fc, [ApprovalMiddleware(gate, gated_tools=["delete_file"], scope=session)])
+result = agent.step("清理临时文件")       # 不抛:模型收到「需要审批」的 tool 结果,run 正常结束
+for held in result.held_approvals:        # 调用方(不是模型)拿到待审请求
+    print(held["request_id"], held["scope"])
+```
+
+需要不依赖上下文、也挡得住别名注册 / 自建线程的保证时,用 `require_approval(delete_file, gate, scope=session)` 把闸
+绑进工具本身(模块级共享的工具不传 `scope`,改在每个请求里 `with approval_scope(session):` 调用)。
 
 ## 13) 信任边界:上游输出是数据
 

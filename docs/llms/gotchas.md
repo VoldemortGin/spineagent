@@ -123,20 +123,30 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
 - request id 由「工具名 + 规范化参数 + 作用域」派生:**参数一变就要重新审批**,换一个作用域(会话 / 用户)也是。
 - **批准缺省一次性**:一次批准只放行一次匹配调用,执行时核销;要放行多次用 `resolve(..., uses=N)`,
   `uses=None` 是旧的「有效期内不限次」模式(有重放风险,慎用)。
-- **作用域**:不设时每次 step 一个新作用域——resolve 后**不带作用域原样重跑会得到一个新的待审请求**。恢复要回到
-  同一作用域:`with approval_scope(exc.context["scope"]): agent.step(task)`(或用 `ResumeTicket.scope`);长驻服务
-  建议用会话 id 显式传 `ApprovalMiddleware(scope=...)` / `approval_scope(...)`。
-- `ManualApprovalGate.resolve` 只接受已登记的待审请求(先 review 过);请求表有上限与过期。`pending()` 的条目带
-  脱敏截断后的参数预览(`request.preview`),只给审批人看,不进 trace。
-- **重跑不重放**:在 `ApprovalMiddleware` 的步里因审批挂起后,同一作用域里重跑会复用已执行调用的结果(步内记账),
-  `send_email` 之类不会被再发一遍;`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls 里有任何受审批调用
-  未获批,整轮一个都不执行(`approve_before_execute=False` 恢复逐个执行)。不想整步抛错就用
-  `on_approval="feed_back"` 把待审 / 被拒作为 tool 结果喂回模型。
-- `gated_tools` 必须写确切工具名:通配符直接报错;能推断工具清单时写错的名字也报错(`ApprovalConfigError`)。
+- **作用域必须显式**:会产生待审请求的门(`ManualApprovalGate` 等可核销的门)要求调用方提供作用域——
+  `ApprovalMiddleware(scope=...)` / `require_approval(scope=...)` / 外层 `with approval_scope(...)`;都没有时在任何工具
+  执行前抛 `ApprovalConfigError`(库不生成隐式作用域)。`AutoApprovalGate` 这类同步门不需要。作用域是不透明字符串,
+  **必须在共享同一个门的所有调用方之间唯一**(建议 `f"{tenant_id}:{session_id}"`)——同作用域 + 同工具 + 同参数就是
+  同一个请求、共用同一个批准。
+- `ManualApprovalGate.resolve` 只接受已登记的待审请求(先 review 过)。请求表有界且 fail-closed:每个作用域最多 64 条
+  待审、全表 1024 条,满了**拒绝新请求**(`ApprovalGateError`),不会挤掉别人的。`FunctionCallingAgent` 一轮最多
+  `max_tool_calls_per_turn=64` 个调用,超出整轮不执行。
+- **审批人看完整参数**:`pending()` 里的 `request.arguments()` 是完整规范化参数(request id 哈希的就是它),审批 UI
+  应展示它;`request.preview` 只作列表展示(长值截断一次并注明省略字符数与摘要)。缺省**不打码**;要在 preview 里
+  藏某些字段,显式声明 `ApprovalMiddleware(sensitive_args={"login": ["password"]})`。两者都不进 trace / repr。
+- **挂起后重跑是至少一次**:`raise` 模式下批准后重跑这个 run,此前各轮已执行过的工具(含 `send_email` 这类未受审批的)
+  **会再执行一次**——库不记录、不复用任何跨 run 的工具结果。工具应幂等;或用 `on_approval="feed_back"`:挂起 /
+  拒绝作为 tool 结果喂回模型,run 正常结束、没有重跑,调用方从 `result.held_approvals` 拿到 `request_id` / `scope`
+  去审批,批准后由下一个任务执行。同一轮内不重放:`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls 里有任何
+  受审批调用未获批,整轮一个都不执行(`approve_before_execute=False` 恢复逐个执行)。
+- 核销发生在**执行之前**:工具随后抛异常,这次批准也已用掉,要重试须重新批准。
+- `gated_tools` 必须写确切工具名:通配符直接报错;能推断工具清单时,只差大小写 / 分隔符的名字报错,清单里找不到的
+  名字只警告一次(全站共用名单、agent 变体缺这个工具都是合法配置;要严格就 `strict_names=True`)。名字校验只防笔误:
   按名字 gate 挡不住「同一函数以别名注册」——安全场景用 `require_approval(tool, gate)` 绑在工具对象上。
-- 自己起线程跑 agent 时,中间件作用域不会自动跟过去(`Coordinator.run_parallel` 已处理):用
-  `pool.submit(bind_context(agent.step), task)` 把当前上下文带进去;需要跨任意线程、不依赖调用方自觉的保证
-  就用 `require_approval(tool, gate)` 把闸绑在工具上。自定义执行工具的 agent 要调 `enforce_tool_approval`。
+- **动态作用域不跨越调用方自建的线程**(`Coordinator.run_parallel` 已处理):工具函数里自己起线程 / 线程池跑子 agent
+  时,`ApprovalMiddleware` 的闸在那条线程里不存在,名字校验也发现不了(外层恰好也注册了同名工具时尤其如此)。这种场景
+  只有 `require_approval(tool, gate)`(绑在工具对象上)可靠;若必须用中间件,在起线程处用
+  `pool.submit(bind_context(agent.step), task)` 把当前上下文带过去。自定义执行工具的 agent 要调 `enforce_tool_approval`。
 
 ## 13) 上游输出是数据,不是指令
 
@@ -159,7 +169,9 @@ agent 的产出(`AgentResult.output`)在产出时就是数据:`down.step(up.step
 超时判 `limit_exceeded`。**协作式超时无法中断单个内建调用**:`round(1, -10**7)` 这类在一个节点内部按参数的
 **值**放大代价的调用,是靠先验规则(`round` 的 `|ndigits|` ≤ 2467、`int()` 数字串 ≤ 4300 字符、`sum` 只做
 数值累加、幂 / 重复 / 拼接按结果规模预判)在调用前拒绝的;反复引用同一个大值的写法由工作量预算(`max_ops`,
-`sorted(x)` 记 `len(x)` 单位)截住。要真正的抢占式超时,用 OS 级沙箱后端(子进程 / 容器)。`CalcTool` 拒绝超长(> 4096 字符)、过深(> 100 层)、超大幂 / 乘法结果的表达式,立即抛
+`sorted(x)` 记 `len(x)` 单位,文本按存储字节折算)截住;内存由**按估算字节计的内存预算**(`max_memory_bytes`,缺省
+32 MiB,`None` 时 128 MiB 硬上限)兜住:每个值产生时就计入,列表字面量 / 调用实参在超限处立即停下,不会先把 1400 个
+256 KB 的宽字符串全部造出来。预算是**累计**口径(临时值释放不回退),所以大量中间值的表达式可能比实际占用更早被拒。要真正的抢占式超时,用 OS 级沙箱后端(子进程 / 容器)。`CalcTool` 拒绝超长(> 4096 字符)、过深(> 100 层)、超大幂 / 乘法结果的表达式,立即抛
 `ValueError`(语法错误、`10.0**400` 这类溢出也一样);深度按真正的嵌套计,长的连加 / 连乘不再被当成「过深」。
 
 ## 16) failover:「同一家重试」与「换一家」是两件事
@@ -167,8 +179,10 @@ agent 的产出(`AgentResult.output`)在产出时就是数据:`down.step(up.step
 `retryable=False`(`NonRetryableProviderError`,非瞬时 4xx)只表示别对**同一家**原样重试;余额不足 / 配额 /
 鉴权 / 模型不存在 / 上下文超长这类常以 400 返回的错误,换一家完全可能成功,所以 `FailoverProvider` 缺省会回退:
 与 provider 相关且持续失效的(401 / 402 / 403 / 404、余额 / 配额 / 计费 / 模型不存在)只冷却出错的那一家;上下文
-超长和无法判定的 4xx 回退但不冷却(同一条请求在全池失败时不会把整个池子冷却掉)。确知请求畸形、想表达
-「别回退」的下游抛 `BadRequestProviderError`;想换取舍就注入 `failover_policy`。
+超长和无法判定的 4xx 不冷却、**最多再试 1 家**——那家也以同类 4xx 拒绝就判定请求本身有问题,抛
+`BadRequestProviderError`(一条畸形请求最多 2 次计费调用,而不是把整个池子打一遍)。OpenAI 风格错误体明确指出参数
+校验失败(`invalid_request_error` + `param`)时适配器直接抛 `BadRequestProviderError`,不回退;想换取舍就注入
+`failover_policy`。
 
 ## 17) 重名工具直接报错
 
