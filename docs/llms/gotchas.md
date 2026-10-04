@@ -126,8 +126,10 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
 - **作用域必须显式**:会产生待审请求的门要求调用方提供作用域。门**声明**自己要不要(`requires_scope`:`AutoApprovalGate`
   为 `False`、`ManualApprovalGate` 为 `True`);**第三方门未声明时按「需要」处理**(fail-closed),缺作用域即报配置错误且
   **不调用**它的 `review`——若该门不会产生待审请求,请在门上声明 `requires_scope = False`。提供作用域的方式——
-  `ApprovalMiddleware(scope=...)` / `require_approval(scope=...)` / 外层 `with approval_scope(...)`;都没有时在任何工具
-  执行前抛 `ApprovalConfigError`(库不生成隐式作用域)。`AutoApprovalGate` 这类同步门不需要。作用域是不透明字符串,
+  `ApprovalMiddleware(scope=...)` / `require_approval(scope=...)` / 外层 `with approval_scope(...)`;都没有时抛 `ApprovalConfigError`(库不生成隐式作用域):`ApprovalMiddleware` 在内层 agent 运行前抛,
+  `FunctionCallingAgent` / `ToolUsingAgent` 在 run 开始时检查自己工具清单里 `require_approval` 包装的要求(早于任何
+  工具执行;嵌套 agent 里的工具在子 agent 开始运行时才检查)。**`require_approval(scope="global")` 的静态作用域与外层
+  per-user 作用域组合成复合作用域,不会盖掉它**(不同用户不共用批准;裸线程看不到外层作用域,那时只剩静态一层)。`AutoApprovalGate` 这类同步门不需要。作用域是不透明字符串,
   **必须在共享同一个门的所有调用方之间唯一**(建议 `f"{tenant_id}:{session_id}"`)——同作用域 + 同工具 + 同参数就是
   同一个请求、共用同一个批准。
 - `ManualApprovalGate.resolve` 只接受已登记的待审请求(先 review 过)。请求表有界且 fail-closed:每个作用域最多 64 条
@@ -136,7 +138,8 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
   `max_tool_calls_per_turn=64` 个调用,超出整轮不执行。
 - **审批人看完整参数**:`pending()` 里的 `request.arguments()` 是完整规范化参数(request id 哈希的就是它),审批 UI
   应展示它;`request.preview` 只作列表展示(长值截断一次并注明省略字符数与摘要)。缺省**不打码**;要在 preview 里
-  藏某些字段,显式声明 `ApprovalMiddleware(sensitive_args={"login": ["password"]})`。两者都不进 trace / repr。
+  藏某些字段,显式声明 `ApprovalMiddleware(sensitive_args={"login": ["password"]})`(必须是路径的集合,传 `str` 直接报错;路径点号分隔、
+  可用 `("body", "x.y")` 分段、可穿过 list;打码显示为 `***`,**不附摘要**)。两者都不进 trace / repr。
 - **挂起后重跑是至少一次**:`raise` 模式下批准后重跑这个 run,此前各轮已执行过的工具(含 `send_email` 这类未受审批的)
   **会再执行一次**——库不记录、不复用任何跨 run 的工具结果。工具应幂等;或用 `on_approval="feed_back"`:挂起 /
   拒绝作为 tool 结果喂回模型,run 正常结束、没有重跑,调用方从 `result.held_approvals` 拿到 `request_id` / `scope`
@@ -144,7 +147,7 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
   受审批调用未获批,整轮一个都不执行(`approve_before_execute=False` 恢复逐个执行)。
 - 核销发生在**执行之前**:工具随后抛异常,这次批准也已用掉,要重试须重新批准。
 - `gated_tools` 必须写确切工具名:通配符直接报错;能推断工具清单时,只差大小写 / 分隔符的名字报错,清单里找不到的
-  名字只警告一次(全站共用名单、agent 变体缺这个工具都是合法配置;要严格就 `strict_names=True`)。名字校验只防笔误:
+  名字只警告一次——**该名字未匹配任何工具,对应的工具不受审批保护**(写错的名字不报错也不保护任何东西,别把警告当成无所谓)(全站共用名单、agent 变体缺这个工具都是合法配置;要严格就 `strict_names=True`)。名字校验只防笔误:
   按名字 gate 挡不住「同一函数以别名注册」——安全场景用 `require_approval(tool, gate)` 绑在工具对象上。
 - **动态作用域不跨越调用方自建的线程**(`Coordinator.run_parallel` 已处理):工具函数里自己起线程 / 线程池跑子 agent
   时,`ApprovalMiddleware` 的闸在那条线程里不存在,名字校验也发现不了(外层恰好也注册了同名工具时尤其如此)。这种场景

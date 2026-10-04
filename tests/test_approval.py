@@ -592,7 +592,7 @@ def test_preview_with_declared_sensitive_arg_is_never_traced():
     [request] = gate.pending()
     preview = dict(request.preview)
     assert preview["amount"] == "1000000"  # 审批人看得到要批的是什么
-    assert preview["password"].startswith("***(sha256:")  # 显式声明的敏感参数打码
+    assert preview["password"] == "***"  # 显式声明的敏感参数打码(不附摘要)
     assert len(preview["memo"]) < 260 and preview["memo"].startswith("'xxx")  # 截断
     assert "hunter2" not in repr(request)  # 预览不进 repr
     for event in sink.events:
@@ -900,7 +900,7 @@ def test_review_r2_model_arguments_are_not_redacted_by_default():
     assert "ATTACKER-ACCT" in preview["body"]
 
 
-def test_explicit_sensitive_args_mask_preview_but_keep_values_distinguishable():
+def test_explicit_sensitive_args_mask_preview_without_a_digest():
     tool = _one_tool(
         "login",
         {"user": {"type": "string"}, "password": {"type": "string"}, "body": {"type": "object"}},
@@ -925,7 +925,9 @@ def test_explicit_sensitive_args_mask_preview_but_keep_values_distinguishable():
         assert preview["password"].startswith("***")
         assert "hunter" not in preview["password"] and "ACCT" not in preview["body"]
         assert '"n": 1' in preview["body"]  # 只打码声明的路径
-    assert pa["password"] != pb["password"] and pa["body"] != pb["body"]  # 打码后仍可区分
+    # 打码后 preview 不再区分不同的值(摘要对低熵值可被字典猜出);请求 id 仍随完整参数而变。
+    assert pa["password"] == pb["password"] == "***" and pa["body"] == pb["body"]
+    assert a.id != b.id
     assert a.arguments()["password"] == "hunter2"  # 完整参数不打码:审批人据它做决定
 
 

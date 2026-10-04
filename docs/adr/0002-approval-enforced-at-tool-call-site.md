@@ -63,8 +63,8 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      作用域里同参调用无限次放行——风险:一次批准可被任意多次重放,只应给确实需要的批处理场景)。
      不实现 `consume` 的门(`AutoApprovalGate` 策略表)的批准是常驻的策略放行。
    - **作用域(第三轮修订:必须显式)**:request 绑定到调用方的作用域(会话 / 用户的不透明字符串),作用域折进
-     id,A 的批准对 B 无效。来源:`ApprovalMiddleware(scope=)` / `require_approval(scope=)` > 外层
-     `approval_scope(...)`;`ApprovalMiddleware` 把它设为外层作用域传给嵌套 agent / `require_approval` 包装(嵌套与
+     id,A 的批准对 B 无效。来源:`ApprovalMiddleware(scope=)` > 外层
+     `approval_scope(...)`;`require_approval(scope=)` 的静态作用域与外层作用域**组合**(第四轮修订,见下);`ApprovalMiddleware` 把它设为外层作用域传给嵌套 agent / `require_approval` 包装(嵌套与
      叠加共享同一请求)。**库不生成隐式作用域**:第二轮的「缺省每次 step 新建一个」让「挂起 → 批准 → 原样重跑」
      三次得到三个 id、永远执行不了,收件箱里堆着批不掉的请求;「`require_approval` 按包装实例生成」让模块级共享的
      工具对所有用户是同一个作用域。现在:
@@ -113,8 +113,13 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      - `preview` 只作列表展示:每个值 / 键只截断一次(值 200、键 64 字符),省略提示如实写「省略 N 字符」并附完整值的
        sha256 前缀,尾部不同的两个请求在 preview 层面也可区分。
      - **缺省不打码**模型提供的参数。打码是调用方的显式声明:`ApprovalMiddleware(sensitive_args={工具名: [参数路径]})`
-       / `require_approval(sensitive_args=[参数路径])`,路径用点号穿过 dict(`"password"`、`"body.to_token"`);被打码的值
-       显示为 `***(sha256:<前缀>)`,不同的值仍可区分。打码只作用于 preview,完整参数不受影响。按键名猜测的缺省规则
+       / `require_approval(sensitive_args=[参数路径])`,路径是点号分隔的 str(`"password"`、`"body.to_token"`)或显式
+       分段的 tuple(`("body", "x.y")`,键名含点号时用;含点号的 str 还同时按字面键名匹配),可穿过 dict 与 list;被打码的值
+       显示为 `***`。**第四轮修订**:①构造时校验——传成 `str`(会被当成字符集合而静默不打码)、空路径 / 空段直接抛
+       `ApprovalConfigError`,不再有「写了却静默不打码」的写法;②**不再附 sha256 前缀**:对 PIN / 验证码这类低熵值,摘要
+       可被字典猜出(评估过按请求随机加盐的摘要:盐就在同一份 preview 里,查看者照样能暴力猜,所以选了更简单的不附摘要;
+       代价是 preview 里不同的敏感值不可区分,审批人看 `arguments()`,请求 id 仍随完整参数而变)。打码只作用于 preview,
+       完整参数不受影响。按键名猜测的缺省规则
        与可注入的 `Redactor` 钩子一并移除。
      - **这与 trace 隐私不冲突**:trace 隐私宪章约束的是可观测性通道(运维 / 观测管道的旁路,可能被批量导出、长期留存、
        给无授权的人看),所以 trace 只记 code / 计数 / 决议;审批接口是有授权的人决定「放不放行这次具体动作」的通道,
@@ -125,6 +130,18 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      作用域由调用方显式提供,ticket 不再携带(第二轮那张「request id -> 作用域」的旁表先进先出淘汰后作用域变成空串,
      已删除)。`InMemoryResumeTokenStore` 有界(`max_tokens`,超出时最早签发的未兑现 token 失效——它只是句柄)、
      过期(`ttl`)、加锁,兑现即删除。
+   - **作用域优先级(第四轮修订:组合,不覆盖)**:复审复现——同一个门上 `require_approval(tool, gate, scope="global")` 的
+     静态作用域盖掉了中间件的 per-user 作用域,bob 用 alice 的批准执行了。现在 `require_approval` 的作用域与**执行时**外层
+     作用域(`ApprovalMiddleware(scope=)` 设的、或 `approval_scope(...)`)**组合**成复合作用域
+     (`"<外层长度>:<外层>|<静态>"`,长度前缀无歧义),静态绑定的全局作用域因此不会让不同用户共用批准;只有一个来源时
+     就用它。优先级:`ApprovalMiddleware(scope=)` > 外层 `approval_scope` 决定「外层」是谁;工具包装上的 `scope=` 总是
+     在外层之上再叠一层,绝不替换外层。复合值会出现在 `request.scope` / `held_approvals[...]["scope"]`。裸线程里看不到外层
+     作用域(动态作用域不跨线程),此时只剩静态那一层——要 per-user 隔离就别在那种线程里跑,或用 `bind_context`。
+   - **作用域要求早检(第四轮修订)**:`FunctionCallingAgent.step` / `ToolUsingAgent.step` 在 run 开始时就对自己工具清单里各
+     `require_approval` 包装检查作用域要求(`check_tool_approval_scopes`),缺作用域即抛 `ApprovalConfigError`,早于任何
+     工具执行——此前要到受审批调用那一轮才报错,之前各轮的工具已执行。做不到的情形:嵌套 agent(`AgentTool` 背后的子
+     agent、工具函数里自建的 agent)的工具清单在外层 run 开始时看不到,它们在子 agent 自己开始运行时才检查;自定义执行点
+     自己负责。`ApprovalMiddleware` 的作用域要求一直是在 `before_step`(内层 agent 运行前)检查。
    - **叠加**:同一调用被同一个门在一次执行闸里只审 / 核销一次(嵌套 `ApprovalMiddleware` 共享作用域;
      执行点把被执行的工具对象传给 `enforce_tool_approval(target=)`,工具自带 `require_approval` 闸时
      同一个门交给工具自己审)。
@@ -133,7 +150,8 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
    `MiddlewareAgent` / `ChainAgent` / `AgentTool` / `DeepResearchAgent` 实现 `tool_inventory()`):
    - 与清单里某个工具**只差大小写 / 分隔符**的名字:抛 `ApprovalConfigError`(这几乎一定是笔误);
    - **在清单里找不到**的名字:发一次 `UserWarning`(每个 `ApprovalMiddleware` 实例一次;消息只含配置里的工具名),
-     不报错——第二轮报错误伤了三种合法配置且没有逃生口:`FunctionTool` 里套着带受审批工具的 agent(清单看不到
+     不报错(警告原文明说「该名字未匹配任何工具,**对应的工具不受审批保护**」:名单里写错的名字不会让真正的工具受到
+     保护,只是不报错)——第二轮报错误伤了三种合法配置且没有逃生口:`FunctionTool` 里套着带受审批工具的 agent(清单看不到
      工具函数内部)、全站共用一份受审批名单、同一配置用于缺少该工具的 agent 变体。需要严格校验的调用方传
      `ApprovalMiddleware(strict_names=True)`,找不到即报 `ApprovalConfigError`。
    推断不了清单(闭包式 `FunctionAgent` 等不透明 agent)时,执行点检测「受审批名与已注册工具仅大小写 / 分隔符
@@ -185,7 +203,9 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      一次看到全部待审请求,批准后下一个任务各执行一次),或 `resilient=True`(分支各自跑完、挂起的分支带 error,不取消
      兄弟);并让分支内的工具幂等。
 6. **fail-closed。** 作用域里有受审批工具时:gate.review 抛任何 `Exception`、或返回非 `Decision`,
-   一律抛 `ApprovalGateError`(code `approval.gate_error`),工具不执行。未配置审批(无作用域、
+   一律抛 `ApprovalGateError`(code `approval.gate_error`),工具不执行。受审批参数含无法编码的字符(如孤立代理字符
+   `"\ud800"`,规范化 / 哈希抛 `UnicodeEncodeError`)同样归一为 `ApprovalGateError`(第四轮修订;`feed_back` 模式也不例外),
+   消息不含参数内容。未配置审批(无作用域、
    `gated_tools` 为空)时执行点只读一次 contextvar 即返回,行为与修复前完全一致。
    `ApprovalMiddleware.before_step` 若在 `MiddlewareAgent` 之外被手动调用而没跑 cleanups,作用域会
    留在当前上下文——只会多拦,不会少拦。
@@ -258,3 +278,6 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 - 2026-10-04(复审第四轮):配额解耦——全表上限缺省 16384 并与每作用域上限独立;已决议的记录不占待审配额,被拒绝的
   记录进有界 / 较短 TTL 的去重结构(决策 4「请求生命周期」)。
 - 2026-10-04(复审第四轮):作用域要求改由门声明(`requires_scope`),不再 `review` 探测第三方门(决策 4「作用域」)。
+- 2026-10-04(复审第四轮,低优先级合集):作用域要求在 run 开始时早检;孤立代理字符归一为 `ApprovalGateError`;
+  `sensitive_args` 构造期校验 + 路径语法(dict / list / 点号键名)+ 不附摘要;`require_approval` 作用域与外层作用域组合;
+  `strict_names=False` 的警告明说「不受审批保护」;超大整数参数归一为 `InvalidToolArguments`。

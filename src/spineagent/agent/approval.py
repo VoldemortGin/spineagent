@@ -45,7 +45,7 @@ import secrets
 import threading
 import time
 import warnings
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -225,20 +225,56 @@ def _clip(text: str, limit: int) -> str:
     return f"{text[:limit]}…(省略 {len(text) - limit} 字符,sha256:{_sha256(text)[:12]})"
 
 
-def _masked(value: object) -> str:
-    """被声明为敏感的值:打码,附完整值的摘要前缀(不同的值仍可区分)。"""
-    return f"***(sha256:{_sha256(_canonical(value))[:12]})"
+# 被声明为敏感的值在预览里的样子。刻意【不附任何摘要】:低熵值(PIN / 验证码等)的摘要可被字典猜出。
+_MASK = "***"
+
+# 参数路径:点号分隔的 str("password" / "body.to_token"),或显式分段的 tuple(("body", "x.y"),键名里有点号时用)。
+type SensitivePath = str | tuple[str, ...]
+
+
+def _normalize_sensitive(paths: object) -> frozenset[tuple[str, ...]]:
+    """校验并规范化敏感参数路径声明;写法不支持就在构造时报错,绝不静默不打码。
+
+    - 必须是路径的集合(list / tuple / set ...);传成一个 str(如 "to")会被当成字符集合而静默不打码,直接报错;
+    - 元素是非空 str(点号分隔;含点号的还同时按【字面键名】匹配,键名里有点号的参数也打得到码)或
+      非空 str 组成的 tuple(显式分段);
+    - 路径可穿过 dict,也可穿过 list / tuple(对每个元素套用余下的路径)。
+    """
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, Collection):
+        raise ApprovalConfigError(
+            'sensitive_args 必须是参数路径的集合(如 ["password", "body.to_token"]),'
+            "不能是单个字符串——那会被当成字符集合而静默不打码"
+        )
+    normalized: set[tuple[str, ...]] = set()
+    for path in paths:
+        if isinstance(path, str):
+            segments = tuple(path.split("."))
+            if not path or not all(segments):
+                raise ApprovalConfigError("sensitive_args 的路径不能为空或含空段", path=path)
+            normalized.add(segments)
+            normalized.add((path,))  # 键名本身含点号:按字面键名也匹配
+        elif isinstance(path, tuple) and path and all(isinstance(p, str) and p for p in path):
+            normalized.add(path)
+        else:
+            raise ApprovalConfigError(
+                "sensitive_args 的元素必须是非空 str 或非空 str 的 tuple", path=repr(path)[:80]
+            )
+    return frozenset(normalized)
 
 
 def _mask_paths(value: object, paths: Collection[tuple[str, ...]]) -> object:
-    """按参数路径(只穿过 dict)把声明为敏感的嵌套值换成打码文本;返回副本,绝不改原值。"""
-    if not paths or not isinstance(value, Mapping):
+    """按参数路径(穿过 dict 与 list)把声明为敏感的嵌套值换成打码文本;返回副本,绝不改原值。"""
+    if not paths:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_mask_paths(item, paths) for item in value]
+    if not isinstance(value, Mapping):
         return value
     out: dict[str, object] = {}
     for key, item in value.items():
         here = str(key)
         if (here,) in paths:
-            out[here] = _masked(item)
+            out[here] = _MASK
         else:
             deeper = [path[1:] for path in paths if len(path) > 1 and path[0] == here]
             out[here] = _mask_paths(item, deeper)
@@ -246,15 +282,14 @@ def _mask_paths(value: object, paths: Collection[tuple[str, ...]]) -> object:
 
 
 def _build_preview(
-    args: Mapping[str, object], sensitive: Collection[str]
+    args: Mapping[str, object], paths: Collection[tuple[str, ...]]
 ) -> tuple[tuple[str, str], ...]:
-    """按键排序生成预览:缺省不打码;只对 sensitive 里声明的参数路径("password" / "body.to_token")打码。"""
-    paths = [tuple(path.split(".")) for path in sensitive]
+    """按键排序生成预览:缺省不打码;只对声明的敏感参数路径(见 _normalize_sensitive)打码。"""
     preview: list[tuple[str, str]] = []
     for key in sorted(str(k) for k in args):
         value = args[key]
         if (key,) in paths:
-            text = _masked(value)
+            text = _MASK
         elif isinstance(value, str):
             text = repr(value)
         else:
@@ -274,15 +309,17 @@ def make_approval_request(
     nonce: str = "",
     bind_values: bool = False,
     scope: str = "",
-    sensitive_args: Collection[str] = (),
+    sensitive_args: Collection[SensitivePath] = (),
 ) -> ApprovalRequest:
     """从工具名 + 参数字典构造一次待审批请求(定位摘要只取 schema 指纹与计数;完整参数只给审批人)。
 
     nonce 让调用方在需要「按次审批」时强制区分 schema 相同的两次调用;缺省 "" 时 schema 相同的
     请求折叠成同一 id。bind_values=True 时把【完整规范化参数的 sha256】也折进 request id:参数一变即是
     新请求、须重新审批——工具调用点上的执行闸用的就是它。scope 把请求绑定到调用方的作用域(折进 id)。
-    sensitive_args 声明预览里要打码的参数路径(点号分隔,只穿过 dict);完整参数不受影响。
+    sensitive_args 声明预览里要打码的参数路径(见 _normalize_sensitive;写法不支持直接抛 ApprovalConfigError);
+    完整参数不受影响。
     """
+    sensitive = _normalize_sensitive(sensitive_args)
     args = {str(k): v for k, v in (arguments or {}).items()}
     canonical = _canonical(args)
     fp = _fingerprint(args)
@@ -295,7 +332,7 @@ def make_approval_request(
         arg_count=len(args),
         scope=scope,
         canonical_arguments=canonical,
-        preview=_build_preview(args, sensitive_args),
+        preview=_build_preview(args, sensitive),
     )
 
 
@@ -830,6 +867,15 @@ def _requires_scope(gate: ApprovalGate) -> bool:
     return getattr(gate, "requires_scope", True) is not False
 
 
+def _compose_scope(outer: str, own: str) -> str:
+    """外层(per-user / 会话)作用域与工具包装上静态绑定的作用域组合成复合作用域。
+
+    用长度前缀保证无歧义(("a", "b/c") 与 ("a/b", "c") 不会撞)。目的:静态绑定的 "global" 之类的作用域不能盖掉外层
+    的 per-user 作用域,否则不同用户共用同一个批准。
+    """
+    return f"{len(outer)}:{outer}|{own}"
+
+
 @dataclass(frozen=True)
 class _ApprovalGuard:
     """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code + 作用域 + 预览打码声明(+ 可选 trace 落点)。"""
@@ -841,12 +887,20 @@ class _ApprovalGuard:
     agent: str = ""
     step: int = 0
     scope: str | None = None  # None:执行时取外层 approval_scope(都没有则见 resolve_scope)
-    # 工具名 -> 预览里要打码的参数路径(调用方显式声明;缺省不打码)。
-    sensitive: Mapping[str, frozenset[str]] = field(default_factory=dict, compare=False)
+    # 工具名 -> 预览里要打码的参数路径(调用方显式声明、已规范化;缺省不打码)。
+    sensitive: Mapping[str, frozenset[tuple[str, ...]]] = field(default_factory=dict, compare=False)
+    # require_approval 的静态绑定作用域与外层(per-user)作用域【组合】而不是覆盖(见 _compose_scope)。
+    compose_outer: bool = False
 
     def resolve_scope(self) -> str:
-        """显式作用域 > 外层 approval_scope;都没有时:会产生待审请求的门报配置错误,同步门用空作用域。"""
-        scope = self.scope if self.scope is not None else _APPROVAL_SCOPE.get()
+        """作用域优先级:静态绑定的作用域与外层作用域组合 > 显式作用域 > 外层 approval_scope;都没有时:
+        会产生待审请求(或未声明 requires_scope)的门报配置错误,声明了 False 的同步门用空作用域。"""
+        outer = _APPROVAL_SCOPE.get()
+        if self.scope is not None:
+            if self.compose_outer and outer:
+                return _compose_scope(outer, self.scope)
+            return self.scope
+        scope = outer
         if scope is not None:
             return scope
         if _requires_scope(self.gate):
@@ -883,14 +937,23 @@ class _ApprovalGuard:
             _check_near_miss(self.gated, available)
         if tool not in self.gated:
             return
-        request = make_approval_request(
-            self.code,
-            tool,
-            arguments,
-            bind_values=True,
-            scope=self.resolve_scope(),
-            sensitive_args=self.sensitive.get(tool, frozenset()),
-        )
+        scope = self.resolve_scope()
+        try:
+            request = make_approval_request(
+                self.code,
+                tool,
+                arguments,
+                bind_values=True,
+                scope=scope,
+                sensitive_args=self.sensitive.get(tool, frozenset()),
+            )
+        except UnicodeEncodeError:
+            # 参数里有无法编码的字符(如孤立代理字符 "\ud800"):无法规范化 / 哈希,fail-closed、不执行;
+            # 消息与上下文不含参数内容。
+            raise ApprovalGateError(
+                "受审批工具的参数含无法编码的字符(如孤立代理字符),无法规范化,不执行(fail-closed)",
+                tool=tool,
+            ) from None
         key = (id(self.gate), request.id)
         if seen is not None and key in seen:
             return  # 同一次调用已被同一个门批准并核销(叠加的审批配置不重复消耗额度)
@@ -1118,6 +1181,17 @@ def _wrapper_guards(target: object | None) -> list[_ApprovalGuard]:
     return guards
 
 
+def check_tool_approval_scopes(tools: Iterable[object]) -> None:
+    """run 开始时检查工具清单里各 require_approval 包装的作用域要求:缺作用域就抛 ApprovalConfigError。
+
+    早于任何工具执行(否则要到受审批调用那一轮才报错,之前各轮的工具已执行)。只看这份清单里的包装;
+    嵌套 agent(AgentTool 背后的子 agent)里的工具在子 agent 自己开始运行时检查。
+    """
+    for tool in tools:
+        for guard in _wrapper_guards(tool):
+            guard.resolve_scope()
+
+
 def _wrapper_gate_ids(target: object | None) -> frozenset[int]:
     """被执行工具自带的 require_approval 闸所用的门(按对象身份)。"""
     return frozenset(id(guard.gate) for guard in _wrapper_guards(target))
@@ -1130,7 +1204,7 @@ def require_approval(
     *,
     code: str = APPROVAL_TOOL_CALL,
     scope: str | None = None,
-    sensitive_args: Collection[str] = (),
+    sensitive_args: Collection[SensitivePath] = (),
 ) -> FunctionTool: ...
 @overload
 def require_approval(
@@ -1139,7 +1213,7 @@ def require_approval(
     *,
     code: str = APPROVAL_TOOL_CALL,
     scope: str | None = None,
-    sensitive_args: Collection[str] = (),
+    sensitive_args: Collection[SensitivePath] = (),
 ) -> Tool: ...
 def require_approval(
     tool: FunctionTool | Tool,
@@ -1147,15 +1221,18 @@ def require_approval(
     *,
     code: str = APPROVAL_TOOL_CALL,
     scope: str | None = None,
-    sensitive_args: Collection[str] = (),
+    sensitive_args: Collection[SensitivePath] = (),
 ) -> FunctionTool | Tool:
     """把审批闸【绑进工具对象本身】:无论哪个 agent、哪条线程、以什么名字执行它,调用前都先过闸。
 
     【安全场景的首选】按名字 gate(ApprovalMiddleware 的 gated_tools)只认工具名:同一个函数换个名字
     再注册一遍、或调用方自建线程脱离动态作用域时都不设防;require_approval 绑在对象上,两者都挡得住。
-    scope:显式作用域;不给时取【执行时】外层的 approval_scope(模块级共享的工具对象用这个,每个请求在
-    自己的作用域里调用)。两者都没有、而门会产生待审请求时,调用时抛 ApprovalConfigError(不执行,也不按
-    包装实例生成隐式作用域)。与 ApprovalMiddleware 用同一个门叠加时,同一调用只审 / 核销一次。
+    scope:静态绑定的作用域;不给时取【执行时】外层的 approval_scope(模块级共享的工具对象用这个,每个请求在
+    自己的作用域里调用)。【两者都有时组合而不是覆盖】:请求作用域是「外层作用域 + 这里的 scope」的复合值
+    (更具体的外层 per-user 作用域不会被静态绑定的 "global" 之类盖掉,不同用户不共用批准)。两者都没有、而门需要作用域
+    时,调用时抛 ApprovalConfigError(不执行,也不按包装实例生成隐式作用域);FunctionCallingAgent /
+    ToolUsingAgent 在 run 开始时就检查它们工具清单里各包装的这条要求。与 ApprovalMiddleware 用同一个门叠加时,
+    同一调用只审 / 核销一次。
     """
     if scope is not None and (not isinstance(scope, str) or not scope):
         raise ValueError("approval scope 必须是非空字符串")
@@ -1164,7 +1241,8 @@ def require_approval(
         gated=frozenset({tool.name}),
         code=code,
         scope=scope,
-        sensitive={tool.name: frozenset(sensitive_args)},
+        sensitive={tool.name: _normalize_sensitive(sensitive_args)},
+        compose_outer=True,
     )
     if isinstance(tool, FunctionTool):
         return replace(tool, func=_GuardedCall(tool.name, tool.func, guard))
@@ -1207,7 +1285,7 @@ class ApprovalMiddleware:
         gated_tools: Sequence[str] = (),
         code: str = APPROVAL_TOOL_CALL,
         scope: str | None = None,
-        sensitive_args: Mapping[str, Collection[str]] | None = None,
+        sensitive_args: Mapping[str, Collection[SensitivePath]] | None = None,
         strict_names: bool = False,
     ) -> None:
         if scope is not None and (not isinstance(scope, str) or not scope):
@@ -1218,7 +1296,9 @@ class ApprovalMiddleware:
         self._scope = scope
         self._strict_names = strict_names
         self._warned = False
-        self._sensitive = {tool: frozenset(paths) for tool, paths in (sensitive_args or {}).items()}
+        self._sensitive = {
+            tool: _normalize_sensitive(paths) for tool, paths in (sensitive_args or {}).items()
+        }
 
     def before_step(self, ctx: StepContext) -> None:
         if not self._gated:
@@ -1264,8 +1344,9 @@ class ApprovalMiddleware:
         if not self._warned:
             self._warned = True
             warnings.warn(
-                f"受审批工具名在被包裹 agent 的工具清单里找不到:{sorted(unknown)}"
-                "(全站共用名单 / agent 变体缺这个工具时可忽略;若是笔误请修正;要严格校验传 strict_names=True)",
+                f"受审批工具名在被包裹 agent 的工具清单里找不到:{sorted(unknown)}——该名字未匹配任何工具,"
+                "对应的工具不受审批保护(全站共用名单 / agent 变体缺这个工具时可忽略;若是笔误,真正的工具现在"
+                "没有任何审批,请立刻修正;要严格校验传 strict_names=True)",
                 UserWarning,
                 stacklevel=4,
             )

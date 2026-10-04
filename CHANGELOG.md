@@ -15,8 +15,11 @@
   - 批准**缺省一次性消费**,在执行之前核销(`resolve(uses=N)` 放行 N 次,`uses=None` 为显式可选的旧幂等模式);
     核销要求请求与登记时逐字段相等(含完整参数)。
   - 请求绑定调用方**显式提供**的作用域(`ApprovalMiddleware(scope=)` / `require_approval(scope=)` / 外层
-    `approval_scope(...)`),A 的批准对 B 无效;会产生待审请求的门(`ManualApprovalGate` 等可核销的门)没有作用域时
-    在任何工具执行前抛 `ApprovalConfigError`,库不生成隐式作用域。作用域须在共享同一个门的调用方之间唯一。
+    `approval_scope(...)`),A 的批准对 B 无效;会产生待审请求的门(`ManualApprovalGate` 等)没有作用域时抛
+    `ApprovalConfigError`,库不生成隐式作用域:`ApprovalMiddleware` 在内层 agent 运行之前抛;`FunctionCallingAgent` /
+    `ToolUsingAgent` 在 run 开始时就检查自己工具清单里各 `require_approval` 包装的作用域要求,早于任何工具执行
+    (嵌套 agent 里的工具在子 agent 开始运行时才检查)。`require_approval(scope=)` 与外层作用域**组合**成复合作用域而
+    不是覆盖(静态绑定的 `"global"` 不会让不同用户共用批准)。作用域须在共享同一个门的调用方之间唯一。
   - `ManualApprovalGate.resolve` 只接受已登记、未过期的请求(不能离线算出 id 预先批准)。请求表有界且 fail-closed:
     每个作用域最多 64 条「待审 + 未核销的已批准」、全表(缺省 16384,= 64 × 256 个满配额会话,构造参数
     `max_requests`,与每作用域上限解耦)满了拒绝新请求(`ApprovalGateError`),不淘汰既有条目;已决议的记录不占这份配额
@@ -25,7 +28,9 @@
     `FunctionCallingAgent` 一轮最多 64 个工具调用,超出整轮不执行、不送审。
   - 审批人看得到要批准的完整内容:`ApprovalRequest.canonical_arguments` / `arguments()` 是 request id 所哈希的完整
     规范化参数;`preview` 只作列表展示(截断一次,如实注明省略字符数与摘要)。缺省不打码,打码由
-    `sensitive_args` 显式声明(打码后仍可区分)。二者都不进 trace / repr。
+    `sensitive_args` 显式声明(`str` 直接报错;路径可含点号分隔 / tuple 分段 / 穿过 list;打码显示为 `***`、
+    **不附摘要**——低熵值的摘要可被字典猜出)。二者都不进 trace / repr。参数含孤立代理字符等无法编码的内容时归一为
+    `ApprovalGateError`(工具不执行,消息不含参数内容)。
   - 受审批工具名含通配符 / 空名、或与已注册工具仅大小写 / 分隔符不同时 fail-closed(`ApprovalConfigError`)。
 - 同一轮内不重放副作用:`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls 里有任何受审批调用未获批则整轮
   不执行。挂起后重跑 run 是**至少一次**语义(此前已执行过的工具会再次执行,库不复用任何跨 run 的结果);不想重跑用
@@ -62,6 +67,9 @@
   prompt 时保留各条发现的标记。
 
 ### Fixed
+
+- `FunctionTool.parse_arguments`:超过 4300 位的整数参数不再让裸 `ValueError` 冒出,归一为 `InvalidToolArguments`
+  (喂回模型、工具不执行)。
 
 - `FunctionCallingAgent`:工具函数抛异常(含 `SkillError`)不再让整轮 `step()` 崩溃,而是归一成
   tool 消息喂回模型(只含稳定错误码 `tool.execution_failed` / CorespineError 的 code 与异常类型名;
@@ -147,7 +155,8 @@
   contextvar 不再泄漏给调用方。
 - `Coordinator.run_parallel` 把调用方的 `contextvars` 上下文复制进每个工作线程。
 - `DeepResearchAgent` 遇到审批挂起 / 拒绝时原样上抛,而不是当作一条失败的检索发现继续综合。
-- `ApprovalMiddleware` 的受审批名在被包裹 agent 的工具清单里找不到时发一次 `UserWarning`(`strict_names=True` 时报错)。
+- `ApprovalMiddleware` 的受审批名在被包裹 agent 的工具清单里找不到时发一次 `UserWarning`(`strict_names=True` 时报错);
+  警告明说「该名字未匹配任何工具,**对应的工具不受审批保护**」。
 
 ### Breaking
 
@@ -159,6 +168,9 @@
 - **会产生待审请求的门必须有显式作用域**:`ManualApprovalGate`(及其它实现 `consume` 的门)配
   `ApprovalMiddleware` / `require_approval` 时,没有 `scope=` 也没有外层 `approval_scope(...)` 即抛
   `ApprovalConfigError`(此前不需要作用域)。恢复须在同一作用域里重跑。
+- `sensitive_args` 的打码值不再附 sha256 前缀(显示为 `***`);传 `str`(如 `{"pay": "to"}`)、空路径等构造时抛
+  `ApprovalConfigError`(此前 `str` 被当成字符集合而静默不打码)。`require_approval(scope=)` 的静态作用域与外层
+  作用域组合成复合作用域(此前盖掉外层 per-user 作用域,`request.scope` / `held_approvals` 里的作用域值随之变成复合值)。
 - **审批门改为由门声明是否需要作用域**(`ApprovalGate.requires_scope`,可选属性):`AutoApprovalGate` 声明
   `False`、`ManualApprovalGate` 声明 `True`;**未声明的第三方门按「需要作用域」处理**——没有作用域就抛
   `ApprovalConfigError`、且**不调用**它的 `review`(此前先 `review` 一次看是否返回 `PENDING`,那会在第三方收件箱里

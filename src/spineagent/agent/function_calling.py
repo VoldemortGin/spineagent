@@ -31,6 +31,7 @@ from spineagent.agent.approval import (
     ApprovalError,
     ApprovalPending,
     ApprovalRejected,
+    check_tool_approval_scopes,
     enforce_tool_approval,
     preflight_tool_approvals,
 )
@@ -94,6 +95,9 @@ class FunctionCallingAgent:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
+        check_tool_approval_scopes(
+            self._tools.values()
+        )  # 缺作用域的 require_approval 包装:早于任何工具执行
         messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
         if self._system:
             messages.insert(0, {"role": "system", "content": self._system})

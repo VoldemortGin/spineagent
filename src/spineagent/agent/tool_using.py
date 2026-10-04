@@ -24,7 +24,7 @@ from collections.abc import Iterable
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult, merge_usage
-from spineagent.agent.approval import enforce_tool_approval
+from spineagent.agent.approval import check_tool_approval_scopes, enforce_tool_approval
 from spineagent.agent.artifact import ArtifactRef
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
 from spineagent.agent.trust import compose, untrusted
@@ -57,6 +57,9 @@ class ToolUsingAgent:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
+        check_tool_approval_scopes(
+            self._tools.values()
+        )  # 缺作用域的 require_approval 包装:早于任何工具执行
         history: list[Observation] = []
         # 工具(如 AgentTool 背后的子 agent)透传上来的 usage / artifacts,按调用序汇总进本步结果。
         usage: dict[str, int] | None = None

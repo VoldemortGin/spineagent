@@ -381,7 +381,8 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   同一 request id 此前已被核销(执行)的次数(不进 id、不参与相等比较);>0 时 `preview` 首行注明「此前已执行过 n 次」。
 - `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False, scope="", sensitive_args=()) -> ApprovalRequest`:
   `bind_values=True` 时把完整规范化参数的 sha256 折进 `id`(参数一变即新请求);`scope` 折进 `id`;`sensitive_args`
-  声明 preview 里要打码的参数路径(点号穿过 dict,如 `"password"`、`"body.to_token"`;显示为 `***(sha256:<前缀>)`)。
+  声明 preview 里要打码的参数路径(路径集合,传 `str` 抛 `ApprovalConfigError`;点号分隔的 str 如 `"password"` /
+  `"body.to_token"`,或 tuple 分段 `("body", "x.y")`;可穿过 dict 与 list;显示为 `***`,不附摘要)。
 - `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(纯查询,幂等);可选属性 `requires_scope: bool`
   (门**声明**需不需要作用域:会产生待审请求的门 `True`,立即决定、永不挂起的门 `False`;**未声明按需要**,缺作用域抛
   `ApprovalConfigError` 且不调用 `review`;非 bool 值同样按需要)。
@@ -408,10 +409,10 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   执行前预检一批调用(只 review、不核销;待审的被登记),返回与输入对齐的「错误或 None」。
 - `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call", scope=None, sensitive_args=None, strict_names=False)`:
   before_step 把审批配置与作用域压进当前上下文(`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 +
-  规范化参数 + 作用域」review 并核销。作用域:`scope=` > 外层 `approval_scope`;**门可核销而两者都没有时,before_step
-  在内层 agent 运行前抛 `ApprovalConfigError`**(不生成隐式作用域);同步门不需要。`sensitive_args`:`{工具名: [参数路径]}`。
+  规范化参数 + 作用域」review 并核销。作用域:`scope=` > 外层 `approval_scope`;**门需要作用域(见 `requires_scope`)而两者都没有时,before_step
+  在内层 agent 运行前抛 `ApprovalConfigError`**(不生成隐式作用域);声明 `requires_scope = False` 的同步门不需要。`sensitive_args`:`{工具名: [参数路径]}`。
   `gated_tools` 须是确切名字:含通配符 / 空名在构造时抛 `ApprovalConfigError`;能推断被包裹 agent 的工具清单时,只差
-  大小写 / 分隔符的名字抛 `ApprovalConfigError`,找不到的名字发一次 `UserWarning`(`strict_names=True` 时改为报错)。
+  大小写 / 分隔符的名字抛 `ApprovalConfigError`,找不到的名字发一次 `UserWarning`(「该名字未匹配任何工具,对应的工具不受审批保护」;`strict_names=True` 时改为报错)。
   缺省 `gated_tools` 空 = 零行为变化。每次受审批调用恰好一条 `mw_approval` trace(只记 code / 计数 / 决议)。
 - `enforce_tool_approval(tool: str, arguments, *, target=None, available=()) -> None`:执行点在调用工具前调它;
   approved(并核销)返回,rejected 抛 `ApprovalRejected`,pending 抛 `ApprovalPending`(`context["request_id"]` /
@@ -420,7 +421,9 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   已注册工具名(检测近似名写错)。
 - `require_approval(tool, gate, *, code="tool_call", scope=None, sensitive_args=()) -> FunctionTool | Tool`:把闸绑进工具
   对象本身,不依赖上下文(裸线程 / 第三方 agent / 别名注册都绕不过)——**安全场景首选**。`scope` 不给时取**执行时**外层的
-  `approval_scope`(模块级共享的工具对象就这么用);两者都没有而门可核销时,调用时抛 `ApprovalConfigError`、不执行。
+  `approval_scope`(模块级共享的工具对象就这么用);**两者都有时组合成复合作用域,不覆盖外层**;两者都没有而门需要作用域时,
+  调用时抛 `ApprovalConfigError`、不执行(`FunctionCallingAgent` / `ToolUsingAgent` 在 run 开始时就用
+  `check_tool_approval_scopes(tools)` 检查自己工具清单里各包装的这条要求)。
 - `spineagent.tools.tool.reachable_tool_names(obj) -> frozenset[str] | None`:agent / 工具在本地能执行到的工具名(经可选
   `tool_inventory()`);推断不了返回 `None`。
 - 错误:`ApprovalError`(基类)/ `ApprovalRejected`(`approval.rejected`,不可重试)/ `ApprovalPending`
