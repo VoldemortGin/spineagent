@@ -95,9 +95,8 @@ class FunctionCallingAgent:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
-        check_tool_approval_scopes(
-            self._tools.values()
-        )  # 缺作用域的 require_approval 包装:早于任何工具执行
+        # 缺作用域的 require_approval 包装:早于任何工具执行就报错。
+        check_tool_approval_scopes(self._tools.values())
         messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
         if self._system:
             messages.insert(0, {"role": "system", "content": self._system})

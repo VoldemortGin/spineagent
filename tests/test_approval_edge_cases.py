@@ -228,13 +228,16 @@ def test_wrapper_scope_composes_with_outer_approval_scope():
 
 def test_composed_scopes_are_unambiguous():
     log, gate = _Log(), ManualApprovalGate()
-    tool = require_approval(log.tool("delete_file"), gate, scope="b/c")
-    agent = FunctionCallingAgent("fc", _Script([[("delete_file", _arg("/a"))]]), [tool])
+    # ("a", "b/c") 与 ("a/b", "c") 用朴素拼接都会得到 "a/b/c",必须是两个不同的请求。
+    tool_bc = require_approval(log.tool("delete_file"), gate, scope="b/c")
+    tool_c = require_approval(log.tool("delete_file"), gate, scope="c")
+    script = _Script([[("delete_file", _arg("/a"))]])
     with approval_scope("a"), pytest.raises(ApprovalPending) as first:
-        agent.step("go")
-    with approval_scope("a/b"), pytest.raises(ApprovalPending) as second:
-        agent.step("go")
-    assert first.value.context["request_id"] != second.value.context["request_id"]
+        FunctionCallingAgent("fc", script, [tool_bc]).step("go")
+    gate.resolve(first.value.context["request_id"], Decision.APPROVED)
+    with approval_scope("a/b"), pytest.raises(ApprovalPending):
+        FunctionCallingAgent("fc", script, [tool_c]).step("go")
+    assert log.calls == []
 
 
 # ---- strict_names=False:写错的名字只警告,但要明说「对应的工具不受审批保护」 -----------------------

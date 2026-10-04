@@ -57,9 +57,8 @@ class ToolUsingAgent:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
-        check_tool_approval_scopes(
-            self._tools.values()
-        )  # 缺作用域的 require_approval 包装:早于任何工具执行
+        # 缺作用域的 require_approval 包装:早于任何工具执行就报错。
+        check_tool_approval_scopes(self._tools.values())
         history: list[Observation] = []
         # 工具(如 AgentTool 背后的子 agent)透传上来的 usage / artifacts,按调用序汇总进本步结果。
         usage: dict[str, int] | None = None

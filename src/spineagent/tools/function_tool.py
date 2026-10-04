@@ -78,9 +78,8 @@ class FunctionTool:
         """
         try:
             parsed = json.loads(raw or "{}")
-        except (
-            ValueError
-        ) as exc:  # JSONDecodeError 是其子类;超过 4300 位的整数等抛的是裸 ValueError
+        # JSONDecodeError 是 ValueError 的子类;超过 4300 位的整数等抛的是裸 ValueError。
+        except ValueError as exc:
             raise InvalidToolArguments(self.name, f"arguments 不是合法 JSON({exc})") from exc
         if not isinstance(parsed, dict):
             raise InvalidToolArguments(
