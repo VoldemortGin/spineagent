@@ -704,8 +704,8 @@ def _changed_arguments_require_reapproval(harness: ToolExecutionHarness) -> None
 
 
 def _approval_is_consumed_once(harness: ToolExecutionHarness) -> None:
-    # 一次批准只放行【一次】匹配的工具调用:同一 run 里第二次同参调用要重新审批;在同一作用域里
-    # resume 时,已执行过的那次由步内记账复用(不再执行),第二次仍然挂起。
+    # 一次批准只放行【一次】匹配的工具调用:同一 run 里第二次同参调用要重新审批;重跑时批准已被核销,
+    # 第一次调用重新挂起(库不复用任何跨 run 的结果,见 ADR 0002 决策 5a)。
     counter, gate = _Counter(), ManualApprovalGate()
     tools = {"delete_file": counter}
     calls = [("delete_file", "/a"), ("delete_file", "/a")]

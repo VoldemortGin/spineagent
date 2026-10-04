@@ -24,11 +24,11 @@ from collections.abc import Iterable
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult, merge_usage
-from spineagent.agent.approval import begin_tool_call, enforce_tool_approval
+from spineagent.agent.approval import enforce_tool_approval
 from spineagent.agent.artifact import ArtifactRef
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
 from spineagent.agent.trust import compose, untrusted
-from spineagent.tools.tool import Tool, ToolResult, index_tools_by_name, inventory_of_tools
+from spineagent.tools.tool import Tool, index_tools_by_name, inventory_of_tools
 
 # 触顶 max_steps 又无任何观测可作答时的固定兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without finishing)"
@@ -79,16 +79,10 @@ class ToolUsingAgent:
             arg = _splice_prev(action.arg, history[-1].output if history else "")
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
             tool = self._tools[action.tool]
-            # 步内记账:因审批挂起而重跑时,已执行过的调用直接复用记录的结果(不再执行)。
-            slot = begin_tool_call(action.tool, {"arg": arg})
-            if slot.replay is not None:
-                result = ToolResult(tool=action.tool, output=slot.replay)
-            else:
-                enforce_tool_approval(
-                    action.tool, {"arg": arg}, target=tool, available=self._tool_names
-                )
-                result = tool.run(arg)
-                slot.record(result.output)
+            enforce_tool_approval(
+                action.tool, {"arg": arg}, target=tool, available=self._tool_names
+            )
+            result = tool.run(arg)
             usage = merge_usage(usage, result.usage)
             artifacts.extend(result.artifacts)
             history.append(Observation(tool=action.tool, arg=arg, output=result.output))

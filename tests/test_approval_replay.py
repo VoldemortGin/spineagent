@@ -1,4 +1,4 @@
-"""修复 3:等待审批期间的重跑不得重放其它工具的副作用(步内记账 / 先审后行 / 不中断模式 / 并行分支)。
+"""审批挂起与重跑:先审后行 / 不中断模式 / 至少一次的重跑语义 / 不存在跨 run 的结果复用。
 
 一律走真实执行路径:真实 FunctionCallingAgent + 离线脚本化 provider + 带副作用计数的真实工具函数。
 """
@@ -14,7 +14,6 @@ from corespine.llm.provider import (
 )
 from corespine.llm.provider import ToolCall as LLMToolCall
 
-from spineagent.agent.agent import FunctionAgent
 from spineagent.agent.approval import (
     ApprovalMiddleware,
     ApprovalPending,
@@ -22,11 +21,9 @@ from spineagent.agent.approval import (
     ManualApprovalGate,
     approval_scope,
 )
-from spineagent.agent.builtin.deep_research import DeepResearchAgent
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.middleware import MiddlewareAgent
 from spineagent.conformance import ScriptedToolCallProvider
-from spineagent.orchestration.coordinator import Coordinator
 from spineagent.tools.function_tool import FunctionTool
 
 
@@ -84,9 +81,102 @@ def _pending(agent):
     return ei.value
 
 
-def test_review_a4_rerun_while_pending_does_not_replay_other_side_effects():
-    # 审查 A4:send_email 在前、受审批工具在后;pending 时重跑 3 次、resolve 后再跑 1 次,
-    # send_email 共执行了 4 次。现在:同一作用域里的重跑复用已执行调用的记录结果。
+class _Profile:
+    """无参工具:返回某个租户的私有数据(带副作用计数)。"""
+
+    def __init__(self, owner: str) -> None:
+        self.owner = owner
+        self.hits = 0
+
+    def __call__(self) -> str:
+        self.hits += 1
+        return f"secret-of-{self.owner}"
+
+
+class _SeenToolMessages(_BatchProvider):
+    """记录喂回给模型的 tool 消息。"""
+
+    def __init__(self, batches, final="finished") -> None:
+        super().__init__(batches, final)
+        self.seen: list[str] = []
+
+    def chat(self, messages, *, tools=None):
+        self.seen = [m["content"] for m in messages if m.get("role") == "tool"]
+        index = sum(1 for m in messages if m.get("role") == "assistant")
+        if index < len(self._batches):
+            calls = tuple(
+                LLMToolCall(
+                    id=f"call_{index}_{j}",
+                    function=FunctionCall(name=name, arguments=json.dumps(args)),
+                )
+                for j, (name, args) in enumerate(self._batches[index])
+            )
+            message = ResponseMessage(role="assistant", content=None, tool_calls=calls)
+            return ChatCompletion(choices=(Choice(index=0, message=message),))
+        message = ResponseMessage(role="assistant", content=self._final)
+        return ChatCompletion(choices=(Choice(index=0, message=message),))
+
+
+def test_review_r2_new_turn_in_same_session_really_executes_side_effects():
+    # 复审 L:按文档推荐用 scope="session-42";第 1 轮 send_email 执行后挂起;第 2 轮是【新任务】,同参数
+    # 的 send_email 没有执行,模型却被告知 ok。现在没有任何跨 run 的结果复用:用户新要求的副作用必须真的发生。
+    log, gate = _Log(), ManualApprovalGate()
+    turn1 = _SeenToolMessages(
+        [[("send_email", {"value": "boss"})], [("delete_file", {"value": "/x"})]]
+    )
+    agent1 = _agent(log, gate, turn1)
+    with approval_scope("session-42"):
+        _pending(agent1)
+    assert log.count("send_email") == 1
+    turn2 = _SeenToolMessages([[("send_email", {"value": "boss"})]])
+    with approval_scope("session-42"):
+        assert _agent(log, gate, turn2).step("send it again").output == "finished"
+    assert log.count("send_email") == 2
+    assert turn2.seen == ["send_email:boss"]
+
+
+def test_review_r2_shared_scope_string_never_leaks_results_or_approvals_across_tenants():
+    # 复审 C:两个租户共用一个门、作用域字符串都叫 chat-1 —— Bob 的模型拿到了 Alice 工具的返回值(他自己的
+    # 工具一次都没执行);批准 Alice 的请求后 Bob 的 run 执行了 delete_file。
+    gate = ManualApprovalGate()
+    deleted: list[str] = []
+
+    def build(owner: str):
+        profile = _Profile(owner)
+        script = _SeenToolMessages(
+            [[("read_profile", {})], [("delete_file", {"value": f"/home/{owner}/x"})]]
+        )
+        tools = [
+            FunctionTool("read_profile", "", {"type": "object", "properties": {}}, func=profile),
+            FunctionTool(
+                "delete_file",
+                "",
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+                func=lambda value: deleted.append(value) or "deleted",
+            ),
+        ]
+        fc = FunctionCallingAgent("fc", script, tools)
+        mw = ApprovalMiddleware(gate, gated_tools=["delete_file"], scope="chat-1")
+        return MiddlewareAgent("mw", fc, [mw]), profile, script
+
+    alice, alice_profile, _ = build("alice")
+    alice_id = _pending(alice).context["request_id"]
+    bob, bob_profile, bob_script = build("bob")
+    bob_id = _pending(bob).context["request_id"]
+    assert bob_profile.hits == 1  # Bob 自己的工具真的执行了
+    assert bob_script.seen == ["secret-of-bob"]  # Bob 的模型只看到 Bob 的数据
+    assert alice_profile.hits == 1
+    assert bob_id != alice_id
+    gate.resolve(alice_id, Decision.APPROVED)
+    _pending(bob)  # Alice 的批准对 Bob 的调用无效
+    assert deleted == []
+    alice.step("t")
+    assert deleted == ["/home/alice/x"]
+
+
+def test_rerun_after_pending_is_at_least_once():
+    # 语义钉子(ADR 0002 决策 5a):挂起后重跑整个 run,此前已执行过的非受审批工具会再次执行——库不记录、
+    # 不复用任何跨 run 的工具结果。要「不重放」就让工具幂等,或用 on_approval="feed_back"。
     log, gate = _Log(), ManualApprovalGate()
     script = ScriptedToolCallProvider(
         [("send_email", {"value": "boss"}), ("delete_file", {"value": "/a"})], final="finished"
@@ -97,27 +187,25 @@ def test_review_a4_rerun_while_pending_does_not_replay_other_side_effects():
             request_id = _pending(agent).context["request_id"]
         gate.resolve(request_id, Decision.APPROVED)
         assert agent.step("t").output == "finished"
-    assert log.count("send_email") == 1
+    assert log.count("send_email") == 4
     assert log.count("delete_file") == 1
 
 
-def test_step_with_two_gated_calls_can_be_resumed_with_single_use_approvals():
-    # 一次性消费下:前面已获批并执行过的调用在重跑时由记账复用,不需要也不会再次执行 / 再次审批。
+def test_feed_back_mode_has_no_rerun_and_no_replay():
+    # 不中断模式:挂起作为 tool 结果喂回模型,run 正常结束;批准后由【下一个任务】去执行受审批调用。
     log, gate = _Log(), ManualApprovalGate()
-    script = ScriptedToolCallProvider(
-        [
-            ("delete_file", {"value": "/a"}),
-            ("send_email", {"value": "x"}),
-            ("delete_file", {"value": "/b"}),
-        ],
-        final="finished",
+    first = _SeenToolMessages(
+        [[("send_email", {"value": "boss"})], [("delete_file", {"value": "/a"})]]
     )
-    agent = _agent(log, gate, script)
     with approval_scope("session-1"):
-        gate.resolve(_pending(agent).context["request_id"], Decision.APPROVED)
-        gate.resolve(_pending(agent).context["request_id"], Decision.APPROVED)
-        assert agent.step("t").output == "finished"
-    assert log.calls == [("delete_file", "/a"), ("send_email", "x"), ("delete_file", "/b")]
+        assert _agent(log, gate, first, on_approval="feed_back").step("t").output == "finished"
+    assert log.calls == [("send_email", "boss")]
+    [request] = gate.pending()
+    gate.resolve(request.id, Decision.APPROVED)
+    follow_up = _SeenToolMessages([[("delete_file", {"value": "/a"})]])
+    with approval_scope("session-1"):
+        _agent(log, gate, follow_up, on_approval="feed_back").step("now delete it")
+    assert log.calls == [("send_email", "boss"), ("delete_file", "/a")]
 
 
 def test_approve_before_execute_runs_nothing_in_a_batch_until_all_approved():
@@ -162,105 +250,8 @@ def test_feed_back_mode_reports_approval_to_the_model_instead_of_raising():
     assert len(gate.pending()) == 1  # 审批人照样能看到待审请求
 
 
-def test_parallel_branches_do_not_replay_on_resume():
-    # DeepResearch 的并行分支:每个分支先 send_email 再调受审批工具;resume 后已执行的 send 不重放。
-    log, gate = _Log(), ManualApprovalGate()
-    script = ScriptedToolCallProvider(
-        [("send_email", {"value": "boss"}), ("delete_file", {"value": "/a"})]
-    )
-    research = DeepResearchAgent(
-        provider=script,
-        tools=[log.tool("send_email"), log.tool("delete_file")],
-        planner=lambda task: ["q1", "q2"],
-    )
-    agent = MiddlewareAgent("mw", research, [ApprovalMiddleware(gate, gated_tools=["delete_file"])])
-    with approval_scope("session-1"):
-        for _ in range(2):
-            request_id = _pending(agent).context["request_id"]
-        gate.resolve(request_id, Decision.APPROVED, uses=2)  # 两个分支各执行一次
-        agent.step("t")
-    assert log.count("send_email") == 2  # 每个分支一次,重跑不重放
-    assert log.count("delete_file") == 2
-
-
-def test_run_parallel_inside_wrapped_step_does_not_replay_completed_branch():
-    log, gate = _Log(), ManualApprovalGate()
-    risky = FunctionCallingAgent(
-        "risky",
-        ScriptedToolCallProvider([("delete_file", {"value": "/a"})]),
-        [log.tool("delete_file")],
-    )
-    benign = FunctionCallingAgent(
-        "benign",
-        ScriptedToolCallProvider([("send_email", {"value": "b"})]),
-        [log.tool("send_email")],
-    )
-    fan = FunctionAgent("fan", lambda t: Coordinator([benign, risky]).run_parallel(t)[0].output)
-    agent = MiddlewareAgent(
-        "mw", fan, [ApprovalMiddleware(gate, gated_tools=["delete_file"], scope="session-1")]
-    )
-    request_id = _pending(agent).context["request_id"]
-    _pending(agent)
-    gate.resolve(request_id, Decision.APPROVED)
-    agent.step("t")
-    assert log.count("send_email") == 1
-    assert log.count("delete_file") == 1
-
-
-def test_successful_step_clears_the_ledger():
-    # 记账只对「因审批挂起而重跑」生效:成功完成后再跑一遍,工具照常执行。
-    log, gate = _Log(), ManualApprovalGate()
-    script = ScriptedToolCallProvider([("send_email", {"value": "boss"})])
-    agent = _agent(log, gate, script)
-    with approval_scope("session-1"):
-        agent.step("t")
-        agent.step("t")
-    assert log.count("send_email") == 2
-
-
-# ---- 变异验证补测:ToolUsingAgent 的记账 / 执行闸路径上的挂起标记 / 喂回模式的逐个执行路径 ------------
-
-
-def test_tool_using_rerun_replays_instead_of_reexecuting():
-    from spineagent.agent.policy import SyntaxToolPolicy
-    from spineagent.agent.tool_using import ToolUsingAgent
-    from spineagent.tools.tool import ToolResult
-
-    hits: list[str] = []
-
-    class Plain:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def run(self, arg: str) -> ToolResult:
-            hits.append(self.name)
-            return ToolResult(tool=self.name, output="ok")
-
-    gate = ManualApprovalGate()
-    tu = ToolUsingAgent("tu", SyntaxToolPolicy(), [Plain("send_email"), Plain("delete_file")])
-    agent = MiddlewareAgent("mw", tu, [ApprovalMiddleware(gate, gated_tools=["delete_file"])])
-    task = "send_email: boss\ndelete_file: /a"
-    with approval_scope("session-1"):
-        for _ in range(2):
-            with pytest.raises(ApprovalPending) as ei:
-                agent.step(task)
-        gate.resolve(ei.value.context["request_id"], Decision.APPROVED)
-        agent.step(task)
-    assert hits == ["send_email", "delete_file"]
-
-
-def test_per_call_path_keeps_ledger_and_feeds_back():
-    # 关掉先审后行:挂起发生在执行闸(check)上,同样要保留记账;喂回模式在逐个执行路径上也不抛。
-    log, gate = _Log(), ManualApprovalGate()
-    script = _BatchProvider([[("send_email", "boss"), ("delete_file", "/a")]])
-    agent = _agent(log, gate, script, approve_before_execute=False)
-    with approval_scope("session-1"):
-        request_id = _pending(agent).context["request_id"]
-        _pending(agent)
-        gate.resolve(request_id, Decision.APPROVED)
-        agent.step("t")
-    assert log.calls == [("send_email", "boss"), ("delete_file", "/a")]
-
+def test_per_call_path_feeds_back():
+    # 关掉先审后行:喂回模式在逐个执行路径(执行闸 check)上也不抛。
     log2, gate2 = _Log(), ManualApprovalGate()
     fed = _agent(
         log2,
@@ -271,14 +262,3 @@ def test_per_call_path_keeps_ledger_and_feeds_back():
     )
     assert fed.step("t").output == "finished"
     assert log2.calls == [("send_email", "boss")]
-
-
-def test_ledger_is_cleared_when_a_fed_back_step_completes():
-    # 喂回模式下挂起被转成 tool 结果、整步成功收尾:记账必须清空,下一次 run 照常执行工具。
-    log, gate = _Log(), ManualApprovalGate()
-    script = _BatchProvider([[("send_email", "boss")], [("delete_file", "/a")]])
-    agent = _agent(log, gate, script, on_approval="feed_back")
-    with approval_scope("session-1"):
-        agent.step("t")
-        agent.step("t")
-    assert log.count("send_email") == 2

@@ -35,7 +35,7 @@ def bind_context[R](fn: Callable[..., R]) -> Callable[..., R]:
     """把【当前】contextvars 上下文绑到 fn 上,返回可交给自建线程 / 线程池执行的可调用对象。
 
     `contextvars.copy_context().run` 的薄封装:在调用 bind_context 的那一刻复制上下文(审批作用域、
-    审批记账、approval_scope 等都在里面),之后无论在哪条线程里调用,fn 都在这份副本里跑。用法:
+    审批配置、approval_scope 等都在里面),之后无论在哪条线程里调用,fn 都在这份副本里跑。用法:
     `pool.submit(bind_context(agent.step), task)`。线程池缺省【不】传播上下文——不包这一层,
     ApprovalMiddleware 的动态作用域就到不了自建线程里的执行点。安全场景仍首选
     require_approval(把闸静态绑在工具对象上,不依赖任何上下文)。

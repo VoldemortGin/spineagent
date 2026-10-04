@@ -43,7 +43,6 @@ import re
 import secrets
 import threading
 import time
-import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -89,9 +88,14 @@ class ApprovalRejected(ApprovalError):
 
 
 class ApprovalPending(ApprovalError):
-    """审批待定:run 挂起,等 out-of-band resolve 后凭 resume token 重跑。可重试(等人拍板)。
+    """审批待定:run 挂起,等 out-of-band resolve 后在【同一作用域】里重跑。可重试(等人拍板)。
 
-    request_id 收进 context,供调用方 / 编排层据它 resolve(与后续 spinestudio 审批收件箱对接)。
+    request_id / scope 收进 context,供调用方 / 编排层据它 resolve(与审批收件箱对接)。
+
+    【至少一次(at-least-once)】重跑是从头再跑这个 run:本 run 里此前已经执行过的工具(含未受审批的
+    send_email 之类、以及此前已获批并执行过的受审批调用)会【再次执行】。库不记录、不复用任何跨 run 的
+    工具结果。调用方应让工具幂等;或改用 FunctionCallingAgent(on_approval="feed_back") 的不中断模式
+    (run 不中断,没有重跑,也就没有重放)。见 docs/adr/0002 决策 5a。
     """
 
     code = "approval.pending"
@@ -129,6 +133,12 @@ class ApprovalConfigError(ApprovalError, ValueError):
     """
 
     code = "approval.config_error"
+
+
+_PENDING_MESSAGE = (
+    "审批待定:受审批工具调用待人类拍板。批准后在同一作用域里重跑本 run 时,此前已执行过的工具会再次执行"
+    "(至少一次语义;工具应幂等,或改用 on_approval='feed_back')"
+)
 
 
 # ---- 请求摘要 + 确定性派生(绝不含参数正文)-----------------------------------------------------
@@ -721,11 +731,8 @@ class _ApprovalGuard:
                 tool=tool,
                 scope=request.scope,
             )
-        session = _LEDGER_SESSION.get()
-        if session is not None:
-            session.suspended = True  # 本步因审批挂起:保留记账,供同一作用域里的重跑复用
         raise ApprovalPending(
-            "审批待定:受审批工具调用待人类拍板",
+            _PENDING_MESSAGE,
             request_id=request.id,
             tool=tool,
             scope=request.scope,
@@ -758,11 +765,8 @@ class _ApprovalGuard:
                 tool=tool,
                 scope=request.scope,
             )
-        session = _LEDGER_SESSION.get()
-        if session is not None:
-            session.suspended = True
         raise ApprovalPending(
-            "审批待定:受审批工具调用待人类拍板",
+            _PENDING_MESSAGE,
             request_id=request.id,
             tool=tool,
             scope=request.scope,
@@ -809,152 +813,6 @@ class _ApprovalGuard:
                 cause=type(exc).__name__,
             ) from exc
         return consumed is True
-
-
-# ---- 步内记账:等待审批期间的重跑不重放已执行过的工具调用 ----------------------------------------
-#
-# 恢复靠「在同一作用域里重跑整步」。没有记账时,重跑会把本步里已经执行过的工具(含未受审批的
-# send_email 之类)再执行一遍;一次性批准下,前面已获批并执行过的受审批调用还会被要求再批一次。
-# 记账按「作用域 + 工具名 + 规范化参数指纹 + 本步内第几次同参调用」记录已成功调用的结果;重跑时
-# 同一槽位直接复用记录的结果,不再执行(也不再审批——它已在批准下执行过)。只对「因审批挂起」结束
-# 的步保留;步成功完成或因其它原因失败即清空。记录的结果只在内存里,绝不进 trace。
-
-
-@runtime_checkable
-class ToolCallLedger(Protocol):
-    """步内记账存储:按作用域记录已成功执行的工具调用结果(键是不含参数明文的摘要)。"""
-
-    def lookup(self, scope: str, key: str) -> str | None: ...
-
-    def record(self, scope: str, key: str, output: str) -> None: ...
-
-    def discard(self, scope: str) -> None: ...
-
-
-# InMemoryToolCallLedger 缺省:最多保留的作用域数 / 每个作用域的记录数 / 作用域存活期(秒)。
-_DEFAULT_LEDGER_SCOPES = 256
-_DEFAULT_LEDGER_ENTRIES = 1_024
-_DEFAULT_LEDGER_TTL = 3_600.0
-
-
-class InMemoryToolCallLedger:
-    """进程内步内记账(缺省):有界(作用域数 / 每作用域记录数)、过期(ttl 秒)、线程安全。"""
-
-    def __init__(
-        self,
-        *,
-        max_scopes: int = _DEFAULT_LEDGER_SCOPES,
-        max_entries: int = _DEFAULT_LEDGER_ENTRIES,
-        ttl: float = _DEFAULT_LEDGER_TTL,
-        now_fn: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self._scopes: dict[str, tuple[float, dict[str, str]]] = {}
-        self._max_scopes = max_scopes
-        self._max_entries = max_entries
-        self._ttl = ttl
-        self._now = now_fn
-        self._lock = threading.Lock()
-
-    def lookup(self, scope: str, key: str) -> str | None:
-        with self._lock:
-            entry = self._scopes.get(scope)
-            if entry is None:
-                return None
-            if self._now() >= entry[0]:
-                del self._scopes[scope]
-                return None
-            return entry[1].get(key)
-
-    def record(self, scope: str, key: str, output: str) -> None:
-        with self._lock:
-            now = self._now()
-            entry = self._scopes.get(scope)
-            if entry is None or now >= entry[0]:
-                while len(self._scopes) >= self._max_scopes:
-                    del self._scopes[next(iter(self._scopes))]
-                entry = (now + self._ttl, {})
-                self._scopes[scope] = entry
-            if len(entry[1]) < self._max_entries:
-                entry[1][key] = output
-
-    def discard(self, scope: str) -> None:
-        with self._lock:
-            self._scopes.pop(scope, None)
-
-    def __repr__(self) -> str:
-        return f"InMemoryToolCallLedger(scopes={len(self._scopes)})"
-
-
-@dataclass
-class RecordedCall:
-    """一次工具调用在记账里的槽位:replay 非 None 表示重跑时直接复用该结果、不再执行。"""
-
-    replay: str | None = None
-    _ledger: ToolCallLedger | None = field(default=None, repr=False)
-    _scope: str = field(default="", repr=False)
-    _key: str = field(default="", repr=False)
-
-    def record(self, output: str) -> None:
-        """执行成功后记下结果(无活动记账时为空操作)。"""
-        if self._ledger is not None:
-            self._ledger.record(self._scope, self._key, output)
-
-
-class _LedgerSession:
-    """一次被包裹 step 的记账会话:本次尝试里同参调用的序号 + 是否因审批挂起。"""
-
-    def __init__(self, ledger: ToolCallLedger, scope: str) -> None:
-        self.ledger = ledger
-        self.scope = scope
-        self.suspended = False
-        self.completed = False
-        self._counts: dict[str, int] = {}
-        self._lock = threading.Lock()
-
-    def claim(self, tool: str, arguments: Mapping[str, object]) -> RecordedCall:
-        base = f"{tool}:{_value_digest(arguments)}"
-        with self._lock:
-            occurrence = self._counts.get(base, 0)
-            self._counts[base] = occurrence + 1
-        key = hashlib.sha256(f"{base}:{occurrence}".encode()).hexdigest()
-        return RecordedCall(
-            replay=self.ledger.lookup(self.scope, key),
-            _ledger=self.ledger,
-            _scope=self.scope,
-            _key=key,
-        )
-
-
-_LEDGER_SESSION: ContextVar[_LedgerSession | None] = ContextVar(
-    "spineagent_approval_ledger", default=None
-)
-# 缺省记账按审批门共享(审批域 = 门 + 作用域):每次请求重建 middleware 时只要共用同一个门就能复用。
-_DEFAULT_LEDGERS: weakref.WeakKeyDictionary[object, ToolCallLedger] = weakref.WeakKeyDictionary()
-_DEFAULT_LEDGERS_LOCK = threading.Lock()
-
-
-def _default_ledger_for(gate: object) -> ToolCallLedger | None:
-    with _DEFAULT_LEDGERS_LOCK:
-        try:
-            ledger = _DEFAULT_LEDGERS.get(gate)
-            if ledger is None:
-                ledger = InMemoryToolCallLedger()
-                _DEFAULT_LEDGERS[gate] = ledger
-        except TypeError:  # 门对象不可弱引用:退回调用方各自的记账
-            return None
-        return ledger
-
-
-def begin_tool_call(tool: str, arguments: Mapping[str, object]) -> RecordedCall:
-    """执行点在执行一次工具调用前调它:拿到本次调用的记账槽位(replay 非 None 时直接复用,不执行)。
-
-    无活动记账(未处在带受审批工具的 ApprovalMiddleware 步里)时返回空槽位。成功执行后调
-    RecordedCall.record(output)。自定义执行工具的 agent 可同样使用,以免重跑重放副作用。
-    """
-    session = _LEDGER_SESSION.get()
-    if session is None:
-        return RecordedCall()
-    return session.claim(tool, arguments)
 
 
 _ACTIVE_GUARDS: ContextVar[tuple[_ApprovalGuard, ...]] = ContextVar(
@@ -1165,7 +1023,6 @@ class ApprovalMiddleware:
         code: str = APPROVAL_TOOL_CALL,
         scope: str | None = None,
         redact: Redactor | None = None,
-        ledger: ToolCallLedger | None = None,
     ) -> None:
         if scope is not None and (not isinstance(scope, str) or not scope):
             raise ValueError("approval scope 必须是非空字符串")
@@ -1174,7 +1031,6 @@ class ApprovalMiddleware:
         self._code = code
         self._scope = scope
         self._redact = redact if redact is not None else default_redactor
-        self._ledger = ledger or _default_ledger_for(gate) or InMemoryToolCallLedger()
 
     def before_step(self, ctx: StepContext) -> None:
         if not self._gated:
@@ -1201,42 +1057,9 @@ class ApprovalMiddleware:
             redact=self._redact,
         )
         ctx.cleanups.append(_push_guard(guard))
-        session = _LEDGER_SESSION.get()
-        if session is None or session.scope != scope:
-            # 本步开一个记账会话(嵌套的同作用域审批配置共用外层会话)。
-            session = _LedgerSession(self._ledger, scope)
-            ctx.extras[_LEDGER_OWNER] = session
-            ctx.cleanups.append(_open_ledger_session(session))
 
     def after_step(self, ctx: StepContext, result: AgentResult) -> AgentResult:
-        session = ctx.extras.get(_LEDGER_OWNER)
-        if isinstance(session, _LedgerSession):
-            session.completed = True  # 成功完成:记账不再需要
         return result
-
-
-_LEDGER_OWNER = "approval.ledger_session"
-
-
-class _LedgerCloser:
-    """记账会话的收尾:复位上下文;只在「因审批挂起而结束」时保留记账,否则清空。
-
-    用类而不是闭包:运行期类型检查会在每次定义带注解的嵌套函数时重新装饰它(热路径开销)。
-    """
-
-    def __init__(self, session: _LedgerSession) -> None:
-        self._session = session
-        self._token = _LEDGER_SESSION.set(session)
-
-    def __call__(self) -> None:
-        _LEDGER_SESSION.reset(self._token)
-        if self._session.completed or not self._session.suspended:
-            self._session.ledger.discard(self._session.scope)
-
-
-def _open_ledger_session(session: _LedgerSession) -> Callable[[], None]:
-    """把记账会话设进当前上下文,返回对应的收尾回调。"""
-    return _LedgerCloser(session)
 
 
 # 把审批 middleware 登记进现有 middlewares 注册表(需显式传 gate=...;缺省 gated_tools 空即零行为变化)。

@@ -31,8 +31,6 @@ from spineagent.agent.approval import (
     ApprovalError,
     ApprovalPending,
     ApprovalRejected,
-    RecordedCall,
-    begin_tool_call,
     enforce_tool_approval,
     preflight_tool_approvals,
 )
@@ -124,13 +122,7 @@ class FunctionCallingAgent:
                 }
             )
             planned = [self._plan(tc) for tc in tool_calls]
-            # 步内记账:为本轮每个有效调用领取槽位(因审批挂起而重跑时,已执行过的直接复用结果)。
-            slots = {
-                i: begin_tool_call(tool.name, validated)
-                for i, (_, tool, validated, _) in enumerate(planned)
-                if tool is not None and validated is not None
-            }
-            held = self._preflight(planned, slots)
+            held = self._preflight(planned)
             for i, (tc, tool, validated, failure) in enumerate(planned):
                 if held is not None:
                     output = held.get(i, failure if failure is not None else _BATCH_HELD)
@@ -139,7 +131,7 @@ class FunctionCallingAgent:
                 else:
                     # 工具函数里嵌套的 agent 花掉的 token 一并计入本 agent 的 usage。
                     with collect_usage() as nested:
-                        output = self._execute(tool, validated, slots[i])
+                        output = self._execute(tool, validated)
                     total_usage = merge_usage(total_usage, *nested)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 # trace 只记本地注册表里存在的工具名;模型编造的名字记成固定占位。
@@ -167,16 +159,14 @@ class FunctionCallingAgent:
         except InvalidToolArguments as exc:
             return tc, tool, None, f"error: {exc}"
 
-    def _preflight(
-        self, planned: list[_Planned], slots: dict[int, RecordedCall]
-    ) -> dict[int, str] | None:
+    def _preflight(self, planned: list[_Planned]) -> dict[int, str] | None:
         """先审后行:本轮有任何一个调用未获批时一个都不执行(抛错,或在喂回模式下返回各调用的喂回文本)。"""
         if not self._approve_before_execute:
             return None
         candidates = [
             (i, tool, validated)
             for i, (_, tool, validated, _) in enumerate(planned)
-            if tool is not None and validated is not None and slots[i].replay is None
+            if tool is not None and validated is not None
         ]
         errors = preflight_tool_approvals(
             [(tool.name, validated, tool) for _, tool, validated in candidates],
@@ -191,10 +181,8 @@ class FunctionCallingAgent:
             raise blocked[min(blocked)]
         return {i: _approval_text(e) for i, e in blocked.items()}
 
-    def _execute(self, tool: FunctionTool, validated: dict[str, Any], slot: RecordedCall) -> str:
-        """执行一次调用:记账里已有结果就复用;否则过执行闸、执行、成功则记账。"""
-        if slot.replay is not None:
-            return slot.replay
+    def _execute(self, tool: FunctionTool, validated: dict[str, Any]) -> str:
+        """执行一次调用:先过执行闸(未批准则不执行),再执行工具。"""
         try:
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
             enforce_tool_approval(tool.name, validated, target=tool, available=self._tools.keys())
@@ -202,21 +190,18 @@ class FunctionCallingAgent:
             if self._on_approval == "raise":
                 raise
             return _approval_text(exc)
-        output, ok = self._invoke(tool, validated)
-        if ok:
-            slot.record(output)
-        return output
+        return self._invoke(tool, validated)
 
-    def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> tuple[str, bool]:
-        """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。返回 (文本, 是否成功)。"""
+    def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> str:
+        """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。"""
         if self._fail_fast:
-            return tool.invoke(arguments), True
+            return tool.invoke(arguments)
         try:
-            return tool.invoke(arguments), True
+            return tool.invoke(arguments)
         except ApprovalError:
             raise  # 嵌套 agent 里的审批挂起 / 拒绝必须冒到调用方(HITL 恢复靠它)
         except Exception as exc:  # noqa: BLE001 —— 工具失败喂回模型,不让整轮崩溃
-            return _tool_error_text(exc, include_message=self._include_error_message), False
+            return _tool_error_text(exc, include_message=self._include_error_message)
 
 
 def _approval_text(exc: ApprovalError) -> str:

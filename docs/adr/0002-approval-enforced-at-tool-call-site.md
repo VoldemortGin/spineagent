@@ -98,27 +98,22 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
    不让弹性并行把审批错误吞成一条失败发现,而是在收集后原样重抛。`FunctionCallingAgent(on_approval=
    "feed_back")` 是调用方显式选择的**不中断模式**:本执行点的挂起 / 拒绝作为 tool 结果(只含 code 与
    request id)喂回模型,整步不抛、不重跑;审批人照样在 `pending()` 里看到请求。
-5a. **重跑不重放副作用(修订新增)。** 恢复靠「在同一作用域里重跑整步」;审查复现:一步里
-   `send_email` 在前、受审批工具在后,pending 时重跑 3 次、resolve 后再跑 1 次,`send_email` 共执行 4 次
-   (轮询期间每次重跑都重放),DeepResearch 的并行分支同样重放。决策:
-   - **步内记账**:`ApprovalMiddleware` 为每个被包裹的 step 开一个记账会话(嵌套的同作用域配置共用
-     外层会话;contextvar 随 `run_parallel` 复制进工作线程)。执行点经 `begin_tool_call(工具名, 参数)`
-     领取槽位——键 = 作用域 + 工具名 + 规范化参数摘要 + 本步内第几次同参调用——已有记录则直接复用
-     结果、**不再执行也不再审批**(它已在批准下执行过,一次性批准也因此能覆盖「一步多个受审批调用」
-     的恢复);否则过执行闸、执行、成功后记下结果。只对「因审批挂起而结束」的步保留记账,成功完成
-     或因其它原因失败即清空(其它失败的重试语义不变)。缺省记账按审批门共享(审批域 = 门 + 作用域),
-     所以每次请求重建 agent / middleware 时只要共用同一个门就能复用;也可 `ApprovalMiddleware(ledger=)`
-     注入。记录的结果只在内存里(有界、过期),绝不进 trace。只用 `require_approval`、没有
-     `ApprovalMiddleware` 的组合没有记账。
-   - **先审后行(`FunctionCallingAgent(approve_before_execute=True)`,缺省开启)**:模型给出一轮
-     tool_calls 后、执行任何一个之前,用 `preflight_tool_approvals` 预检整轮(只 review、不核销;待审的
-     会被一次性登记,审批人能一次看到整批);有任何一个未获批,该轮**一个工具都不执行**。评估:对未配置
-     审批的调用方零影响(预检只读一次 contextvar);对配置了审批的调用方,同轮里未受审批的工具从
-     「先执行、后被挂起的兄弟调用拖着重放」变成「等整轮获批后一起执行」——更安全,且与旧设计「调用方在
-     执行任何工具前就知道本步需要审批」的能力一致,故缺省开启;`approve_before_execute=False` 恢复逐个
-     执行。预检不核销:同一轮里同参调用多于剩余额度时执行中途仍可能挂起(由记账兜住重放)。
-   - **预检 API**:`preflight_tool_approvals([(工具名, 参数, 工具对象), ...])` 返回与输入对齐的
-     「错误或 None」,自定义执行工具的 agent 可用它实现自己的先审后行。
+5a. **挂起后的重跑语义:同一轮内不重放,跨轮至少一次(修订)。** 恢复靠「批准后在同一作用域里重跑这个 run」。
+   审查复现:一步里 `send_email` 在前、受审批工具在后,pending 时重跑 3 次、resolve 后再跑 1 次,`send_email` 共执行
+   4 次。第二轮曾为此加过「步内记账」(按作用域字符串记录已执行调用的结果、重跑时复用),复审证明它本身是漏洞:
+   同一会话作用域里用户的**新任务**被当成重跑,副作用被静默吞掉而模型被告知 `ok`;两个租户的作用域字符串相同时
+   一方的模型直接拿到另一方工具的返回值。决策:**整体移除步内记账,不存在任何跨 run 的工具结果复用**,语义改为:
+   - **同一轮内不重放**(保留):`FunctionCallingAgent(approve_before_execute=True)`(缺省)在模型给出一轮
+     tool_calls 后、执行任何一个之前预检整轮(只 review、不核销;待审的被一次性登记,审批人一次看到整批);有任何
+     一个未获批,该轮**一个工具都不执行**。`approve_before_execute=False` 恢复逐个执行。
+   - **跨轮至少一次(at-least-once)**:因审批挂起后**重跑**该 run,此前各轮已执行过的工具(含未受审批的、以及此前
+     已获批并执行过的受审批调用——一次性批准已被核销,会重新挂起)会**再次执行**。调用方二选一:让工具幂等;
+     或用不中断模式 `on_approval="feed_back"`——挂起 / 拒绝作为 tool 结果喂回模型,run 正常结束,没有重跑,也就
+     没有重放;批准后由**下一个任务**去执行(见下文「推荐用法」)。`ApprovalPending` 的消息与 docstring 写明这一点。
+   - 评估过「调用方持有的续跑上下文」(`ApprovalPending` 携带已完成的调用与消息历史,`run(resume=...)` 从挂起点
+     继续,状态只在调用方手里):`Agent.step` 协议没有续跑通道,而挂起可以发生在嵌套 agent 里(`AgentTool` /
+     `ChainAgent` / `run_parallel` / `DeepResearchAgent` / 工具函数里的子 agent),只在最内层 `FunctionCallingAgent`
+     保存进度无法恢复外层的进度;要让所有组合 agent 都可续跑是协议级改动。代价大,本轮不做。
 6. **fail-closed。** 作用域里有受审批工具时:gate.review 抛任何 `Exception`、或返回非 `Decision`,
    一律抛 `ApprovalGateError`(code `approval.gate_error`),工具不执行。未配置审批(无作用域、
    `gated_tools` 为空)时执行点只读一次 contextvar 即返回,行为与修复前完全一致。
