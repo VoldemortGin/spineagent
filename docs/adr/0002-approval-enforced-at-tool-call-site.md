@@ -85,13 +85,22 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      `UnknownApprovalRequest`(不得预先批准)。请求表有上限(`max_requests`,满了先清过期再淘汰最早
      登记的)与存活期(`request_ttl`;批准 / 拒绝的有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定),
      防止「真实模型每次重跑参数略有变化就生成新 pending」造成的无界增长。拒绝不被消耗。
-   - **审批人看得到要批准什么**:执行闸构造请求时用脱敏钩子(缺省 `default_redactor`:键名命中敏感
-     词表整值打码、每个值截断到 200 字符;钩子出错整值打码)生成 `ApprovalRequest.preview`,
-     gate 与 `ManualApprovalGate.pending()` 可读。**这与 trace 隐私不冲突**:trace 是面向运维 / 观测
-     管道的旁路,可能被批量导出、长期留存、给无授权的人看,所以只记 code / 计数 / 决议;审批接口是
-     有授权的人决定「放不放行这次具体动作」的通道,看不到参数的审批没有意义(`transfer(1)` 与
-     `transfer(1000000)` 在旧接口里完全一样)。预览不进 trace、不进 `repr`、不参与请求相等比较,
-     且只出现在 gate 收到的请求与 `pending()` 里。
+   - **审批人看得到要批准的完整内容(第三轮修订)**:request id 哈希的是完整规范化参数(批准 X 只放行字节完全相同的
+     X),所以审批人也必须能看到完整的 X。第二轮只给了截断 + 按键名子串打码的 preview:200 字符之后才不同的两次调用
+     preview 逐字节相同;`author` / `passage` / `max_tokens` / `session_name` 都被打成 `***`;嵌套 dict 的键是模型
+     自己定的,起名 `to_token` 就能把收款账户藏起来;API 里取不到完整参数。现在:
+     - `ApprovalRequest.canonical_arguments`(键排序紧凑 JSON,正是 id 所哈希的内容)与 `ApprovalRequest.arguments()`
+       (解析后的新 dict)给审批 UI / 审批人。**审批人应基于完整参数而不是 preview 做决定。**
+     - `preview` 只作列表展示:每个值 / 键只截断一次(值 200、键 64 字符),省略提示如实写「省略 N 字符」并附完整值的
+       sha256 前缀,尾部不同的两个请求在 preview 层面也可区分。
+     - **缺省不打码**模型提供的参数。打码是调用方的显式声明:`ApprovalMiddleware(sensitive_args={工具名: [参数路径]})`
+       / `require_approval(sensitive_args=[参数路径])`,路径用点号穿过 dict(`"password"`、`"body.to_token"`);被打码的值
+       显示为 `***(sha256:<前缀>)`,不同的值仍可区分。打码只作用于 preview,完整参数不受影响。按键名猜测的缺省规则
+       与可注入的 `Redactor` 钩子一并移除。
+     - **这与 trace 隐私不冲突**:trace 隐私宪章约束的是可观测性通道(运维 / 观测管道的旁路,可能被批量导出、长期留存、
+       给无授权的人看),所以 trace 只记 code / 计数 / 决议;审批接口是有授权的人决定「放不放行这次具体动作」的通道,
+       看不到参数的审批没有意义。完整参数与 preview 不进 trace、不进 `repr`(也就不进以 repr 打日志的地方),只出现在
+       gate 收到的请求与 `pending()` 里;核销时要求请求与登记时逐字段相等(含完整参数)。
    - **ticket 只是 resume 句柄**:`redeem(token)` 拿回 `ResumeTicket(request_id, decision, scope)`,告诉
      调用方在哪个作用域里重跑;它不参与执行闸判定。放行额度在执行点核销,所以持有 / 重放 ticket
      都不能让同一批准多执行一次;token 本身仍一次性(ADR 0001 不变)。

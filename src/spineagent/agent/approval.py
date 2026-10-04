@@ -6,8 +6,8 @@
 
 家族缝的元模式(同 trigger / credential / sandbox 缝):**Protocol + 离线确定性默认 + Registry
 工厂 + 参数化 conformance**。一次「待审批请求」的定位摘要——审批类别 code、确定性 request id、
-触发的工具名、参数 schema 指纹与计数、作用域——不含参数值;另带一份只给审批人看的参数预览
-(脱敏 + 截断,不进 trace / repr)。gate 对它给出三态决议之一:approved / rejected / pending。
+触发的工具名、参数 schema 指纹与计数、作用域——不含参数值;另带只给审批人看的完整规范化参数与
+列表用的预览(不进 trace / repr)。gate 对它给出三态决议之一:approved / rejected / pending。
 
 两个离线确定性默认:
   - AutoApprovalGate —— 策略表:按工具名 glob 模式 allow / deny,纯配置、确定性,永不 pending;
@@ -31,7 +31,7 @@ redeem 校验 + 标记消费,重放(再次 redeem 同一 token)必抛 InvalidRes
 受审批工具名写错 / 含通配符时 fail-closed(ApprovalConfigError)。
 
 隐私:本缝实现【自身不发射 trace】(同 credential / trigger 缝)。要观测在【审批 middleware】里记
-code / 计数 / 决议,绝不记参数正文或预览;参数预览只经审批接口(gate.review / pending())给审批人。
+code / 计数 / 决议,绝不记参数正文或预览;完整参数与预览只经审批接口(gate.review / pending())给审批人。
 """
 
 from __future__ import annotations
@@ -141,22 +141,27 @@ _PENDING_MESSAGE = (
 )
 
 
-# ---- 请求摘要 + 确定性派生(绝不含参数正文)-----------------------------------------------------
+# ---- 请求:定位摘要 + 给审批人看的完整参数 / 预览 ------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ApprovalRequest:
-    """一次待审批请求(只读):审批类别 code + 确定性 request id + 定位摘要(绝不含参数正文)。
+    """一次待审批请求(只读):定位摘要(code / id / 工具名 / schema 指纹 / 计数 / 作用域)+ 给审批人的内容。
 
     - code:审批类别 code(如 "tool_call";调用方据它路由 / 计数);
-    - id:确定性且唯一的 request id(纯函数派生:同一逻辑动作恒同 id,可重放——正是它让挂起的
-      run 在 resolve 后重跑 step 能稳定命中已落决议);
+    - id:确定性 request id(code + 工具名 + schema 指纹 + 完整规范化参数的 sha256 + 作用域派生):批准 X 只放行
+      字节完全相同的 X;
     - tool:触发审批的工具名(定位符,非正文);
     - arg_fingerprint:参数的 schema 指纹(sha256 前 16 位,只覆盖【键名 + 值类型】,绝不含值);
     - arg_count:参数个数(计数);
-    - scope:请求所属的作用域(会话 / 用户 / run 的不透明标识,已折进 id;A 作用域的批准对 B 无效);
-    - preview:给【审批人】看的参数预览((键, 脱敏 + 截断后的值文本) 元组),只经审批接口
-      (gate.review / ManualApprovalGate.pending)提供,绝不进 trace;不参与相等比较、不进 repr。
+    - scope:请求所属的作用域(调用方给的不透明标识,已折进 id;A 作用域的批准对 B 无效);
+    - canonical_arguments:完整规范化参数(键排序紧凑 JSON,非 JSON 值退回 repr)——正是 id 所哈希的内容。
+      审批人据它(`arguments()`)做决定;
+    - preview:列表展示用的预览((键, 值文本) 元组;长值截断一次并如实注明省略的字符数与该值的摘要前缀;
+      只对调用方显式声明的敏感参数打码)。审批人不应只凭 preview 做决定。
+
+    canonical_arguments 与 preview 只经审批接口(gate.review / ManualApprovalGate.pending)给审批人:不进 repr、
+    不进 trace / 日志(trace 只记 code / 计数 / 决议,见 docs/adr/0002)。
     """
 
     code: str
@@ -165,7 +170,15 @@ class ApprovalRequest:
     arg_fingerprint: str = ""
     arg_count: int = 0
     scope: str = field(default="", repr=False)
+    canonical_arguments: str = field(default="", repr=False)
     preview: tuple[tuple[str, str], ...] = field(default=(), repr=False, compare=False)
+
+    def arguments(self) -> dict[str, Any]:
+        """完整规范化参数(每次返回新 dict;未打码——审批人据它决定放不放行)。"""
+        if not self.canonical_arguments:
+            return {}
+        loaded: dict[str, Any] = json.loads(self.canonical_arguments)
+        return loaded
 
 
 def _fingerprint(args: Mapping[str, object]) -> str:
@@ -175,81 +188,72 @@ def _fingerprint(args: Mapping[str, object]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _value_digest(args: Mapping[str, object]) -> str:
-    """规范化参数(键排序 + 紧凑 JSON)后取 sha256——只用作 request id 的派生材料,绝不落明文。
-
-    非 JSON 值退回 repr:它若不稳定,只会让请求「对不上旧批准」而要求重新审批(偏向 fail-closed)。
-    """
-    raw = json.dumps(
-        {str(k): v for k, v in args.items()},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=repr,
+def _canonical(value: object) -> str:
+    """规范化:键排序紧凑 JSON;非 JSON 值退回 repr(它若不稳定,只会让请求对不上旧批准而重新审批)。"""
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=repr
     )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _request_id(code: str, tool: str, fingerprint: str, nonce: str, scope: str = "") -> str:
     """据 code + 工具名 + schema 指纹 + nonce(+ 作用域)派生确定性 request id(纯函数,可重放)。"""
     parts = [code, tool, fingerprint, nonce] + ([f"scope={scope}"] if scope else [])
-    return hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:16]
+    return _sha256(":".join(parts))[:16]
 
 
-# ---- 参数预览(只给审批人看;脱敏 + 截断;绝不进 trace)----------------------------------------
-
-# 预览里单个值 / 键的最大字符数(超出截断并注明省略了多少字符)。
-PREVIEW_MAX_CHARS = 200
+# 预览里单个值 / 键的最大字符数:超出只截断一次,并注明省略的字符数与该值的摘要前缀(尾部不同的两个值可区分)。
+_PREVIEW_MAX_CHARS = 200
 _PREVIEW_MAX_KEY_CHARS = 64
-_REDACTED = "***"
-# 键名命中即整值打码的敏感词表(大小写不敏感,子串匹配)。
-_SENSITIVE_KEY = re.compile(
-    r"(?i)(pass(word|wd)?|secret|token|api[-_]?key|apikey|auth|credential|cookie|"
-    r"private[-_]?key|session|signature)"
-)
-
-# 脱敏钩子:(键, 原值) -> 给审批人看的文本。可注入以替换缺省规则。
-type Redactor = Callable[[str, object], str]
 
 
-def _mask_nested(value: object) -> object:
-    """递归把嵌套 dict 里敏感键的值换成占位(只用于预览渲染)。"""
-    if isinstance(value, Mapping):
-        return {
-            str(k): (_REDACTED if _SENSITIVE_KEY.search(str(k)) else _mask_nested(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_mask_nested(v) for v in value]
-    return value
-
-
-def _truncate(text: str, limit: int) -> str:
+def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    return f"{text[:limit]}…(+{len(text) - limit} 字符)"
+    return f"{text[:limit]}…(省略 {len(text) - limit} 字符,sha256:{_sha256(text)[:12]})"
 
 
-def default_redactor(key: str, value: object) -> str:
-    """缺省脱敏:键名命中敏感词表 -> 整值打码;其余按 repr / 紧凑 JSON 渲染并截断到 PREVIEW_MAX_CHARS。"""
-    if _SENSITIVE_KEY.search(key):
-        return _REDACTED
-    if isinstance(value, str):
-        text = repr(value)
-    else:
-        text = json.dumps(_mask_nested(value), ensure_ascii=False, sort_keys=True, default=repr)
-    return _truncate(text, PREVIEW_MAX_CHARS)
+def _masked(value: object) -> str:
+    """被声明为敏感的值:打码,附完整值的摘要前缀(不同的值仍可区分)。"""
+    return f"***(sha256:{_sha256(_canonical(value))[:12]})"
 
 
-def _build_preview(args: Mapping[str, object], redact: Redactor) -> tuple[tuple[str, str], ...]:
-    """按键排序生成预览;脱敏钩子自身出错时整值打码(fail-closed,不让原文漏出)。"""
+def _mask_paths(value: object, paths: Collection[tuple[str, ...]]) -> object:
+    """按参数路径(只穿过 dict)把声明为敏感的嵌套值换成打码文本;返回副本,绝不改原值。"""
+    if not paths or not isinstance(value, Mapping):
+        return value
+    out: dict[str, object] = {}
+    for key, item in value.items():
+        here = str(key)
+        if (here,) in paths:
+            out[here] = _masked(item)
+        else:
+            deeper = [path[1:] for path in paths if len(path) > 1 and path[0] == here]
+            out[here] = _mask_paths(item, deeper)
+    return out
+
+
+def _build_preview(
+    args: Mapping[str, object], sensitive: Collection[str]
+) -> tuple[tuple[str, str], ...]:
+    """按键排序生成预览:缺省不打码;只对 sensitive 里声明的参数路径("password" / "body.to_token")打码。"""
+    paths = [tuple(path.split(".")) for path in sensitive]
     preview: list[tuple[str, str]] = []
     for key in sorted(str(k) for k in args):
-        try:
-            text = _truncate(str(redact(key, args[key])), PREVIEW_MAX_CHARS)
-        except Exception:  # noqa: BLE001 —— 预览失败不应阻断审批,也绝不回退到原文
-            text = _REDACTED
-        preview.append((_truncate(key, _PREVIEW_MAX_KEY_CHARS), text))
+        value = args[key]
+        if (key,) in paths:
+            text = _masked(value)
+        elif isinstance(value, str):
+            text = repr(value)
+        else:
+            nested = [path[1:] for path in paths if len(path) > 1 and path[0] == key]
+            text = json.dumps(
+                _mask_paths(value, nested), ensure_ascii=False, sort_keys=True, default=repr
+            )
+        preview.append((_clip(key, _PREVIEW_MAX_KEY_CHARS), _clip(text, _PREVIEW_MAX_CHARS)))
     return tuple(preview)
 
 
@@ -261,18 +265,19 @@ def make_approval_request(
     nonce: str = "",
     bind_values: bool = False,
     scope: str = "",
-    redact: Redactor | None = None,
+    sensitive_args: Collection[str] = (),
 ) -> ApprovalRequest:
-    """从工具名 + 参数字典构造一次待审批请求(定位摘要只取 schema 指纹与计数,绝不落参数值)。
+    """从工具名 + 参数字典构造一次待审批请求(定位摘要只取 schema 指纹与计数;完整参数只给审批人)。
 
     nonce 让调用方在需要「按次审批」时强制区分 schema 相同的两次调用;缺省 "" 时 schema 相同的
-    请求折叠成同一 id。bind_values=True 时把【规范化参数值的 sha256】也折进 request id(仍不落
-    明文):参数一变即是新请求、须重新审批——工具调用点上的执行闸用的就是它。scope 把请求绑定到
-    调用方的作用域(折进 id)。给了 redact 时生成参数预览(只给审批人看,见 ApprovalRequest)。
+    请求折叠成同一 id。bind_values=True 时把【完整规范化参数的 sha256】也折进 request id:参数一变即是
+    新请求、须重新审批——工具调用点上的执行闸用的就是它。scope 把请求绑定到调用方的作用域(折进 id)。
+    sensitive_args 声明预览里要打码的参数路径(点号分隔,只穿过 dict);完整参数不受影响。
     """
-    args = dict(arguments or {})
+    args = {str(k): v for k, v in (arguments or {}).items()}
+    canonical = _canonical(args)
     fp = _fingerprint(args)
-    salt = nonce if not bind_values else f"{nonce}:{_value_digest(args)}"
+    salt = nonce if not bind_values else f"{nonce}:{_sha256(canonical)}"
     return ApprovalRequest(
         code=code,
         id=_request_id(code, tool, fp, salt, scope),
@@ -280,7 +285,8 @@ def make_approval_request(
         arg_fingerprint=fp,
         arg_count=len(args),
         scope=scope,
-        preview=_build_preview(args, redact) if redact is not None else (),
+        canonical_arguments=canonical,
+        preview=_build_preview(args, sensitive_args),
     )
 
 
@@ -444,7 +450,7 @@ class ManualApprovalGate:
       (有效期内同一请求可无限次执行——风险:一次批准可被同一作用域里任意多次的同参调用复用)。
     - consume(request):执行闸在执行前调用,原子核销一次;额度用尽即删除记录,同一请求再来会重新
       登记为待审。
-    - pending():列举待审请求,带【参数预览】(脱敏 + 截断,只给审批人看,绝不进 trace)。
+    - pending():列举待审请求,带完整规范化参数(arguments())与预览(只给审批人看,绝不进 trace)。
 
     请求表有上限(max_requests,满了先清过期、再淘汰最早登记的)与存活期(request_ttl 秒;批准 /
     拒绝的有效期缺省同此,可由 resolve 的 ttl_seconds 单独指定),防无界增长。时钟可注入。线程安全。
@@ -566,7 +572,7 @@ class ManualApprovalGate:
         return replace(ticket, scope=scope)
 
     def pending(self) -> list[ApprovalRequest]:
-        """列举未过期、尚未落决议的待审请求(按 id 字典序;带给审批人看的参数预览)。"""
+        """列举未过期、尚未落决议的待审请求(按 id 字典序;带给审批人看的完整参数与预览)。"""
         with self._lock:
             now = self._now()
             return [
@@ -692,7 +698,7 @@ def _requires_scope(gate: ApprovalGate) -> bool:
 
 @dataclass(frozen=True)
 class _ApprovalGuard:
-    """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code + 作用域 + 脱敏钩子(+ 可选 trace 落点)。"""
+    """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code + 作用域 + 预览打码声明(+ 可选 trace 落点)。"""
 
     gate: ApprovalGate
     gated: frozenset[str]
@@ -701,7 +707,8 @@ class _ApprovalGuard:
     agent: str = ""
     step: int = 0
     scope: str | None = None  # None:执行时取外层 approval_scope(都没有则见 resolve_scope)
-    redact: Redactor = default_redactor
+    # 工具名 -> 预览里要打码的参数路径(调用方显式声明;缺省不打码)。
+    sensitive: Mapping[str, frozenset[str]] = field(default_factory=dict, compare=False)
 
     def resolve_scope(self) -> str:
         """显式作用域 > 外层 approval_scope;都没有时:会产生待审请求的门报配置错误,同步门用空作用域。"""
@@ -748,7 +755,7 @@ class _ApprovalGuard:
             arguments,
             bind_values=True,
             scope=self.resolve_scope(),
-            redact=self.redact,
+            sensitive_args=self.sensitive.get(tool, frozenset()),
         )
         key = (id(self.gate), request.id)
         if seen is not None and key in seen:
@@ -963,7 +970,7 @@ def require_approval(
     *,
     code: str = APPROVAL_TOOL_CALL,
     scope: str | None = None,
-    redact: Redactor | None = None,
+    sensitive_args: Collection[str] = (),
 ) -> FunctionTool: ...
 @overload
 def require_approval(
@@ -972,7 +979,7 @@ def require_approval(
     *,
     code: str = APPROVAL_TOOL_CALL,
     scope: str | None = None,
-    redact: Redactor | None = None,
+    sensitive_args: Collection[str] = (),
 ) -> Tool: ...
 def require_approval(
     tool: FunctionTool | Tool,
@@ -980,7 +987,7 @@ def require_approval(
     *,
     code: str = APPROVAL_TOOL_CALL,
     scope: str | None = None,
-    redact: Redactor | None = None,
+    sensitive_args: Collection[str] = (),
 ) -> FunctionTool | Tool:
     """把审批闸【绑进工具对象本身】:无论哪个 agent、哪条线程、以什么名字执行它,调用前都先过闸。
 
@@ -997,7 +1004,7 @@ def require_approval(
         gated=frozenset({tool.name}),
         code=code,
         scope=scope,
-        redact=redact if redact is not None else default_redactor,
+        sensitive={tool.name: frozenset(sensitive_args)},
     )
     if isinstance(tool, FunctionTool):
         return replace(tool, func=_GuardedCall(tool.name, tool.func, guard))
@@ -1026,7 +1033,8 @@ class ApprovalMiddleware:
     推断不了(不透明 agent)时在执行点检测「仅大小写 / 分隔符不同」的写错。按名字 gate 对「同一函数
     以别名注册」不设防——安全场景首选 require_approval(按工具对象绑定)。
 
-    参数预览:gate 收到的 ApprovalRequest 带 redact 钩子(缺省 default_redactor)产出的预览,只给
+    审批内容:gate 收到的 ApprovalRequest 带完整规范化参数(arguments())与列表用的预览;sensitive_args
+    (工具名 -> 参数路径)显式声明预览里要打码的字段,缺省不打码。两者只给
     审批人看;trace 只记 code / 计数 / 决议,绝不记参数正文或预览。默认 gated_tools 为空 =>
     before_step 恒早退,零行为变化(opt-in)。
     """
@@ -1038,7 +1046,7 @@ class ApprovalMiddleware:
         gated_tools: Sequence[str] = (),
         code: str = APPROVAL_TOOL_CALL,
         scope: str | None = None,
-        redact: Redactor | None = None,
+        sensitive_args: Mapping[str, Collection[str]] | None = None,
     ) -> None:
         if scope is not None and (not isinstance(scope, str) or not scope):
             raise ValueError("approval scope 必须是非空字符串")
@@ -1046,7 +1054,7 @@ class ApprovalMiddleware:
         self._gated = _validate_gated_names(gated_tools)
         self._code = code
         self._scope = scope
-        self._redact = redact if redact is not None else default_redactor
+        self._sensitive = {tool: frozenset(paths) for tool, paths in (sensitive_args or {}).items()}
 
     def before_step(self, ctx: StepContext) -> None:
         if not self._gated:
@@ -1076,7 +1084,7 @@ class ApprovalMiddleware:
             agent=ctx.agent,
             step=ctx.step,
             scope=scope,
-            redact=self._redact,
+            sensitive=self._sensitive,
         )
         ctx.cleanups.append(_push_guard(guard))
 

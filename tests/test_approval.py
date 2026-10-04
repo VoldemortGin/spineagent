@@ -560,7 +560,7 @@ def test_rejection_is_not_consumed():
     assert deleter.paths == []
 
 
-def test_preview_is_redacted_truncated_and_never_traced():
+def test_preview_with_declared_sensitive_arg_is_never_traced():
     calls = [
         ("transfer", {"amount": 1000000, "password": "hunter2-SENTINEL", "memo": "x" * 500}),
     ]
@@ -587,7 +587,14 @@ def test_preview_is_redacted_truncated_and_never_traced():
     agent = MiddlewareAgent(
         "mw",
         FunctionCallingAgent("fc", ScriptedToolCallProvider(calls), [tool]),
-        [ApprovalMiddleware(gate, gated_tools=["transfer"], scope="s")],
+        [
+            ApprovalMiddleware(
+                gate,
+                gated_tools=["transfer"],
+                scope="s",
+                sensitive_args={"transfer": ["password"]},
+            )
+        ],
     )
     sink = InProcessPrivacyTraceSink()
     with pytest.raises(ApprovalPending):
@@ -595,31 +602,13 @@ def test_preview_is_redacted_truncated_and_never_traced():
     [request] = gate.pending()
     preview = dict(request.preview)
     assert preview["amount"] == "1000000"  # 审批人看得到要批的是什么
-    assert preview["password"] == "***"  # 敏感键打码
+    assert preview["password"].startswith("***(sha256:")  # 显式声明的敏感参数打码
     assert len(preview["memo"]) < 260 and preview["memo"].startswith("'xxx")  # 截断
     assert "hunter2" not in repr(request)  # 预览不进 repr
     for event in sink.events:
         for value in event.fields.values():
             assert "hunter2" not in str(value) and "1000000" not in str(value)
     assert hits == []
-
-
-def test_custom_redactor_and_failing_redactor():
-    gate = ManualApprovalGate()
-
-    def hide_all(key, value):
-        return "<hidden>"
-
-    agent = _guarded(_fc_calls(_Deleter(), 1, path="/secret"), gate, redact=hide_all)
-    _pending_id(agent)
-    assert dict(gate.pending()[0].preview) == {"path": "<hidden>"}
-
-    def broken(key, value):
-        raise RuntimeError("boom")
-
-    gate2 = ManualApprovalGate()
-    _pending_id(_guarded(_fc_calls(_Deleter(), 1, path="/secret"), gate2, redact=broken))
-    assert dict(gate2.pending()[0].preview) == {"path": "***"}  # 钩子出错整值打码,不回退原文
 
 
 def test_ticket_replay_cannot_execute_twice():
@@ -856,5 +845,158 @@ def test_consume_only_matches_the_registered_request():
     gate.review(real)
     gate.resolve(real.id, Decision.APPROVED)
     forged = ApprovalRequest(code=real.code, id=real.id, tool=real.tool, scope="bob")
+    assert gate.consume(forged) is False
+    assert gate.consume(real) is True
+
+
+# ---- 第三轮修改 3:审批人看得到要批准的完整内容 ----------------------------------------------------
+
+
+def _one_tool(name, properties, func):
+    return FunctionTool(name, "", {"type": "object", "properties": properties}, func=func)
+
+
+def _pending_request(tool, args, gate=None, **mw_kw):
+    gate = gate or ManualApprovalGate()
+    agent = MiddlewareAgent(
+        "mw",
+        FunctionCallingAgent("fc", ScriptedToolCallProvider([(tool.name, args)]), [tool]),
+        [ApprovalMiddleware(gate, gated_tools=[tool.name], scope="s", **mw_kw)],
+    )
+    with pytest.raises(ApprovalPending) as ei:
+        agent.step("t")
+    [request] = [r for r in gate.pending() if r.id == ei.value.context["request_id"]]
+    return request
+
+
+def test_review_r2_tail_difference_is_visible_in_preview_and_full_arguments():
+    # 复审 P:只在 200 字符之后不同的两次调用 preview 逐字节相同(批准 X 只放行 X,但审批人分不清 X 和 Y)。
+    hits: list[str] = []
+    tool = _one_tool("run_sql", {"query": {"type": "string"}}, lambda query: hits.append(query))
+    benign = "SELECT name FROM users WHERE id = 1 " + " " * 200
+    evil = benign + "; DROP TABLE users"
+    gate = ManualApprovalGate()
+    a = _pending_request(tool, {"query": benign}, gate)
+    b = _pending_request(tool, {"query": evil}, gate)
+    assert a.preview != b.preview
+    assert a.arguments() == {"query": benign} and b.arguments() == {"query": evil}
+    assert hits == []
+
+
+def test_preview_truncates_once_and_reports_the_real_omission():
+    # 复审:预览被截断了两次,「省略了多少字符」的提示永远显示 +9。
+    tool = _one_tool("note", {"memo": {"type": "string"}}, lambda memo: "ok")
+    for size in (500, 5000):
+        request = _pending_request(tool, {"memo": "x" * size})
+        text = dict(request.preview)["memo"]
+        rendered = repr("x" * size)
+        assert text.startswith(rendered[:200])
+        assert f"省略 {len(rendered) - 200} 字符" in text
+        assert text.count("省略") == 1
+
+
+def test_review_r2_model_arguments_are_not_redacted_by_default():
+    # 复审:按键名子串打码 —— author / passage / max_tokens / session_name 的值都被打成 ***,而嵌套 dict 的键是
+    # 模型自己定的,起名 to_token 就能把收款账户藏起来。缺省不打码:审批人要看到真实内容才能做决定。
+    tool = _one_tool(
+        "post",
+        {
+            "author": {"type": "string"},
+            "passage": {"type": "string"},
+            "session_name": {"type": "string"},
+            "max_tokens": {"type": "integer"},
+            "body": {"type": "object"},
+        },
+        lambda **kw: "ok",
+    )
+    args = {
+        "author": "attacker@evil",
+        "passage": "wire $1M",
+        "session_name": "s",
+        "max_tokens": 5,
+        "body": {"amount": 1, "to_token": "ATTACKER-ACCT"},
+    }
+    preview = dict(_pending_request(tool, args).preview)
+    assert "attacker@evil" in preview["author"] and "wire $1M" in preview["passage"]
+    assert preview["max_tokens"] == "5" and "'s'" == preview["session_name"]
+    assert "ATTACKER-ACCT" in preview["body"]
+
+
+def test_explicit_sensitive_args_mask_preview_but_keep_values_distinguishable():
+    tool = _one_tool(
+        "login",
+        {"user": {"type": "string"}, "password": {"type": "string"}, "body": {"type": "object"}},
+        lambda **kw: "ok",
+    )
+    gate = ManualApprovalGate()
+    sensitive = {"login": ["password", "body.to_token"]}
+    a = _pending_request(
+        tool,
+        {"user": "u", "password": "hunter2", "body": {"to_token": "ACCT-1", "n": 1}},
+        gate,
+        sensitive_args=sensitive,
+    )
+    b = _pending_request(
+        tool,
+        {"user": "u", "password": "hunter3", "body": {"to_token": "ACCT-2", "n": 1}},
+        gate,
+        sensitive_args=sensitive,
+    )
+    pa, pb = dict(a.preview), dict(b.preview)
+    for preview in (pa, pb):
+        assert preview["password"].startswith("***")
+        assert "hunter" not in preview["password"] and "ACCT" not in preview["body"]
+        assert '"n": 1' in preview["body"]  # 只打码声明的路径
+    assert pa["password"] != pb["password"] and pa["body"] != pb["body"]  # 打码后仍可区分
+    assert a.arguments()["password"] == "hunter2"  # 完整参数不打码:审批人据它做决定
+
+
+def test_require_approval_accepts_sensitive_args():
+    gate = ManualApprovalGate()
+    tool = require_approval(
+        _one_tool("login", {"password": {"type": "string"}}, lambda password: "ok"),
+        gate,
+        scope="s",
+        sensitive_args=["password"],
+    )
+    agent = FunctionCallingAgent(
+        "fc", ScriptedToolCallProvider([("login", {"password": "hunter2"})]), [tool]
+    )
+    with pytest.raises(ApprovalPending):
+        agent.step("t")
+    [request] = gate.pending()
+    assert "hunter2" not in dict(request.preview)["password"]
+
+
+def test_full_arguments_never_reach_trace_or_repr():
+    sink = InProcessPrivacyTraceSink()
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    agent = _guarded(_fc_calls(deleter, 1, path=_SENTINEL), gate)
+    with pytest.raises(ApprovalPending):
+        agent.step("t", trace=sink)
+    [request] = gate.pending()
+    assert request.arguments() == {"path": _SENTINEL}
+    assert _SENTINEL not in repr(request) and _SENTINEL not in str(request)
+    assert _SENTINEL not in repr(gate)
+    for event in sink.events:
+        for value in event.fields.values():
+            assert _SENTINEL not in str(value)
+
+
+def test_consume_requires_the_registered_full_arguments():
+    gate = ManualApprovalGate()
+    real = make_approval_request("tool_call", "rm", {"p": "/a"}, bind_values=True, scope="s")
+    gate.review(real)
+    gate.resolve(real.id, Decision.APPROVED)
+    other = make_approval_request("tool_call", "rm", {"p": "/b"}, bind_values=True, scope="s")
+    forged = ApprovalRequest(
+        code=real.code,
+        id=real.id,
+        tool=real.tool,
+        arg_fingerprint=real.arg_fingerprint,
+        arg_count=real.arg_count,
+        scope=real.scope,
+        canonical_arguments=other.canonical_arguments,
+    )
     assert gate.consume(forged) is False
     assert gate.consume(real) is True
