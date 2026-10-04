@@ -30,10 +30,20 @@
 - `FunctionCallingAgent` / `ToolUsingAgent` / `DeepResearchAgent` 传入重名工具时构造即抛
   `ValueError`,不再静默覆盖。
 
+- `FailoverProvider` / `StreamingFailoverProvider`:不可重试错(`NonRetryableProviderError`,
+  4xx 坏请求)不再打遍整个池子并冷却全部下游,而是直接抛给调用方;游标 / 冷却表加锁。
+- 各适配器按 vendor 状态码设 `retryable`:400 / 413 / 422 → `NonRetryableProviderError`;
+  其余(网络 / 超时 / 408 / 429 / 5xx / 鉴权类)→ `ProviderError(retryable=True)`。
+- `MiddlewareAgent` 步序取号加锁,多线程共享时不重号。
+- usage 不再丢失:`FunctionCallingAgent` 多轮累加;`ChainAgent` 累加各段 usage 并拼接 artifacts;
+  `AgentTool` 经 `ToolResult` 透传子 agent 的 usage / artifacts,`ToolUsingAgent` 汇总。
+
 ### Added
 
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
+- `spineagent.llm.errors.NonRetryableProviderError` / `provider_error_from`;
+  `spineagent.agent.agent.merge_usage`;`ToolResult.usage` / `ToolResult.artifacts`(可选字段)。
 - `spineagent.agent.trust`:`TaskText` / `untrusted` / `compose` / `lines_with_trust`;
   `SyntaxToolPolicy(parse_untrusted=...)`;`POLICY_INVARIANTS` 新增
   `untrusted_data_is_never_an_instruction`。
@@ -64,5 +74,8 @@
 - `FunctionCallingAgent` 缺省不再让工具异常冒泡(需要旧行为传 `fail_fast=True`)。
 - `McpClientTool` 缺结果键时抛 `McpProtocolError` 而非 `KeyError`。
 - 重名工具从「后者静默覆盖前者」变为构造期 `ValueError`。
+- 适配器抛出的 `ProviderError` 现在带 `retryable=True`(此前为类默认 False);坏请求改抛子类
+  `NonRetryableProviderError`(仍是 `ProviderError`),`FailoverProvider` 对它不回退。
+- `FunctionCallingAgent` 的 `usage` 由「末轮」改为「各轮累加」。
 - `SyntaxToolPolicy` 缺省不再解析被标为数据的文本:依赖「pipeline 上游输出驱动下游执行工具」的
   调用方需显式 `SyntaxToolPolicy(parse_untrusted=True)`;`SummaryMiddleware` 的摘要也属数据。

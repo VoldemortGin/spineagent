@@ -112,6 +112,18 @@ class FunctionAgent:
         return result
 
 
+def merge_usage(*usages: dict[str, int] | None) -> dict[str, int] | None:
+    """逐键累加多份 usage(多轮 / 多段 / 多次工具调用);全部为 None 时返回 None(与「无 usage」一致)。"""
+    present = [u for u in usages if u is not None]
+    if not present:
+        return None
+    merged: dict[str, int] = {}
+    for usage in present:
+        for key, value in usage.items():
+            merged[key] = merged.get(key, 0) + value
+    return merged
+
+
 def _emit_step(trace: TraceSink | None, name: str, task: str, result: AgentResult) -> None:
     """记一条隐私安全的步级 trace:只记 agent 名 + 长度 + token 数,绝不记正文。"""
     if trace is None:

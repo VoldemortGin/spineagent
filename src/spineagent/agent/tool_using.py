@@ -23,8 +23,9 @@ from collections.abc import Iterable
 
 from corespine.observability.trace import TraceSink
 
-from spineagent.agent.agent import AgentResult
+from spineagent.agent.agent import AgentResult, merge_usage
 from spineagent.agent.approval import enforce_tool_approval
+from spineagent.agent.artifact import ArtifactRef
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
 from spineagent.agent.trust import compose, untrusted
 from spineagent.tools.tool import Tool, index_tools_by_name
@@ -57,22 +58,27 @@ class ToolUsingAgent:
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
         history: list[Observation] = []
+        # 工具(如 AgentTool 背后的子 agent)透传上来的 usage / artifacts,按调用序汇总进本步结果。
+        usage: dict[str, int] | None = None
+        artifacts: list[ArtifactRef] = []
         while True:
             action = self._policy.decide(task, tools=self._tool_names, history=tuple(history))
             if isinstance(action, Finish):
                 _emit_finish(trace, self._name, len(history), action.answer)
-                return AgentResult(agent=self._name, output=action.answer)
+                return AgentResult(self._name, action.answer, usage, artifacts=tuple(artifacts))
             # ToolCall:已用满 max_steps 次工具调用,policy 还想再调 -> 触顶强制收尾。
             if len(history) >= self._max_steps:
                 answer = (history[-1].output if history else "") or _NO_OUTPUT
                 _emit_step_limit(trace, self._name, self._max_steps)
                 _emit_finish(trace, self._name, len(history), answer)
-                return AgentResult(agent=self._name, output=answer)
+                return AgentResult(self._name, answer, usage, artifacts=tuple(artifacts))
             # 把 $prev 替换为上一步观测输出后执行该工具,观测追加进历史。
             arg = _splice_prev(action.arg, history[-1].output if history else "")
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
             enforce_tool_approval(action.tool, {"arg": arg})
             result = self._tools[action.tool].run(arg)
+            usage = merge_usage(usage, result.usage)
+            artifacts.extend(result.artifacts)
             history.append(Observation(tool=action.tool, arg=arg, output=result.output))
             _emit_tool_step(trace, self._name, len(history) - 1, action.tool, arg, result.output)
 

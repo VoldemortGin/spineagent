@@ -35,7 +35,7 @@ from spineagent.llm._mapping import (
     normalize_openai_messages,
     unwrap_function_tool,
 )
-from spineagent.llm.errors import ProviderError
+from spineagent.llm.errors import provider_error_from
 
 _BOTO3_SDK_MODULE = "boto3"
 
@@ -88,7 +88,7 @@ class BedrockConverseProvider:
         try:
             response = self._client.converse(modelId=self._model, messages=convo, **kwargs)
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"Bedrock 调用失败:{exc}") from exc
+            raise provider_error_from(f"Bedrock 调用失败:{exc}", exc) from exc
         blocks = response["output"]["message"].get("content", []) or []
         text = "".join(b["text"] for b in blocks if "text" in b)
         tool_calls = tuple(

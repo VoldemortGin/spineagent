@@ -25,7 +25,7 @@ from corespine.errors import CorespineError
 from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
-from spineagent.agent.agent import AgentResult
+from spineagent.agent.agent import AgentResult, merge_usage
 from spineagent.agent.approval import ApprovalError, enforce_tool_approval
 from spineagent.tools.function_tool import FunctionTool, InvalidToolArguments
 from spineagent.tools.tool import index_tools_by_name
@@ -68,15 +68,16 @@ class FunctionCallingAgent:
         if self._system:
             messages.insert(0, {"role": "system", "content": self._system})
         schemas = [tool.schema() for tool in self._tools.values()] or None
-        last_usage: dict[str, int] | None = None
+        # usage 逐轮累加(工具轮的 token 同样要算;缺 usage 的轮不计)。
+        total_usage: dict[str, int] | None = None
         for index in range(self._max_steps):
             result = self._model.chat(messages, tools=schemas)
-            last_usage = _usage_dict(result.usage)
+            total_usage = merge_usage(total_usage, _usage_dict(result.usage))
             message = result.choices[0].message
             tool_calls = message.tool_calls or ()
             if not tool_calls:
                 _emit_finish(trace, self._name, index, message.content or "")
-                return AgentResult(self._name, message.content or "", usage=last_usage)
+                return AgentResult(self._name, message.content or "", usage=total_usage)
             # 把这一轮的 assistant(带 tool_calls)按 OpenAI 形状追加进对话历史。
             messages.append(
                 {
@@ -118,7 +119,7 @@ class FunctionCallingAgent:
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)
-        return AgentResult(self._name, _NO_OUTPUT, usage=last_usage)
+        return AgentResult(self._name, _NO_OUTPUT, usage=total_usage)
 
     def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> str:
         """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。"""

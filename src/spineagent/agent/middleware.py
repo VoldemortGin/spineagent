@@ -10,6 +10,7 @@
 conformance.py 的 middleware 组:包裹后 trace 零正文泄漏)。离线内置四件套全部零网络、确定性。
 """
 
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
@@ -71,14 +72,17 @@ class MiddlewareAgent:
         self._agent = agent
         self._middlewares = list(middlewares)
         self._step_index = 0
+        self._step_lock = threading.Lock()  # 跨线程共享时步序取号原子(不丢自增、不重号)
 
     @property
     def name(self) -> str:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
-        ctx = StepContext(agent=self._name, task=task, trace=trace, step=self._step_index)
-        self._step_index += 1
+        with self._step_lock:
+            step_index = self._step_index
+            self._step_index += 1
+        ctx = StepContext(agent=self._name, task=task, trace=trace, step=step_index)
         try:
             for mw in self._middlewares:
                 mw.before_step(ctx)

@@ -344,7 +344,7 @@ def test_function_tool_decorator_maps_list_and_dict_annotations():
     assert props["mapping"]["type"] == "object"
 
 
-# ---- 并行工具调用 / usage 取末轮 ------------------------------------------------------------
+# ---- 并行工具调用 / usage 逐轮累加 ------------------------------------------------------------
 
 
 def test_parallel_tool_calls_in_one_turn_both_executed_and_id_aligned():
@@ -390,22 +390,35 @@ def test_parallel_tool_calls_in_one_turn_both_executed_and_id_aligned():
     assert len(assistant_with_calls[0]["tool_calls"]) == 2  # 该轮含 2 个并行调用
 
 
-def test_usage_reflects_final_turn_even_when_final_is_none():
-    # 循环每轮覆写 last_usage:首轮工具调用有 usage,末轮文本 usage=None → 末轮的 None 取胜。
+def test_usage_accumulates_across_turns():
+    # 多轮 chat 的 usage 逐轮累加(修复前只留末轮,工具轮的 token 被丢);缺 usage 的轮按 0 计。
     echo = FunctionTool(
         "echo",
         "",
         {"type": "object", "properties": {"text": {"type": "string"}}},
         func=lambda text: text,
     )
+    first = _tool("c1", "echo", '{"text": "x"}')
+    first = ChatCompletion(choices=first.choices, usage=Usage(10, 1, 11))
+    second = _tool("c2", "echo", '{"text": "y"}')  # 这一轮没有 usage
+    final = ChatCompletion(
+        choices=(Choice(index=0, message=ResponseMessage(role="assistant", content="fin")),),
+        usage=Usage(prompt_tokens=20, completion_tokens=2, total_tokens=22),
+    )
+    model = _ScriptedProvider(first, second, final)
+    result = FunctionCallingAgent("u", model, [echo]).step("go")
+    assert result.output == "fin"
+    assert result.usage == {"prompt_tokens": 30, "completion_tokens": 3, "total_tokens": 33}
+
+
+def test_usage_is_none_when_no_turn_reports_it():
+    echo = FunctionTool("echo", "", {}, func=lambda text: text)
     final = ChatCompletion(
         choices=(Choice(index=0, message=ResponseMessage(role="assistant", content="fin")),),
         usage=None,
     )
     model = _ScriptedProvider(_tool("c1", "echo", '{"text": "x"}'), final)
-    result = FunctionCallingAgent("u", model, [echo]).step("go")
-    assert result.output == "fin"
-    assert result.usage is None  # 末轮 None 覆写早轮 usage
+    assert FunctionCallingAgent("u", model, [echo]).step("go").usage is None
 
 
 # ---- 工具执行失败路径:异常归一成 tool 消息喂回,不让整轮崩溃 ------------------------------

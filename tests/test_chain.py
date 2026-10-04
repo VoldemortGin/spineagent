@@ -72,3 +72,44 @@ def test_chain_step_trace_is_privacy_safe():
     assert fields["stages"] == 3
     for value in fields.values():
         assert "机密正文" not in str(value)
+
+
+class _Metered:
+    """固定 usage / artifacts 的 agent(测组合层透传)。"""
+
+    def __init__(self, name: str, tokens: int, artifact: str | None = None) -> None:
+        self.name = name
+        self._tokens = tokens
+        self._artifact = artifact
+
+    def step(self, task, *, trace=None):
+        from spineagent.agent.agent import AgentResult
+        from spineagent.agent.artifact import ArtifactRef
+
+        refs = (
+            (
+                ArtifactRef(
+                    sink="mem",
+                    key=self._artifact,
+                    name=self._artifact,
+                    mime="text/plain",
+                    size=1,
+                    producer=self.name,
+                ),
+            )
+            if self._artifact
+            else ()
+        )
+        usage = {
+            "prompt_tokens": self._tokens,
+            "completion_tokens": 1,
+            "total_tokens": self._tokens + 1,
+        }
+        return AgentResult(self.name, f"{self.name}:{task}", usage=usage, artifacts=refs)
+
+
+def test_chain_accumulates_usage_and_passes_artifacts_through():
+    chain = ChainAgent("c", [_Metered("a", 10, "a.txt"), _Metered("b", 5, "b.txt")])
+    result = chain.step("go")
+    assert result.usage == {"prompt_tokens": 15, "completion_tokens": 2, "total_tokens": 17}
+    assert [ref.name for ref in result.artifacts] == ["a.txt", "b.txt"]

@@ -55,7 +55,7 @@ from spineagent.llm._mapping import (
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
 from spineagent.llm.cohere_provider import CohereProvider
-from spineagent.llm.errors import ProviderError
+from spineagent.llm.errors import provider_error_from
 from spineagent.llm.failover_provider import make_failover_provider
 from spineagent.llm.gemini_provider import GeminiProvider
 
@@ -128,7 +128,7 @@ class AnthropicProvider:
                 **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"Anthropic 调用失败:{exc}") from exc
+            raise provider_error_from(f"Anthropic 调用失败:{exc}", exc) from exc
         text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         tool_calls = tuple(
             ToolCall(id=b.id, function=FunctionCall(name=b.name, arguments=json.dumps(b.input)))
@@ -179,7 +179,7 @@ class AnthropicProvider:
                 **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"Anthropic 流式调用失败:{exc}") from exc
+            raise provider_error_from(f"Anthropic 流式调用失败:{exc}", exc) from exc
 
         for event in stream:
             etype = getattr(event, "type", None)
@@ -251,7 +251,7 @@ class OpenAICompatProvider:
                 **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"OpenAI 兼容端点调用失败:{exc}") from exc
+            raise provider_error_from(f"OpenAI 兼容端点调用失败:{exc}", exc) from exc
         choices = tuple(
             Choice(
                 index=getattr(c, "index", i),
@@ -312,7 +312,7 @@ class OpenAICompatProvider:
                 **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"OpenAI 兼容端点流式调用失败:{exc}") from exc
+            raise provider_error_from(f"OpenAI 兼容端点流式调用失败:{exc}", exc) from exc
         for chunk in stream:
             yield ChatCompletionChunk(
                 choices=tuple(

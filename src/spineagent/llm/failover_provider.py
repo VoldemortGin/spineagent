@@ -15,7 +15,12 @@
 
 【只对可重试错回退,绝不吞逻辑错】:catch 的是显式的 `retryable_errors`(默认 ProviderError),
 【不】用裸 `except Exception`。KeyError / TypeError 等程序 bug 照常上抛、立即失败,绝不被容错外衣
-掩盖成「换一家再试」——那只会把真正的代码缺陷藏进重试噪声里。
+掩盖成「换一家再试」——那只会把真正的代码缺陷藏进重试噪声里。适配器判定为坏请求的
+`NonRetryableProviderError`(4xx 坏请求)同样【不回退、不冷却】,直接抛给调用方:换哪家都一样失败,
+回退只会把一条坏请求打遍整个池子并把健康下游全部冷却。
+
+【线程安全】:游标与冷却表的读改写在一把锁内完成(DeepResearchAgent 等会跨线程共享 provider);
+下游调用本身在锁外进行,不串行化并发请求。
 
 【流式的诚实】:仅当【全部】下游都实现 `StreamingLLMProvider` 时,工厂才返回带 `stream_chat` 的
 `StreamingFailoverProvider`;混编(有下游不支持流式)时返回不带 `stream_chat` 的基类,`isinstance
@@ -28,6 +33,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, cast
@@ -39,7 +45,7 @@ from corespine.llm.provider import (
     StreamingLLMProvider,
 )
 
-from spineagent.llm.errors import ProviderError
+from spineagent.llm.errors import NonRetryableProviderError, ProviderError
 
 # 冷却窗口默认时长(秒):某下游撞可重试错后,这段时间内的调用跳过它。30s 是限流/瞬时故障的
 # 常见恢复量级,既不会长到白白闲置一家、也不会短到刚冷却就又去打它。
@@ -101,6 +107,8 @@ class FailoverProvider:
         self._cooldown_until = [0.0] * len(providers)
         # 轮询游标:下一次调用【优先】从这个下游起试,每次成功后前移一位。
         self._cursor = 0
+        # 守护 _cursor / _cooldown_until 的读改写(跨线程共享时不丢状态)。
+        self._lock = threading.Lock()
 
     def _attempt_order(self, now: float) -> list[int]:
         """本次调用的下游尝试序:先【未冷却】的(从游标起轮询),再【冷却中】的(强制兜底)。
@@ -108,21 +116,25 @@ class FailoverProvider:
         非冷却段实现策略 (a) 轮询分摊;冷却段附在末尾实现策略 (c) 的强制回退——冷却中的下游也许
         已自愈,全部未冷却的都失败时,宁可再赌一把强制试它们,也不直接放弃。每个下游本次至多试一次。
         """
-        rotated = [(self._cursor + i) % len(self._providers) for i in range(len(self._providers))]
-        not_cooled = [i for i in rotated if now >= self._cooldown_until[i]]
-        cooled = [i for i in rotated if now < self._cooldown_until[i]]
+        with self._lock:
+            n = len(self._providers)
+            rotated = [(self._cursor + i) % n for i in range(n)]
+            not_cooled = [i for i in rotated if now >= self._cooldown_until[i]]
+            cooled = [i for i in rotated if now < self._cooldown_until[i]]
         return not_cooled + cooled
 
     def _on_success(self, idx: int) -> None:
         """某下游成功:游标前移到它之后(轮询),并清掉它的冷却(已证明恢复)。"""
-        self._cooldown_until[idx] = 0.0
-        self._cursor = (idx + 1) % len(self._providers)
+        with self._lock:
+            self._cooldown_until[idx] = 0.0
+            self._cursor = (idx + 1) % len(self._providers)
 
     def _on_failure(
         self, idx: int, exc: BaseException, now: float, failures: dict[int, str]
     ) -> None:
         """某下游撞可重试错:记录(脱敏)原因并置其冷却截止时刻。"""
-        self._cooldown_until[idx] = now + self._cooldown_seconds
+        with self._lock:
+            self._cooldown_until[idx] = now + self._cooldown_seconds
         label = type(self._providers[idx]).__name__
         failures[idx] = f"[{idx}] {label}: {_redact_credentials(str(exc))}"
 
@@ -139,13 +151,15 @@ class FailoverProvider:
         """按 `_attempt_order` 逐个下游试 chat;首个成功即返回,全失败则抛聚合错误。
 
         只 catch `retryable_errors`(默认 ProviderError):可重试错 → 记录 + 冷却 + 试下一家;
-        其它异常(逻辑 bug)不 catch,照常上抛、立即失败,绝不被容错掩盖。
+        坏请求(NonRetryableProviderError)与其它异常(逻辑 bug)照常上抛、立即失败,不冷却。
         """
         now = self._now()
         failures: dict[int, str] = {}
         for idx in self._attempt_order(now):
             try:
                 result = self._providers[idx].chat(messages, tools=tools)
+            except NonRetryableProviderError:
+                raise
             except self._retryable_errors as exc:
                 self._on_failure(idx, exc, now, failures)
                 continue
@@ -182,6 +196,8 @@ class StreamingFailoverProvider(FailoverProvider):
             except StopIteration:  # 下游合法地吐了个空流:算成功,推进游标后正常结束
                 self._on_success(idx)
                 return
+            except NonRetryableProviderError:
+                raise
             except self._retryable_errors as exc:
                 self._on_failure(idx, exc, now, failures)
                 continue

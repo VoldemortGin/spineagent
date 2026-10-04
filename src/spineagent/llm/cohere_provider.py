@@ -25,7 +25,7 @@ from corespine.llm.provider import (
 )
 from corespine.seam.registry import lazy_extra_import
 
-from spineagent.llm.errors import ProviderError
+from spineagent.llm.errors import provider_error_from
 
 _COHERE_SDK_MODULE = "cohere"
 
@@ -73,7 +73,7 @@ class CohereProvider:
         try:
             response = self._client.chat(model=self._model, messages=messages, **kwargs)
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"Cohere 调用失败:{exc}") from exc
+            raise provider_error_from(f"Cohere 调用失败:{exc}", exc) from exc
         message = response.message
         text = "".join(
             b.text

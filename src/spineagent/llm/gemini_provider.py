@@ -35,7 +35,7 @@ from spineagent.llm._mapping import (
     normalize_openai_messages,
     unwrap_function_tool,
 )
-from spineagent.llm.errors import ProviderError
+from spineagent.llm.errors import provider_error_from
 
 _GEMINI_SDK_MODULE = "google.genai"
 
@@ -91,7 +91,7 @@ class GeminiProvider:
                 model=self._model, contents=contents, config=config or None
             )
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
-            raise ProviderError(f"Gemini 调用失败:{exc}") from exc
+            raise provider_error_from(f"Gemini 调用失败:{exc}", exc) from exc
         candidate = response.candidates[0]
         parts = getattr(candidate.content, "parts", None) or []
         text = "".join(p.text for p in parts if getattr(p, "text", None))

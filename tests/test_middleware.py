@@ -107,3 +107,33 @@ def test_registry_makes_all_four_builtins():
         mw = middlewares.make(name)
         assert hasattr(mw, "before_step") and hasattr(mw, "after_step")
     assert {"token_usage", "summary", "dynamic_tool", "attachment"} <= set(middlewares.names())
+
+
+def test_concurrent_steps_get_unique_step_indices():
+    # MiddlewareAgent 的步序在多线程共享时也必须单调唯一(不丢自增、不重号)。
+    import sys
+    import threading
+
+    seen: list[int] = []
+
+    class Recorder:
+        def before_step(self, ctx):
+            seen.append(ctx.step)
+
+        def after_step(self, ctx, result):
+            return result
+
+    agent = MiddlewareAgent("m", FunctionAgent("f", lambda t: t), [Recorder()])
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [
+            threading.Thread(target=lambda: [agent.step("x") for _ in range(300)]) for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old)
+    assert sorted(seen) == list(range(8 * 300))

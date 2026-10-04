@@ -17,15 +17,22 @@ from typing import Protocol, runtime_checkable
 
 from corespine.seam.registry import Registry
 
+from spineagent.agent.artifact import ArtifactRef
 from spineagent.sandbox.seam import _guard_expensive_binop, _LimitExceeded
 
 
 @dataclass(frozen=True)
 class ToolResult:
-    """工具调用结果:产出文本 + 来源工具名(provenance,可溯源到产出它的工具)。"""
+    """工具调用结果:产出文本 + 来源工具名(provenance,可溯源到产出它的工具)。
+
+    usage / artifacts 可选:工具背后若是一个 agent(AgentTool),其 token 用量与交付物引用经此透传给
+    调用它的 agent 循环;普通工具缺省 None / 空 tuple,无感。
+    """
 
     tool: str
     output: str
+    usage: dict[str, int] | None = None
+    artifacts: tuple[ArtifactRef, ...] = ()
 
 
 @runtime_checkable

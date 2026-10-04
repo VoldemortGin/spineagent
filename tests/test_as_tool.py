@@ -46,3 +46,26 @@ def test_supervisor_routes_among_multiple_subagents():
     )
     # 点名 rev:路由到反转子 agent(而非第一个 upper)。
     assert "cba" in supervisor.step("rev: abc").output
+
+
+def test_agent_tool_passes_usage_and_artifacts_to_the_calling_agent():
+    from spineagent.agent.agent import AgentResult
+    from spineagent.agent.artifact import ArtifactRef
+
+    ref = ArtifactRef(sink="mem", key="k", name="r.txt", mime="text/plain", size=1, producer="sub")
+
+    class Sub:
+        name = "sub"
+
+        def step(self, task, *, trace=None):
+            usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            return AgentResult("sub", "ok", usage=usage, artifacts=(ref,))
+
+    tool = AgentTool(Sub())
+    tr = tool.run("x")
+    assert tr.usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    assert tr.artifacts == (ref,)
+    supervisor = ToolUsingAgent("sup", SyntaxToolPolicy(), [tool])
+    result = supervisor.step("sub: a\nsub: b")
+    assert result.usage == {"prompt_tokens": 14, "completion_tokens": 6, "total_tokens": 20}
+    assert result.artifacts == (ref, ref)

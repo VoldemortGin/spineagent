@@ -16,7 +16,7 @@ from collections.abc import Iterable
 
 from corespine.observability.trace import TraceSink
 
-from spineagent.agent.agent import Agent, AgentResult
+from spineagent.agent.agent import Agent, AgentResult, merge_usage
 from spineagent.orchestration.coordinator import Coordinator
 
 
@@ -37,7 +37,13 @@ class ChainAgent:
         # 末端 agent 的输出即 chain 的产出;空链(无 agent)退化为恒等透传。
         output = results[-1].output if results else task
         _emit_chain_step(trace, self._name, len(results), output)
-        return AgentResult(agent=self._name, output=output)
+        # 组合层透传:各段 usage 累加、artifacts 按段序拼接(不丢子 agent 的元数据)。
+        return AgentResult(
+            agent=self._name,
+            output=output,
+            usage=merge_usage(*(r.usage for r in results)),
+            artifacts=tuple(ref for r in results for ref in r.artifacts),
+        )
 
 
 def _emit_chain_step(trace: TraceSink | None, name: str, stages: int, output: str) -> None:

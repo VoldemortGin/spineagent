@@ -15,7 +15,7 @@ from corespine.llm.provider import (
     StreamingLLMProvider,
 )
 
-from spineagent.llm.errors import ProviderError
+from spineagent.llm.errors import NonRetryableProviderError, ProviderError
 from spineagent.llm.failover_provider import (
     FailoverExhaustedError,
     FailoverProvider,
@@ -259,3 +259,114 @@ def test_registry_builds_failover_from_config():
     assert isinstance(fp, FailoverProvider)
     assert fp._cooldown_seconds == 5.0
     assert fp.chat(_MSGS).choices[0].message.content, "经注册表装配的 failover 应可正常 chat"
+
+
+# ---- 不可重试错(4xx 坏请求)不回退、不冷却;适配器按状态码分类 -------------------------------
+
+
+class _BadRequest:
+    """模拟一条坏请求:适配器会把 vendor 400 归一成不可重试的 ProviderError。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None):
+        self.calls += 1
+        raise NonRetryableProviderError("400 invalid request", status=400)
+
+
+def test_non_retryable_provider_error_is_raised_without_failover_or_cooldown():
+    bad, a, b = _BadRequest(), _Recording("a"), _Recording("b")
+    fp = FailoverProvider([bad, a, b], now_fn=_FakeClock())
+    with pytest.raises(NonRetryableProviderError):
+        fp.chat(_MSGS)
+    assert (bad.calls, a.calls, b.calls) == (1, 0, 0), "坏请求不该打遍整个池子"
+    assert all(t == 0.0 for t in fp._cooldown_until), "坏请求不该冷却任何下游"
+
+
+def test_stream_non_retryable_error_is_raised_without_failover():
+    class _BadStream(_BadRequest):
+        def stream_chat(self, messages, *, tools=None):
+            self.calls += 1
+            raise NonRetryableProviderError("400", status=400)
+            yield  # pragma: no cover
+
+    bad = _BadStream()
+    good = _BadStream()
+    fp = StreamingFailoverProvider([bad, good], now_fn=_FakeClock())
+    with pytest.raises(NonRetryableProviderError):
+        list(fp.stream_chat(_MSGS))
+    assert (bad.calls, good.calls) == (1, 0)
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(400, False), (413, False), (422, False), (408, True), (429, True), (500, True), (503, True)],
+)
+def test_adapter_classifies_vendor_errors_by_status(status, retryable):
+    from types import SimpleNamespace
+
+    from spineagent.llm.provider import OpenAICompatProvider
+
+    def create(**kwargs):
+        raise _StatusError(status)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with pytest.raises(ProviderError) as ei:
+        OpenAICompatProvider("m", client=client).chat(_MSGS)
+    assert ei.value.retryable is retryable
+    assert isinstance(ei.value, NonRetryableProviderError) is (not retryable)
+
+
+def test_adapter_treats_unknown_failures_as_retryable():
+    from types import SimpleNamespace
+
+    from spineagent.llm.provider import OpenAICompatProvider
+
+    def create(**kwargs):
+        raise ConnectionError("reset")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with pytest.raises(ProviderError) as ei:
+        OpenAICompatProvider("m", client=client).chat(_MSGS)
+    assert ei.value.retryable is True
+
+
+# ---- 并发:多线程共享同一个 FailoverProvider 不丢状态、不抛异常 -----------------------------
+
+
+def test_concurrent_calls_share_state_safely():
+    import sys
+    import threading
+
+    downstreams = [_Recording(f"p{i}") for i in range(3)]
+    fp = FailoverProvider(downstreams, now_fn=_FakeClock())
+    errors: list[BaseException] = []
+    per_thread = 300
+
+    def hammer() -> None:
+        try:
+            for _ in range(per_thread):
+                fp.chat(_MSGS)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old)
+    assert errors == []
+    assert sum(d.calls for d in downstreams) == 8 * per_thread
+    assert 0 <= fp._cursor < 3
