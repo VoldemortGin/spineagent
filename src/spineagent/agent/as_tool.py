@@ -14,7 +14,7 @@ run(arg) 即对子 agent 跑一步、取其输出包成带 provenance 的 ToolRe
 
 from spineagent.agent.agent import Agent
 from spineagent.agent.trust import untrusted
-from spineagent.tools.tool import ToolResult
+from spineagent.tools.tool import ToolResult, reachable_tool_names
 
 
 class AgentTool:
@@ -33,3 +33,6 @@ class AgentTool:
             usage=result.usage,
             artifacts=result.artifacts,
         )
+
+    def tool_inventory(self) -> frozenset[str] | None:
+        return reachable_tool_names(self._agent)

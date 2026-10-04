@@ -20,6 +20,12 @@
   截住。深嵌套 env 不再让 `run()` 抛 `RecursionError`。
 - `CalcTool`:表达式长度 ≤ 4096、嵌套深度 ≤ 100,幂 / 乘法结果位数复用 sandbox 的昂贵二元运算
   守卫;越界立即抛 `ValueError`。
+- 审批的批准语义改为安全边界(ADR 0002 修订):批准**缺省一次性消费**(执行时核销;`resolve(uses=N)`
+  放行 N 次,`uses=None` 为显式可选的旧幂等模式);请求绑定调用方作用域(`approval_scope` /
+  `ApprovalMiddleware(scope=)` / `require_approval(scope=)`,缺省每次 step 一个新作用域),A 的批准对 B 无效;
+  `ManualApprovalGate.resolve` 只接受已登记、未过期的请求(不能离线算出 id 预先批准);请求表有上限与过期;
+  `pending()` 的条目带脱敏 + 截断的参数预览(只给审批人,不进 trace);受审批工具名含通配符 / 对应不到已知工具 /
+  与已注册工具仅大小写或分隔符不同时 fail-closed(`ApprovalConfigError`)。
 - 指令 / 数据分通道(ADR 0003):pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
   `McpClientTool` / `A2AAgentAdapter` 的返回都标为数据(`TaskText`),`SyntaxToolPolicy` 不再把其中的
   `<tool>: <arg>` 当指令执行。
@@ -53,6 +59,13 @@
 
 ### Added
 
+- 审批:`approval_scope` / `current_approval_scope`、`ConsumableApprovalGate`(`consume`)、`ApprovalConfigError`、
+  `UnknownApprovalRequest`、`default_redactor` / `Redactor`、`ApprovalRequest.scope` / `.preview`、
+  `ResumeTicket.scope`、`ManualApprovalGate(max_requests=, request_ttl=, now_fn=)` 与
+  `resolve(uses=, ttl_seconds=)`、`ApprovalMiddleware(scope=, redact=)`、`require_approval(scope=, redact=)`、
+  `enforce_tool_approval(target=, available=)`、`StepContext.inner_agent`、`reachable_tool_names` 与各 agent 的
+  `tool_inventory()`;conformance `approval_is_consumed_once` / `approval_is_scope_bound`,
+  `ToolExecutionHarness.run(scope=...)`。
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
 - `spineagent.llm.errors.NonRetryableProviderError` / `provider_error_from`;
@@ -93,6 +106,13 @@
 - 依赖「`ApprovalMiddleware` 在内层 agent 运行前、按 `ctx.tools` 抛 `ApprovalRejected` /
   `ApprovalPending`」的调用方:现在只有在受审批工具**真正被调用**时才抛;内层 agent 不调用该工具
   就不会抛。ManualApprovalGate 上旧的按「工具集」派生的 request id 不再出现,待审请求改为按调用派生。
+- **审批批准改为一次性消费**:此前一次 resolve 后同工具同参数的调用都放行;现在缺省只放行一次,要旧行为传
+  `resolve(..., uses=None)`。**resume 须回到同一作用域**:未设作用域时每次 step 是新作用域,resolve 后原样重跑会
+  得到新的待审请求;用 `with approval_scope(exc.context["scope"]):` / `ResumeTicket.scope`,或给
+  `ApprovalMiddleware(scope=会话 id)`。`ManualApprovalGate.resolve` 对未登记 / 已过期的 id 抛
+  `UnknownApprovalRequest`(此前可预先批准)。`gated_tools` 含通配符、对应不到已知工具、与已注册工具仅大小写 /
+  分隔符不同时抛 `ApprovalConfigError`(此前静默放行)。`ApprovalRequest` 新增 `scope` / `preview` 字段,
+  请求 id 在设了作用域时随作用域变化;`ToolExecutionHarness.run` 新增 `scope` 关键字参数。
 - `InProcessSandbox.run(timeout=...)` / `Limits.timeout_seconds` 从「只记录」变为强制:求值超过
   timeout(缺省 `DEFAULT_LIMITS` 为 5 秒)判失败。
 - `InProcessSandbox` 新增拒绝规则:`round(x, n)` 要求 `|n|` ≤ 2467(`limit_exceeded`);`int(s)` 要求

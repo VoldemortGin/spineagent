@@ -28,7 +28,7 @@ from spineagent.agent.approval import enforce_tool_approval
 from spineagent.agent.artifact import ArtifactRef
 from spineagent.agent.policy import Finish, Observation, ToolPolicy
 from spineagent.agent.trust import compose, untrusted
-from spineagent.tools.tool import Tool, index_tools_by_name
+from spineagent.tools.tool import Tool, index_tools_by_name, inventory_of_tools
 
 # 触顶 max_steps 又无任何观测可作答时的固定兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without finishing)"
@@ -75,12 +75,18 @@ class ToolUsingAgent:
             # 把 $prev 替换为上一步观测输出后执行该工具,观测追加进历史。
             arg = _splice_prev(action.arg, history[-1].output if history else "")
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
-            enforce_tool_approval(action.tool, {"arg": arg})
-            result = self._tools[action.tool].run(arg)
+            tool = self._tools[action.tool]
+            enforce_tool_approval(
+                action.tool, {"arg": arg}, target=tool, available=self._tool_names
+            )
+            result = tool.run(arg)
             usage = merge_usage(usage, result.usage)
             artifacts.extend(result.artifacts)
             history.append(Observation(tool=action.tool, arg=arg, output=result.output))
             _emit_tool_step(trace, self._name, len(history) - 1, action.tool, arg, result.output)
+
+    def tool_inventory(self) -> frozenset[str] | None:
+        return inventory_of_tools(self._tools.values())
 
 
 def _splice_prev(arg: str, prev: str) -> str:

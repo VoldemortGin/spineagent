@@ -339,25 +339,42 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 ## approval 缝(审批门 / Wait,ADR 0001 / 0002)
 
 - `Decision`(StrEnum):`APPROVED` / `REJECTED` / `PENDING`。
-- `ApprovalRequest(code: str, id: str, tool: str, arg_fingerprint: str = "", arg_count: int = 0)`:只带定位摘要,绝不含参数值。
-- `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False) -> ApprovalRequest`:
-  `bind_values=True` 时把规范化参数值的 sha256 折进 `id`(参数一变即新请求);执行闸用的就是它。
-- `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(幂等)。
-- `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,永不 pending。
-- `ManualApprovalGate(*, token_store=None)`:`review` 登记待审;`resolve(request_id, decision) -> str` 落决议并返回一次性
-  resume token;`redeem(token) -> ResumeTicket`(重放抛 `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`。
-- `ResumeTokenStore` / `InMemoryResumeTokenStore` / `ResumeTicket(request_id, decision)`。
-- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call")`:before_step 把审批配置压进当前上下文的审批作用域
-  (`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 + 规范化参数」review。缺省 `gated_tools` 空 = 零行为变化。
-- `enforce_tool_approval(tool: str, arguments: Mapping[str, object]) -> None`:执行点在调用工具前调它;
-  approved 返回,rejected 抛 `ApprovalRejected`,pending 抛 `ApprovalPending`(`context["request_id"]`),门抛异常或返回
-  非 `Decision` 抛 `ApprovalGateError`(fail-closed)。未配置审批时只读一次 contextvar。
-- `require_approval(tool: FunctionTool | Tool, gate, *, code="tool_call") -> FunctionTool | Tool`:把闸绑进工具本身,
-  不依赖上下文(裸线程 / 第三方 agent 也绕不过)。
+- `ApprovalRequest(code, id, tool, arg_fingerprint="", arg_count=0, scope="", preview=())`:定位摘要不含参数值;
+  `scope` 是作用域(已折进 `id`);`preview` 是给审批人看的 `(键, 脱敏截断后的值)` 元组(不进 trace / repr / 相等比较)。
+- `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False, scope="", redact=None) -> ApprovalRequest`:
+  `bind_values=True` 时把规范化参数值的 sha256 折进 `id`(参数一变即新请求);`scope` 折进 `id`;给 `redact` 才生成预览。
+- `default_redactor(key, value) -> str`:键名命中敏感词表(password / secret / token / api_key / auth / cookie / session …)
+  整值打码为 `***`,其余 repr / 紧凑 JSON 渲染并截断到 200 字符。脱敏钩子类型 `Redactor = Callable[[str, object], str]`。
+- `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(纯查询,幂等)。
+  `ConsumableApprovalGate`(Protocol):额外 `consume(request) -> bool`,执行闸在执行前核销一次放行额度。
+- `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,
+  永不 pending;不可核销(常驻策略放行)。
+- `ManualApprovalGate(*, token_store=None, max_requests=1024, request_ttl=3600.0, now_fn=time.monotonic)`:
+  `review` 登记待审(满了先清过期再淘汰最早的);`resolve(request_id, decision, *, uses=1, ttl_seconds=None) -> str`
+  只接受**已登记、未过期**的请求(否则 `UnknownApprovalRequest`),返回一次性 resume token;`uses=1` 缺省只放行一次、
+  `uses=N` 放行 N 次、`uses=None` 为显式可选的幂等模式(有效期内不限次,有重放风险);`consume(request) -> bool`;
+  `redeem(token) -> ResumeTicket`(重放抛 `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`(带预览)。
+- `ResumeTokenStore` / `InMemoryResumeTokenStore` / `ResumeTicket(request_id, decision, scope="")`:ticket 只是 resume
+  句柄(告诉你在哪个作用域重跑),不是执行凭据;批准在执行点核销,重放 ticket 不会多执行。
+- `approval_scope(scope: str)`(上下文管理器)/ `current_approval_scope() -> str | None`:设置 / 读取当前上下文的审批作用域。
+- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call", scope=None, redact=None)`:before_step 把审批配置与作用域
+  压进当前上下文(`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 + 规范化参数 + 作用域」review 并核销。
+  作用域:`scope=` > 外层 `approval_scope` > 缺省每次 step 新建(并传给嵌套 agent)。`gated_tools` 须是确切名字:含通配符 /
+  空名在构造时抛 `ApprovalConfigError`;能推断被包裹 agent 的工具清单时,对应不到已知工具的名字在首个工具执行前抛
+  `ApprovalConfigError`。缺省 `gated_tools` 空 = 零行为变化。
+- `enforce_tool_approval(tool: str, arguments, *, target=None, available=()) -> None`:执行点在调用工具前调它;
+  approved(并核销)返回,rejected 抛 `ApprovalRejected`,pending 抛 `ApprovalPending`(`context["request_id"]` /
+  `context["scope"]`),门抛异常或返回非 `Decision` 抛 `ApprovalGateError`(fail-closed)。`target` = 被执行的工具对象
+  (自带 `require_approval` 闸时同一个门不重复审);`available` = 本执行点已注册工具名(检测近似名写错)。
+- `require_approval(tool, gate, *, code="tool_call", scope=None, redact=None) -> FunctionTool | Tool`:把闸绑进工具对象
+  本身,不依赖上下文(裸线程 / 第三方 agent / 别名注册都绕不过)——**安全场景首选**。
+- `spineagent.tools.tool.reachable_tool_names(obj) -> frozenset[str] | None`:agent / 工具在本地能执行到的工具名(经可选
+  `tool_inventory()`);推断不了返回 `None`。
 - 错误:`ApprovalError`(基类)/ `ApprovalRejected`(`approval.rejected`,不可重试)/ `ApprovalPending`
-  (`approval.pending`,可重试)/ `ApprovalGateError`(`approval.gate_error`)/ `ApprovalConflict` / `InvalidResumeToken`。
-- 批准语义:决议绑定在内容派生的 request id 上并被记住(同工具 + 同参数的调用都放行);**不是**一次性消费。
-  恢复 = resolve 后原样重跑 step(会重放该步内已执行工具的副作用)。
+  (`approval.pending`,可重试)/ `ApprovalGateError`(`approval.gate_error`)/ `ApprovalConfigError`(`approval.config_error`,
+  也是 `ValueError`)/ `UnknownApprovalRequest`(`approval.unknown_request`)/ `ApprovalConflict` / `InvalidResumeToken`。
+- 批准语义(ADR 0002 决策 4):缺省一次性消费、绑定作用域、只能批准已存在的请求;恢复 = 在同一作用域里重跑 step
+  (`with approval_scope(exc.context["scope"]): agent.step(task)`)。
 - `approval_gates` / `make_approval_gate(spec, **kw)`:内置 `auto` / `manual`。
 
 ---
@@ -418,13 +435,15 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   `untrusted_data_is_never_an_instruction`。
 - `LLM_INVARIANTS` / `STREAMING_INVARIANTS`:OpenAI 形状 / finish_reason 取值域 / usage 非负 /
   tool_call 往返;流式各块形状 + 流式拼接 == 非流式。
-- `SANDBOX_INVARIANTS`:provenance / 产出非空 / 记账非负 / 上限生效 / 无网络出口 / `timeout_takes_effect`。
+- `SANDBOX_INVARIANTS`:provenance / 产出非空 / 记账非负 / 上限生效 / 无网络出口 / `timeout_takes_effect` /
+  `amplifying_expression_is_bounded`(值放大型表达式必须在超时量级内被拒 / 被终止)。
 - `SKILL_INVARIANTS`、`MIDDLEWARE_INVARIANTS`、`ARTIFACT_INVARIANTS`、`APPROVAL_INVARIANTS`。
 - `APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness]`(名 `approval_enforcement`):
   `unapproved_gated_tool_never_executes`、`rerun_does_not_bypass`、`changed_arguments_require_reapproval`、
-  `gate_failure_blocks_execution`、`ungated_tools_are_unaffected`——全部用带副作用计数的真实工具函数断言。
+  `approval_is_consumed_once`、`approval_is_scope_bound`、`gate_failure_blocks_execution`、
+  `ungated_tools_are_unaffected`——全部用带副作用计数的真实工具函数断言。
 - `TOOL_TRACE_INVARIANTS: InvariantPack[ToolExecutionHarness]`(名 `tool_trace`):`unknown_tool_name_is_not_traced`。
-- `ToolExecutionHarness`(Protocol):`run(calls, tools, *, gate, gated_tools=(), trace=None) -> None`,把一串
+- `ToolExecutionHarness`(Protocol):`run(calls, tools, *, gate, gated_tools=(), trace=None, scope=None) -> None`,把一串
   `(工具名, 参数值)` 交给某个会执行工具的 agent 真实跑一次;`ScriptedToolCallProvider(calls, *, final="done", usage=None)`:
   离线脚本化 provider,按对话中 assistant 条数回放 tool_calls(无状态、可重放、线程安全),供 harness 驱动
   `FunctionCallingAgent`。二者在 `spineagent.conformance`。

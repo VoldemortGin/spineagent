@@ -602,7 +602,8 @@ class ToolExecutionHarness(Protocol):
 
     - calls:要依次尝试的 (工具名, 单个字符串参数值);
     - tools:工具名 -> 真实副作用函数(参数值进、文本出),harness 把它包成该 agent 吃的工具形状;
-    - gate / gated_tools:审批配置;gate 为 None 表示未配置审批。
+    - gate / gated_tools:审批配置;gate 为 None 表示未配置审批;
+    - scope:审批作用域(None = 缺省,每次 run 一个新作用域;resume 须在同一作用域里重跑)。
     审批的拒绝 / 挂起 / 闸故障以异常形式冒出(ApprovalRejected / ApprovalPending / ApprovalGateError)。
     """
 
@@ -614,6 +615,7 @@ class ToolExecutionHarness(Protocol):
         gate: ApprovalGate | None,
         gated_tools: Sequence[str] = (),
         trace: TraceSink | None = None,
+        scope: str | None = None,
     ) -> None: ...
 
 
@@ -643,9 +645,10 @@ def _expect_approval_error(
     calls: Sequence[tuple[str, str]],
     tools: Mapping[str, Callable[[str], str]],
     gate: ApprovalGate,
+    scope: str | None = None,
 ) -> ApprovalError:
     try:
-        harness.run(calls, tools, gate=gate, gated_tools=["delete_file"])
+        harness.run(calls, tools, gate=gate, gated_tools=["delete_file"], scope=scope)
     except error as exc:
         return exc
     raise AssertionError(f"受审批工具未获批准却没有被 {error.__name__} 拦下")
@@ -669,24 +672,77 @@ def _rerun_does_not_bypass(harness: ToolExecutionHarness) -> None:
     counter, gate = _Counter(), ManualApprovalGate()
     ids = {
         _expect_approval_error(
-            harness, ApprovalPending, [("delete_file", "/x")], {"delete_file": counter}, gate
+            harness,
+            ApprovalPending,
+            [("delete_file", "/x")],
+            {"delete_file": counter},
+            gate,
+            scope="session-a",
         ).context["request_id"]
         for _ in range(3)
     }
     assert counter.calls == [], "原样重跑绝不能绕过审批"
-    assert len(ids) == 1, "request id 不依赖步序:原样重跑必须命中同一请求"
+    assert len(ids) == 1, "request id 不依赖步序:同一作用域里原样重跑必须命中同一请求"
 
 
 def _changed_arguments_require_reapproval(harness: ToolExecutionHarness) -> None:
     counter, gate = _Counter(), ManualApprovalGate()
     tools = {"delete_file": counter}
-    first = _expect_approval_error(harness, ApprovalPending, [("delete_file", "/a")], tools, gate)
+    first = _expect_approval_error(
+        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-a"
+    )
     gate.resolve(str(first.context["request_id"]), Decision.APPROVED)
-    harness.run([("delete_file", "/a")], tools, gate=gate, gated_tools=["delete_file"])
-    assert counter.calls == ["/a"], "获批后以相同参数重跑必须执行恰好一次"
-    second = _expect_approval_error(harness, ApprovalPending, [("delete_file", "/b")], tools, gate)
+    harness.run(
+        [("delete_file", "/a")], tools, gate=gate, gated_tools=["delete_file"], scope="session-a"
+    )
+    assert counter.calls == ["/a"], "获批后在同一作用域以相同参数重跑必须执行恰好一次"
+    second = _expect_approval_error(
+        harness, ApprovalPending, [("delete_file", "/b")], tools, gate, scope="session-a"
+    )
     assert second.context["request_id"] != first.context["request_id"], "改参数必须是新请求"
     assert counter.calls == ["/a"], "参数被改后必须重新审批,绝不复用旧批准"
+
+
+def _approval_is_consumed_once(harness: ToolExecutionHarness) -> None:
+    # 一次批准只放行【一次】匹配的工具调用:同一 run 里重复的同参调用、之后的重跑都要重新审批。
+    counter, gate = _Counter(), ManualApprovalGate()
+    tools = {"delete_file": counter}
+    first = _expect_approval_error(
+        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-a"
+    )
+    gate.resolve(str(first.context["request_id"]), Decision.APPROVED)
+    _expect_approval_error(
+        harness,
+        ApprovalPending,
+        [("delete_file", "/a"), ("delete_file", "/a")],
+        tools,
+        gate,
+        scope="session-a",
+    )
+    assert counter.calls == ["/a"], "一次批准只能执行一次"
+    _expect_approval_error(
+        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-a"
+    )
+    assert counter.calls == ["/a"], "批准核销后重跑必须重新审批"
+
+
+def _approval_is_scope_bound(harness: ToolExecutionHarness) -> None:
+    # A 作用域的批准对 B 无效:同一个 gate 被多个会话共享时互不串。
+    counter, gate = _Counter(), ManualApprovalGate()
+    tools = {"delete_file": counter}
+    first = _expect_approval_error(
+        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-a"
+    )
+    gate.resolve(str(first.context["request_id"]), Decision.APPROVED)
+    other = _expect_approval_error(
+        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-b"
+    )
+    assert other.context["request_id"] != first.context["request_id"], "作用域必须折进 request id"
+    assert counter.calls == [], "A 作用域的批准对 B 无效"
+    harness.run(
+        [("delete_file", "/a")], tools, gate=gate, gated_tools=["delete_file"], scope="session-a"
+    )
+    assert counter.calls == ["/a"]
 
 
 def _gate_failure_blocks_execution(harness: ToolExecutionHarness) -> None:
@@ -742,6 +798,8 @@ APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness] = (
     .add("unapproved_gated_tool_never_executes", _unapproved_gated_tool_never_executes)
     .add("rerun_does_not_bypass", _rerun_does_not_bypass)
     .add("changed_arguments_require_reapproval", _changed_arguments_require_reapproval)
+    .add("approval_is_consumed_once", _approval_is_consumed_once)
+    .add("approval_is_scope_bound", _approval_is_scope_bound)
     .add("gate_failure_blocks_execution", _gate_failure_blocks_execution)
     .add("ungated_tools_are_unaffected", _ungated_tools_are_unaffected)
 )

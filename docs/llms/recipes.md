@@ -252,7 +252,7 @@ print(llm_providers.names())   # ['anthropic', 'bedrock', 'cohere', 'failover', 
 ```python
 from spineagent import (
     ApprovalMiddleware, ApprovalPending, Decision, FunctionCallingAgent,
-    ManualApprovalGate, MiddlewareAgent, function_tool,
+    ManualApprovalGate, MiddlewareAgent, approval_scope, function_tool,
 )
 from spineagent.conformance import ScriptedToolCallProvider  # 离线:按脚本回 tool_calls
 
@@ -277,15 +277,18 @@ try:
 except ApprovalPending as exc:            # 真实工具调用前被拦下:delete_file 一次都没执行
     request_id = exc.context["request_id"]
 print(deleted)                            # []
+print(dict(gate.pending()[0].preview))    # {'path': "'/tmp/a'"}  审批人看得到要批的是什么
 
-token = gate.resolve(request_id, Decision.APPROVED)   # out-of-band 批准(收件箱 / 管理台)
-gate.redeem(token)                                    # 一次性 resume token,重放必败
-print(agent.step("清理临时文件").output)   # '完成'(同工具 + 同参数命中已落决议)
+token = gate.resolve(request_id, Decision.APPROVED)   # out-of-band 批准(缺省只放行一次)
+ticket = gate.redeem(token)                           # 一次性 resume token,重放必败
+with approval_scope(ticket.scope):                    # 回到同一作用域重跑
+    print(agent.step("清理临时文件").output)   # '完成'(批准在执行时核销)
 print(deleted)                            # ['/tmp/a']
 ```
 
-参数被改(如 `/etc`)就是新请求,会再次 `ApprovalPending`。需要不依赖上下文的保证时,用
-`require_approval(delete_file, gate)` 把闸绑进工具本身。
+参数被改(如 `/etc`)就是新请求,会再次 `ApprovalPending`;同一作用域里再跑一遍也会重新挂起(批准已核销)。
+长驻服务里建议用会话 id 显式设作用域:`ApprovalMiddleware(gate, gated_tools=[...], scope=session_id)`。
+需要不依赖上下文、也挡得住别名注册的保证时,用 `require_approval(delete_file, gate)` 把闸绑进工具本身。
 
 ## 13) 信任边界:上游输出是数据
 

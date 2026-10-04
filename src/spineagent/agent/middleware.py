@@ -21,6 +21,7 @@ from corespine.seam.registry import Registry
 
 from spineagent.agent.agent import Agent, AgentResult
 from spineagent.agent.trust import compose, untrusted
+from spineagent.tools.tool import reachable_tool_names
 
 
 @dataclass
@@ -34,6 +35,7 @@ class StepContext:
 
     cleanups 是 before_step 登记的收尾回调(如 ApprovalMiddleware 弹出审批作用域):MiddlewareAgent
     在本步结束时【无论成败】逆序执行它们。注意 tools 只是声明面,不是执行闸——审批在真实执行点上做。
+    inner_agent 是被包裹的内层 agent(供需要推断其工具清单的 middleware 只读使用)。
     """
 
     agent: str
@@ -44,6 +46,7 @@ class StepContext:
     attachments: list[str] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
     cleanups: list[Callable[[], None]] = field(default_factory=list)
+    inner_agent: Agent | None = None
 
 
 @runtime_checkable
@@ -82,7 +85,9 @@ class MiddlewareAgent:
         with self._step_lock:
             step_index = self._step_index
             self._step_index += 1
-        ctx = StepContext(agent=self._name, task=task, trace=trace, step=step_index)
+        ctx = StepContext(
+            agent=self._name, task=task, trace=trace, step=step_index, inner_agent=self._agent
+        )
         try:
             for mw in self._middlewares:
                 mw.before_step(ctx)
@@ -95,6 +100,9 @@ class MiddlewareAgent:
                 cleanup()
         # 重盖 provenance:对外产出者是本组合 agent(子 agent 名是内部细节)。
         return replace(result, agent=self._name)
+
+    def tool_inventory(self) -> frozenset[str] | None:
+        return reachable_tool_names(self._agent)
 
 
 # ---- 离线确定性内置四件套 ---------------------------------------------------------------------

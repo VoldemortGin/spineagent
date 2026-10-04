@@ -1,6 +1,6 @@
 # ADR 0002 — 审批是工具调用点上的强制闸(取代 ADR 0001 决策 3 的「步前声明检查」)
 
-- 状态:已接受
+- 状态:已接受(2026-10-04 修订:批准语义改为一次性消费 + 作用域,见「修订记录」)
 - 日期:2026-10-04
 - 相关:ADR 0001(审批门 / Wait 缝);`agent/approval.py`、`agent/middleware.py`、
   `agent/function_calling.py`、`agent/tool_using.py`、`orchestration/coordinator.py`
@@ -47,15 +47,50 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
    agent)的工具对象,无法替它包装;而「中间件改写内层 agent 的工具表」要么侵入各 agent 私有字段、
    要么对不透明 agent 再次 fail-open。故以动态作用域承接现有中间件 API,以静态包装补齐跨线程 /
    第三方执行点。
-3. **request id 由内容派生,不依赖步序。** id = sha256(code, 工具名, schema 指纹, sha256(规范化参数
-   值))前 16 位;规范化 = 键排序紧凑 JSON(非 JSON 值退回 repr——不稳定只会导致重新审批)。
-   `make_approval_request(..., bind_values=True)` 暴露同一派生;缺省 `bind_values=False` 保留旧的
-   「只看 schema」语义,给显式调用方。
-4. **批准的消费语义 = 沿用 ADR 0001 的「决议幂等」。** 决议绑定在内容派生的 request id 上并被记住:
-   同一工具 + 同一参数的调用(包括 resolve 后原样重跑、或同一 run 内的重复调用)都命中已落决议;
-   参数一变就是新请求、须重新审批。**批准不是一次性消费**——一次性的是 resume token(ADR 0001 不变)。
-   理由:恢复靠「重跑整步」,一步内若有多个受审批调用,前面已批准的调用在重跑时必须仍能通过,否则
-   永远走不到后面的调用。代价写明:重跑会重放该步内已执行过的工具副作用(ADR 0001 既有语义)。
+3. **request id 由内容与作用域派生,不依赖步序。** id = sha256(code, 工具名, schema 指纹,
+   sha256(规范化参数值), 作用域)前 16 位;规范化 = 键排序紧凑 JSON(非 JSON 值退回 repr——不稳定只会
+   导致重新审批)。`make_approval_request(..., bind_values=True, scope=...)` 暴露同一派生;缺省
+   `bind_values=False` / `scope=""` 保留旧的「只看 schema」语义,给显式调用方。
+4. **批准是安全边界:缺省一次性消费、绑定作用域、只能批准已存在的请求。**(本条于修订时取代原
+   「决议幂等」。原条款下审查复现:只 resolve 一次、从不 redeem,同一步重复 6 次、换一个 agent 再
+   6 次,共执行了 12 次;还能离线算出 id 预先批准。)
+   - **消费**:`review` 仍是纯查询(幂等,不变量不变);可核销的门(`ConsumableApprovalGate`,如
+     `ManualApprovalGate`)额外实现 `consume(request)`。执行闸在 review 得到 APPROVED 后原子核销一次,
+     核销不到(额度已用尽 / 过期)即重新登记为待审、本次不执行。`resolve(..., uses=1)` 缺省只放行
+     **一次**匹配调用;`uses=N` 放行 N 次;`uses=None` 是显式可选的旧「决议幂等」模式(有效期内同一
+     作用域里同参调用无限次放行——风险:一次批准可被任意多次重放,只应给确实需要的批处理场景)。
+     不实现 `consume` 的门(`AutoApprovalGate` 策略表)的批准是常驻的策略放行。
+   - **作用域**:request 绑定到调用方的作用域(会话 / 用户 / run 的不透明字符串),作用域折进 id,
+     A 的批准对 B 无效。来源优先级:`ApprovalMiddleware(scope=)` / `require_approval(scope=)` >
+     外层 `approval_scope(...)` > 缺省。缺省时**每次被 `ApprovalMiddleware` 包裹的 step 新建一个
+     作用域**,并作为外层作用域传给嵌套 agent / `require_approval` 包装(嵌套与叠加共享同一请求);
+     `require_approval` 在没有任何外层作用域时用包装实例自己的作用域(同一包装对象重跑间稳定)。
+     resume 必须回到同一作用域:`ApprovalPending.context["scope"]` / `ResumeTicket.scope` 给出它,
+     `with approval_scope(scope): agent.step(...)`。同一个门实例被多个 agent / 会话共享时互不串。
+   - **请求生命周期**:`ManualApprovalGate.resolve` 只能决议**已登记、未过期**的待审请求,未知 id 抛
+     `UnknownApprovalRequest`(不得预先批准)。请求表有上限(`max_requests`,满了先清过期再淘汰最早
+     登记的)与存活期(`request_ttl`;批准 / 拒绝的有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定),
+     防止「真实模型每次重跑参数略有变化就生成新 pending」造成的无界增长。拒绝不被消耗。
+   - **审批人看得到要批准什么**:执行闸构造请求时用脱敏钩子(缺省 `default_redactor`:键名命中敏感
+     词表整值打码、每个值截断到 200 字符;钩子出错整值打码)生成 `ApprovalRequest.preview`,
+     gate 与 `ManualApprovalGate.pending()` 可读。**这与 trace 隐私不冲突**:trace 是面向运维 / 观测
+     管道的旁路,可能被批量导出、长期留存、给无授权的人看,所以只记 code / 计数 / 决议;审批接口是
+     有授权的人决定「放不放行这次具体动作」的通道,看不到参数的审批没有意义(`transfer(1)` 与
+     `transfer(1000000)` 在旧接口里完全一样)。预览不进 trace、不进 `repr`、不参与请求相等比较,
+     且只出现在 gate 收到的请求与 `pending()` 里。
+   - **ticket 只是 resume 句柄**:`redeem(token)` 拿回 `ResumeTicket(request_id, decision, scope)`,告诉
+     调用方在哪个作用域里重跑;它不参与执行闸判定。放行额度在执行点核销,所以持有 / 重放 ticket
+     都不能让同一批准多执行一次;token 本身仍一次性(ADR 0001 不变)。
+   - **叠加**:同一调用被同一个门在一次执行闸里只审 / 核销一次(嵌套 `ApprovalMiddleware` 共享作用域;
+     执行点把被执行的工具对象传给 `enforce_tool_approval(target=)`,工具自带 `require_approval` 闸时
+     同一个门交给工具自己审)。
+4a. **受审批工具名的校验(fail-closed)。** 名字必须是确切工具名:构造时拒绝空名与通配符
+   (`*?[]`——不支持 glob,写了就报错,不再静默放行);首次使用时若能推断被包裹 agent 的工具清单
+   (`reachable_tool_names`:`FunctionCallingAgent` / `ToolUsingAgent` / `MiddlewareAgent` /
+   `ChainAgent` / `AgentTool` / `DeepResearchAgent` 实现 `tool_inventory()`),对应不到已知工具的名字
+   在任何工具执行前抛 `ApprovalConfigError`;推断不了(闭包式 `FunctionAgent` 等不透明 agent)时,
+   执行点检测「受审批名与已注册工具仅大小写 / 分隔符不同」并 fail-closed。**按名字 gate 对「同一函数
+   以别名注册」不设防**——安全场景首选 `require_approval`(按工具对象绑定,别名、自建线程都绕不过)。
 5. **未批准 = 不执行,保持现有对外语义。** rejected 抛 `ApprovalRejected`、pending 抛
    `ApprovalPending`(带 `request_id`,与 `ManualApprovalGate` / `ResumeTicket` 的「resolve 后重跑」
    流程一致),不改成「拒绝结果喂回模型」。异常从执行点一路冒到调用方;`AgentTool` 嵌套照常上抛;
@@ -74,10 +109,12 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 函数断言:
 
 1. 未获批准(rejected / pending)的受审批工具执行次数为 0;
-2. 原样重跑不绕过,且三次重跑命中同一 request id;
-3. 获批后同参重跑恰好执行一次;改参数得到新 request id 并重新挂起;
-4. 审批门抛异常时执行次数为 0(`ApprovalGateError`);
-5. 未受审批的工具不受审批门影响。
+2. 原样重跑不绕过,且同一作用域里三次重跑命中同一 request id;
+3. 获批后在同一作用域同参重跑恰好执行一次;改参数得到新 request id 并重新挂起;
+4. 一次批准只放行一次:同一 run 里重复的同参调用与之后的重跑都重新挂起(`approval_is_consumed_once`);
+5. A 作用域的批准对 B 无效(`approval_is_scope_bound`);
+6. 审批门抛异常时执行次数为 0(`ApprovalGateError`);
+7. 未受审批的工具不受审批门影响。
 
 ## 已知边界
 
@@ -86,12 +123,23 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 - 自定义 agent 若自己执行工具,须在调用前调 `enforce_tool_approval`,或只接受经
   `require_approval` 包装过的工具。
 - request id 是参数值的哈希而非明文;对低熵参数(如 `yes` / `no`)可被字典猜测,request id 不是
-  参数保密手段。
+  参数保密手段。(参数预览本来就给审批人看,见决策 4。)
+- 按名字 gate 对别名注册不设防;推断不了工具清单的不透明 agent 只能检测「近似名」写错,完全写错
+  的名字(如把 `delete_file` 写成 `rm`)在不透明 agent 下仍无法发现——用 `require_approval`。
 
 ## 后果
 
-- `ApprovalMiddleware` / `ManualApprovalGate` / `ResumeTicket` 的对外用法不变;`ApprovalMiddleware`
-  不再在步前依据 `ctx.tools` 抛错(那条路径本身就是漏洞来源)。新增 `ApprovalGateError`、
+- `ApprovalMiddleware` 不再在步前依据 `ctx.tools` 抛错(那条路径本身就是漏洞来源)。修订后的破坏性
+  变化:批准缺省一次性消费;resume 须回到同一作用域;`resolve` 只接受已登记的请求;受审批名含通配 /
+  对应不到已知工具时报错;`ManualApprovalGate.pending()` 的条目带预览。新增 `ApprovalGateError`、
   `enforce_tool_approval`、`require_approval`、`make_approval_request(bind_values=)`、
   `StepContext.cleanups`。行为变化见 CHANGELOG。
 - 原 `tests/test_approval.py` 里以 `FunctionAgent` 假执行的中间件测试全部改写为端到端真实路径。
+
+## 修订记录
+
+- 2026-10-04(审查第二轮):决策 4 由「决议幂等」改为「一次性消费 + 作用域 + 只能批准已存在的请求 +
+  审批人可见的参数预览 + ticket 只是 resume 句柄」;新增决策 4a(受审批工具名校验)。原因:审查复现
+  一次批准被同一步 / 跨 agent 重放 12 次、可离线预先批准、审批人看不到参数值、写错的工具名静默放行。
+  本 ADR 尚未随版本发布,故就地修订而不另开编号(ADR 0002 取代 ADR 0001 决策 3 时用的是新编号,
+  那是因为 0001 已发布)。

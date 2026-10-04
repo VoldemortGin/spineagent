@@ -18,6 +18,7 @@ from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, merge_usage
 from spineagent.orchestration.coordinator import Coordinator
+from spineagent.tools.tool import reachable_tool_names
 
 
 class ChainAgent:
@@ -44,6 +45,15 @@ class ChainAgent:
             usage=merge_usage(*(r.usage for r in results)),
             artifacts=tuple(ref for r in results for ref in r.artifacts),
         )
+
+    def tool_inventory(self) -> frozenset[str] | None:
+        names: set[str] = set()
+        for agent in self._agents:
+            inventory = reachable_tool_names(agent)
+            if inventory is None:
+                return None
+            names |= inventory
+        return frozenset(names)
 
 
 def _emit_chain_step(trace: TraceSink | None, name: str, stages: int, output: str) -> None:

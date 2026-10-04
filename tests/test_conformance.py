@@ -11,6 +11,7 @@
 """
 
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from spineagent.agent.approval import (
     ApprovalMiddleware,
     AutoApprovalGate,
     ManualApprovalGate,
+    approval_scope,
     require_approval,
 )
 from spineagent.agent.artifact import BlobArtifactSink, InProcessArtifactSink
@@ -193,9 +195,10 @@ class _Harness:
     def __init__(self, build) -> None:
         self._build = build
 
-    def run(self, calls, tools, *, gate, gated_tools=(), trace=None):
+    def run(self, calls, tools, *, gate, gated_tools=(), trace=None, scope=None):
         agent, task = self._build(calls, tools, _approval(gate, gated_tools))
-        agent.step(task, trace=trace)
+        with approval_scope(scope) if scope is not None else nullcontext():
+            agent.step(task, trace=trace)
 
 
 def _h_function_calling(calls, tools, mws):
@@ -249,9 +252,11 @@ def _h_deep_research(calls, tools, mws):
 class _StaticWrapperForeignThreadHarness:
     """审批经 require_approval 绑在工具本身上,agent 在一条【裸线程】里跑(无 contextvar 传播)。"""
 
-    def run(self, calls, tools, *, gate, gated_tools=(), trace=None):
+    def run(self, calls, tools, *, gate, gated_tools=(), trace=None, scope=None):
         wrapped = [
-            require_approval(t, gate) if gate is not None and t.name in gated_tools else t
+            require_approval(t, gate, scope=scope)
+            if gate is not None and t.name in gated_tools
+            else t
             for t in _function_tools(tools)
         ]
         script = ScriptedToolCallProvider([(n, {"value": v}) for n, v in calls])

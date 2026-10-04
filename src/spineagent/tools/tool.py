@@ -68,6 +68,33 @@ def index_tools_by_name[T: _Named](tools: Iterable[T]) -> dict[str, T]:
     return indexed
 
 
+def reachable_tool_names(obj: object) -> frozenset[str] | None:
+    """一个 agent / 工具在本地能执行到的全部工具名(含嵌套声明的子 agent);推断不了返回 None。
+
+    靠可选方法 ``tool_inventory() -> frozenset[str] | None``:FunctionCallingAgent / ToolUsingAgent /
+    MiddlewareAgent / ChainAgent / AgentTool / DeepResearchAgent 实现它;没有该方法的(闭包式
+    FunctionAgent、远端 agent)视为不透明(None)。FunctionTool 的函数体当作叶子,不展开。
+    """
+    method = getattr(obj, "tool_inventory", None)
+    if not callable(method):
+        return None
+    inventory = method()
+    return inventory if isinstance(inventory, frozenset) else None
+
+
+def inventory_of_tools(tools: Iterable[_Named]) -> frozenset[str] | None:
+    """一组工具的工具名并上其中声明了嵌套清单的工具(如 AgentTool);有一个推断不了即 None。"""
+    names: set[str] = set()
+    for tool in tools:
+        names.add(tool.name)
+        if callable(getattr(tool, "tool_inventory", None)):
+            nested = reachable_tool_names(tool)
+            if nested is None:
+                return None
+            names |= nested
+    return frozenset(names)
+
+
 class EchoTool:
     """玩具工具:原样回显输入(最小的「能力」示例)。"""
 

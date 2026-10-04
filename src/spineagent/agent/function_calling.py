@@ -116,7 +116,9 @@ class FunctionCallingAgent:
                         output = f"error: {exc}"
                     else:
                         # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
-                        enforce_tool_approval(tool.name, validated)
+                        enforce_tool_approval(
+                            tool.name, validated, target=tool, available=self._tools.keys()
+                        )
                         output = self._invoke(tool, validated)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 # trace 只记本地注册表里存在的工具名;模型编造的名字记成固定占位。
@@ -126,6 +128,9 @@ class FunctionCallingAgent:
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)
         return AgentResult(self._name, _NO_OUTPUT, usage=total_usage)
+
+    def tool_inventory(self) -> frozenset[str] | None:
+        return frozenset(self._tools)
 
     def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> str:
         """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。"""

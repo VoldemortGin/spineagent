@@ -5,9 +5,9 @@
 产品侧的审批收件箱 UI 留给 spinestudio 后续批。
 
 家族缝的元模式(同 trigger / credential / sandbox 缝):**Protocol + 离线确定性默认 + Registry
-工厂 + 参数化 conformance**。一次「待审批请求」只携带 domain-neutral 的【定位摘要】——审批类别
-code、确定性 request id、触发的工具名、参数 schema 指纹与计数——【绝不含参数正文 / 值】。gate 对
-它给出三态决议之一:approved / rejected / pending。
+工厂 + 参数化 conformance**。一次「待审批请求」的定位摘要——审批类别 code、确定性 request id、
+触发的工具名、参数 schema 指纹与计数、作用域——不含参数值;另带一份只给审批人看的参数预览
+(脱敏 + 截断,不进 trace / repr)。gate 对它给出三态决议之一:approved / rejected / pending。
 
 两个离线确定性默认:
   - AutoApprovalGate —— 策略表:按工具名 glob 模式 allow / deny,纯配置、确定性,永不 pending;
@@ -15,9 +15,11 @@ code、确定性 request id、触发的工具名、参数 schema 指纹与计数
     铸一枚【一次性 resume token】(secrets 随机、只存 sha256 哈希、用过即废,模式照 spinestudio
     refresh_store,但这里是框架内存 / 可插拔 ResumeTokenStore)。
 
-【幂等性裁决(钉死)】决议是 request id 的稳定函数:review 同一请求恒返回同一决议(未决则恒
-PENDING);resolve 首次落决议,重复以【相同】决议 resolve 幂等(各自铸一枚独立一次性 token),
-以【冲突】决议 resolve 抛 ApprovalConflict(先落者胜,绝不静默翻转)。
+【批准语义裁决(钉死,见 docs/adr/0002 决策 4)】review 是纯查询(其间无 resolve / consume 时恒返回
+同一决议);批准缺省【一次性消费】:执行闸在执行前经 consume 核销一次放行额度(resolve(uses=N) 放行
+N 次,uses=None 为显式可选的幂等模式)。request 绑定作用域(会话 / 用户 / run),A 的批准对 B 无效。
+resolve 只接受已登记、未过期的请求(不得预先批准),以【冲突】决议 resolve 抛 ApprovalConflict
+(先落者胜,绝不静默翻转)。
 
 【resume token 一次性裁决(钉死)】token 明文只在 resolve 那一刻返回一次,落库只存 sha256 哈希;
 redeem 校验 + 标记消费,重放(再次 redeem 同一 token)必抛 InvalidResumeToken——泄露的 token 也
@@ -25,10 +27,11 @@ redeem 校验 + 标记消费,重放(再次 redeem 同一 token)必抛 InvalidRes
 
 【执行闸裁决(钉死,见 docs/adr/0002)】审批是【工具调用点上的强制闸】,不是对 ctx.tools 声明的
 检查:执行点在每一次真实调用工具前调 enforce_tool_approval(真实工具名, 参数);request id 由
-(code, 工具名, schema 指纹, 规范化参数值的 sha256)派生,不依赖步序;门故障 fail-closed。
+(code, 工具名, schema 指纹, 规范化参数值的 sha256, 作用域)派生,不依赖步序;门故障 fail-closed;
+受审批工具名写错 / 含通配符时 fail-closed(ApprovalConfigError)。
 
-隐私:本缝实现【自身不发射 trace】(同 credential / trigger 缝);request 只带定位摘要,payload
-正文到不了任何字段。要观测在【审批 middleware】里记 code / 计数 / 决议,绝不记参数正文。
+隐私:本缝实现【自身不发射 trace】(同 credential / trigger 缝)。要观测在【审批 middleware】里记
+code / 计数 / 决议,绝不记参数正文或预览;参数预览只经审批接口(gate.review / pending())给审批人。
 """
 
 from __future__ import annotations
@@ -36,10 +39,14 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import re
 import secrets
-from collections.abc import Callable, Mapping, Sequence
+import threading
+import time
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol, overload, runtime_checkable
 
@@ -50,7 +57,7 @@ from corespine.seam.registry import Registry
 from spineagent.agent.agent import AgentResult
 from spineagent.agent.middleware import StepContext, middlewares
 from spineagent.tools.function_tool import FunctionTool
-from spineagent.tools.tool import Tool, ToolResult
+from spineagent.tools.tool import Tool, ToolResult, reachable_tool_names
 
 # 内置审批类别 code(domain-neutral;调用方用它路由 / 计数)。
 APPROVAL_TOOL_CALL = "tool_call"
@@ -108,6 +115,21 @@ class ApprovalGateError(ApprovalError):
     code = "approval.gate_error"
 
 
+class UnknownApprovalRequest(ApprovalError):
+    """resolve 了一个不存在 / 已过期 / 已被核销的请求(不得预先批准离线算出的 id)。"""
+
+    code = "approval.unknown_request"
+
+
+class ApprovalConfigError(ApprovalError, ValueError):
+    """审批配置错误(受审批工具名含通配 / 对应不到已知工具 / 与已注册工具仅大小写或分隔符不同)。
+
+    fail-closed:在任何工具执行之前抛出,绝不让写错的名字静默放行。
+    """
+
+    code = "approval.config_error"
+
+
 # ---- 请求摘要 + 确定性派生(绝不含参数正文)-----------------------------------------------------
 
 
@@ -120,7 +142,10 @@ class ApprovalRequest:
       run 在 resolve 后重跑 step 能稳定命中已落决议);
     - tool:触发审批的工具名(定位符,非正文);
     - arg_fingerprint:参数的 schema 指纹(sha256 前 16 位,只覆盖【键名 + 值类型】,绝不含值);
-    - arg_count:参数个数(计数)。
+    - arg_count:参数个数(计数);
+    - scope:请求所属的作用域(会话 / 用户 / run 的不透明标识,已折进 id;A 作用域的批准对 B 无效);
+    - preview:给【审批人】看的参数预览((键, 脱敏 + 截断后的值文本) 元组),只经审批接口
+      (gate.review / ManualApprovalGate.pending)提供,绝不进 trace;不参与相等比较、不进 repr。
     """
 
     code: str
@@ -128,6 +153,8 @@ class ApprovalRequest:
     tool: str
     arg_fingerprint: str = ""
     arg_count: int = 0
+    scope: str = field(default="", repr=False)
+    preview: tuple[tuple[str, str], ...] = field(default=(), repr=False, compare=False)
 
 
 def _fingerprint(args: Mapping[str, object]) -> str:
@@ -152,10 +179,67 @@ def _value_digest(args: Mapping[str, object]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _request_id(code: str, tool: str, fingerprint: str, nonce: str) -> str:
-    """据 code + 工具名 + schema 指纹 + nonce 派生确定性 request id(纯函数,可重放)。"""
-    raw = ":".join([code, tool, fingerprint, nonce])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+def _request_id(code: str, tool: str, fingerprint: str, nonce: str, scope: str = "") -> str:
+    """据 code + 工具名 + schema 指纹 + nonce(+ 作用域)派生确定性 request id(纯函数,可重放)。"""
+    parts = [code, tool, fingerprint, nonce] + ([f"scope={scope}"] if scope else [])
+    return hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+# ---- 参数预览(只给审批人看;脱敏 + 截断;绝不进 trace)----------------------------------------
+
+# 预览里单个值 / 键的最大字符数(超出截断并注明省略了多少字符)。
+PREVIEW_MAX_CHARS = 200
+_PREVIEW_MAX_KEY_CHARS = 64
+_REDACTED = "***"
+# 键名命中即整值打码的敏感词表(大小写不敏感,子串匹配)。
+_SENSITIVE_KEY = re.compile(
+    r"(?i)(pass(word|wd)?|secret|token|api[-_]?key|apikey|auth|credential|cookie|"
+    r"private[-_]?key|session|signature)"
+)
+
+# 脱敏钩子:(键, 原值) -> 给审批人看的文本。可注入以替换缺省规则。
+type Redactor = Callable[[str, object], str]
+
+
+def _mask_nested(value: object) -> object:
+    """递归把嵌套 dict 里敏感键的值换成占位(只用于预览渲染)。"""
+    if isinstance(value, Mapping):
+        return {
+            str(k): (_REDACTED if _SENSITIVE_KEY.search(str(k)) else _mask_nested(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_mask_nested(v) for v in value]
+    return value
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…(+{len(text) - limit} 字符)"
+
+
+def default_redactor(key: str, value: object) -> str:
+    """缺省脱敏:键名命中敏感词表 -> 整值打码;其余按 repr / 紧凑 JSON 渲染并截断到 PREVIEW_MAX_CHARS。"""
+    if _SENSITIVE_KEY.search(key):
+        return _REDACTED
+    if isinstance(value, str):
+        text = repr(value)
+    else:
+        text = json.dumps(_mask_nested(value), ensure_ascii=False, sort_keys=True, default=repr)
+    return _truncate(text, PREVIEW_MAX_CHARS)
+
+
+def _build_preview(args: Mapping[str, object], redact: Redactor) -> tuple[tuple[str, str], ...]:
+    """按键排序生成预览;脱敏钩子自身出错时整值打码(fail-closed,不让原文漏出)。"""
+    preview: list[tuple[str, str]] = []
+    for key in sorted(str(k) for k in args):
+        try:
+            text = _truncate(str(redact(key, args[key])), PREVIEW_MAX_CHARS)
+        except Exception:  # noqa: BLE001 —— 预览失败不应阻断审批,也绝不回退到原文
+            text = _REDACTED
+        preview.append((_truncate(key, _PREVIEW_MAX_KEY_CHARS), text))
+    return tuple(preview)
 
 
 def make_approval_request(
@@ -165,22 +249,27 @@ def make_approval_request(
     *,
     nonce: str = "",
     bind_values: bool = False,
+    scope: str = "",
+    redact: Redactor | None = None,
 ) -> ApprovalRequest:
-    """从工具名 + 参数字典构造一次待审批请求(只取 schema 指纹与计数,绝不落参数值)。
+    """从工具名 + 参数字典构造一次待审批请求(定位摘要只取 schema 指纹与计数,绝不落参数值)。
 
     nonce 让调用方在需要「按次审批」时强制区分 schema 相同的两次调用;缺省 "" 时 schema 相同的
-    请求折叠成同一 id(决议可复用,幂等)。bind_values=True 时把【规范化参数值的 sha256】也折进
-    request id(仍不落明文):参数一变即是新请求、须重新审批——工具调用点上的执行闸用的就是它。
+    请求折叠成同一 id。bind_values=True 时把【规范化参数值的 sha256】也折进 request id(仍不落
+    明文):参数一变即是新请求、须重新审批——工具调用点上的执行闸用的就是它。scope 把请求绑定到
+    调用方的作用域(折进 id)。给了 redact 时生成参数预览(只给审批人看,见 ApprovalRequest)。
     """
     args = dict(arguments or {})
     fp = _fingerprint(args)
     salt = nonce if not bind_values else f"{nonce}:{_value_digest(args)}"
     return ApprovalRequest(
         code=code,
-        id=_request_id(code, tool, fp, salt),
+        id=_request_id(code, tool, fp, salt, scope),
         tool=tool,
         arg_fingerprint=fp,
         arg_count=len(args),
+        scope=scope,
+        preview=_build_preview(args, redact) if redact is not None else (),
     )
 
 
@@ -200,15 +289,33 @@ class ApprovalGate(Protocol):
     def review(self, request: ApprovalRequest) -> Decision: ...
 
 
+@runtime_checkable
+class ConsumableApprovalGate(ApprovalGate, Protocol):
+    """可核销的审批门:批准是【有限次数】的放行额度,执行闸在真正执行前调 consume 核销一次。
+
+    review 仍是纯查询(幂等);consume(request) 原子地扣减一次放行额度,扣到了返回 True,额度已用尽 /
+    不存在 / 已过期返回 False(执行闸据此判「未批准」、不执行)。不实现 consume 的门(如策略表
+    AutoApprovalGate)的批准是常驻的策略放行。
+    """
+
+    def consume(self, request: ApprovalRequest) -> bool: ...
+
+
 # ---- 一次性 resume token 存储(可插拔;框架内存默认)------------------------------------------
 
 
 @dataclass(frozen=True)
 class ResumeTicket:
-    """一次成功 redeem 的凭据:指向被授权恢复的 request 及其决议(供调用方据此重跑 step)。"""
+    """一次成功 redeem 的凭据:指向被授权恢复的 request、其决议与作用域(resume 流程的句柄)。
+
+    ticket 【不是】执行凭据:它只告诉调用方「哪个请求在哪个作用域里被批准了」,调用方据此在同一
+    作用域里重跑(`with approval_scope(ticket.scope): agent.step(...)`)。放行额度在执行点核销,
+    故持有 / 重放 ticket 都不能让同一批准多执行一次。
+    """
 
     request_id: str
     decision: Decision
+    scope: str = ""
 
 
 @runtime_checkable
@@ -301,52 +408,160 @@ class AutoApprovalGate:
         )
 
 
+# ManualApprovalGate 缺省:请求表上限与请求存活期(秒)。
+_DEFAULT_MAX_REQUESTS = 1_024
+_DEFAULT_REQUEST_TTL = 3_600.0
+
+
+@dataclass
+class _RequestRecord:
+    request: ApprovalRequest
+    created: float
+    expires: float
+    decision: Decision = Decision.PENDING
+    uses_left: int | None = None  # 仅 APPROVED 有意义:None = 不限次(显式可选的幂等模式)
+
+
 class ManualApprovalGate:
-    """进程内挂起审批门:review 登记待审并返回当前决议,resolve 落决议 + 铸一次性 resume token。
+    """进程内挂起审批门:review 登记待审,resolve 落决议 + 铸一次性 resume token,执行时核销批准。
 
-    review(request):首见即登记为待审(供 pending() 列举,对接审批收件箱);返回已落决议或 PENDING。
-    resolve(request_id, decision):把 approved / rejected 决议落进 gate,并铸一枚一次性 resume token
-    返回(明文只此一次)。redeem(raw_token):消费 token(重放必败),拿回 ResumeTicket 以授权恢复。
+    - review(request):首见即登记为待审(供 pending() 列举,对接审批收件箱);返回当前决议。纯查询,
+      不消耗批准额度。
+    - resolve(request_id, decision, *, uses=1, ttl_seconds=None):只能决议【已登记、未过期】的请求
+      (未知 id 抛 UnknownApprovalRequest——不得预先批准离线算出的 id)。批准缺省只放行【一次】
+      匹配的工具调用(uses=1,执行时核销);uses=N 放行 N 次;uses=None 是旧的「决议幂等」模式
+      (有效期内同一请求可无限次执行——风险:一次批准可被同一作用域里任意多次的同参调用复用)。
+    - consume(request):执行闸在执行前调用,原子核销一次;额度用尽即删除记录,同一请求再来会重新
+      登记为待审。
+    - pending():列举待审请求,带【参数预览】(脱敏 + 截断,只给审批人看,绝不进 trace)。
 
-    幂等:review 对同一 request 恒返回同一决议;resolve 以相同决议重复调用幂等(各铸独立 token),
-    以冲突决议调用抛 ApprovalConflict。token 存储可注入(默认进程内一次性),便于换持久后端。
+    请求表有上限(max_requests,满了先清过期、再淘汰最早登记的)与存活期(request_ttl 秒;批准 /
+    拒绝的有效期缺省同此,可由 resolve 的 ttl_seconds 单独指定),防无界增长。时钟可注入。线程安全。
+    冲突决议抛 ApprovalConflict(先落者胜,绝不静默翻转)。
     """
 
     name = "manual"
 
-    def __init__(self, *, token_store: ResumeTokenStore | None = None) -> None:
-        self._registry: dict[str, ApprovalRequest] = {}
-        self._decisions: dict[str, Decision] = {}
+    def __init__(
+        self,
+        *,
+        token_store: ResumeTokenStore | None = None,
+        max_requests: int = _DEFAULT_MAX_REQUESTS,
+        request_ttl: float = _DEFAULT_REQUEST_TTL,
+        now_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_requests < 1:
+            raise ValueError(f"max_requests 必须 ≥ 1:{max_requests}")
+        if request_ttl <= 0:
+            raise ValueError(f"request_ttl 必须为正:{request_ttl}")
+        self._records: dict[str, _RequestRecord] = {}
+        self._ticket_scopes: dict[str, str] = {}
         self._store: ResumeTokenStore = token_store or InMemoryResumeTokenStore()
+        self._max_requests = max_requests
+        self._request_ttl = request_ttl
+        self._now = now_fn
+        self._lock = threading.Lock()
+
+    def _live(self, request_id: str, now: float) -> _RequestRecord | None:
+        record = self._records.get(request_id)
+        if record is not None and now >= record.expires:
+            del self._records[request_id]
+            return None
+        return record
+
+    def _make_room(self, now: float) -> None:
+        if len(self._records) < self._max_requests:
+            return
+        for rid in [rid for rid, rec in self._records.items() if now >= rec.expires]:
+            del self._records[rid]
+        while len(self._records) >= self._max_requests:
+            oldest = min(self._records, key=lambda rid: self._records[rid].created)
+            del self._records[oldest]
 
     def review(self, request: ApprovalRequest) -> Decision:
-        self._registry.setdefault(request.id, request)  # 登记待审(幂等)
-        return self._decisions.get(request.id, Decision.PENDING)
+        with self._lock:
+            now = self._now()
+            record = self._live(request.id, now)
+            if record is None:
+                self._make_room(now)
+                self._records[request.id] = _RequestRecord(
+                    request=request, created=now, expires=now + self._request_ttl
+                )
+                return Decision.PENDING
+            return record.decision
 
-    def resolve(self, request_id: str, decision: Decision) -> str:
-        """落一个 approved / rejected 决议并铸一枚一次性 resume token(明文只此一次)。"""
+    def consume(self, request: ApprovalRequest) -> bool:
+        with self._lock:
+            record = self._live(request.id, self._now())
+            if record is None or record.decision is not Decision.APPROVED:
+                return False
+            if record.uses_left is not None:
+                record.uses_left -= 1
+                if record.uses_left <= 0:
+                    del self._records[request.id]
+            return True
+
+    def resolve(
+        self,
+        request_id: str,
+        decision: Decision,
+        *,
+        uses: int | None = 1,
+        ttl_seconds: float | None = None,
+    ) -> str:
+        """对一个【已登记、未过期】的待审请求落 approved / rejected 决议,并铸一枚一次性 resume token。"""
         if decision not in (Decision.APPROVED, Decision.REJECTED):
             raise ValueError(f"resolve 只接受 approved / rejected,收到:{decision!r}")
-        prior = self._decisions.get(request_id)
-        if prior is not None and prior is not decision:
-            raise ApprovalConflict(
-                f"request {request_id!r} 已落决议 {prior.value!r},不接受冲突决议 {decision.value!r}",
-                request_id=request_id,
-            )
-        self._decisions[request_id] = decision
+        if uses is not None and uses < 1:
+            raise ValueError(f"uses 必须 ≥ 1 或为 None(不限次):{uses}")
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds 必须为正:{ttl_seconds}")
+        with self._lock:
+            now = self._now()
+            record = self._live(request_id, now)
+            if record is None:
+                raise UnknownApprovalRequest(
+                    "只能决议已登记、未过期的待审请求", request_id=request_id
+                )
+            if record.decision is Decision.PENDING:
+                record.decision = decision
+                record.uses_left = uses if decision is Decision.APPROVED else None
+                record.expires = now + (
+                    ttl_seconds if ttl_seconds is not None else self._request_ttl
+                )
+            elif record.decision is not decision:
+                raise ApprovalConflict(
+                    f"request {request_id!r} 已落决议 {record.decision.value!r},"
+                    f"不接受冲突决议 {decision.value!r}",
+                    request_id=request_id,
+                )
+            # 相同决议重复 resolve 幂等:不追加额度,只另铸一枚独立的一次性 token。
+            self._ticket_scopes[request_id] = record.request.scope
+            while len(self._ticket_scopes) > self._max_requests:
+                del self._ticket_scopes[next(iter(self._ticket_scopes))]
         return self._store.issue(request_id, decision)
 
     def redeem(self, raw_token: str) -> ResumeTicket:
-        """消费一枚一次性 resume token(重放必败),拿回被授权恢复的 request 与决议。"""
-        return self._store.redeem(raw_token)
+        """消费一枚一次性 resume token(重放必败),拿回被授权恢复的 request、决议与作用域。"""
+        ticket = self._store.redeem(raw_token)
+        with self._lock:
+            scope = self._ticket_scopes.get(ticket.request_id, ticket.scope)
+        return replace(ticket, scope=scope)
 
     def pending(self) -> list[ApprovalRequest]:
-        """列举尚未落决议的待审请求(按 id 字典序;只含定位摘要,供审批收件箱读取)。"""
-        return [req for rid, req in sorted(self._registry.items()) if rid not in self._decisions]
+        """列举未过期、尚未落决议的待审请求(按 id 字典序;带给审批人看的参数预览)。"""
+        with self._lock:
+            now = self._now()
+            return [
+                rec.request
+                for rid, rec in sorted(self._records.items())
+                if rec.decision is Decision.PENDING and now < rec.expires
+            ]
 
     def __repr__(self) -> str:
-        undecided = sum(1 for rid in self._registry if rid not in self._decisions)
-        return f"ManualApprovalGate(seen={len(self._registry)}, pending={undecided})"
+        with self._lock:
+            undecided = sum(1 for rec in self._records.values() if rec.decision is Decision.PENDING)
+            return f"ManualApprovalGate(seen={len(self._records)}, pending={undecided})"
 
 
 # ---- Registry + 工厂 --------------------------------------------------------------------------
@@ -379,9 +594,72 @@ def make_approval_gate(spec: str, **kwargs: object) -> ApprovalGate:
 # 未配置任何审批时,执行点只做一次 contextvar 读取即返回(零行为变化)。
 
 
+_GLOB_CHARS = frozenset("*?[]")
+
+
+def _validate_gated_names(names: Sequence[str]) -> frozenset[str]:
+    """受审批工具名必须是确切名字:空名 / 非 str / 含通配符一律拒绝(不支持 glob,绝不静默放行)。"""
+    validated: set[str] = set()
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise ApprovalConfigError("受审批工具名必须是非空字符串")
+        if _GLOB_CHARS & set(name):
+            raise ApprovalConfigError(
+                "受审批工具名不支持通配符;请列出确切工具名,或用 require_approval 按工具对象绑定",
+                name=name,
+            )
+        validated.add(name)
+    return frozenset(validated)
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"[-_\s]", "", name).casefold()
+
+
+def _check_near_miss(gated: frozenset[str], available: Collection[str]) -> None:
+    """受审批名与本执行点已注册工具仅大小写 / 分隔符不同 -> 多半是写错:fail-closed,任何工具都不执行。"""
+    for name in gated:
+        if name in available:
+            continue
+        target = _normalized(name)
+        for registered in available:
+            if registered != name and _normalized(registered) == target:
+                raise ApprovalConfigError(
+                    "受审批工具名与已注册工具仅大小写 / 分隔符不同(多半是写错),fail-closed",
+                    name=name,
+                    registered=registered,
+                )
+
+
+_APPROVAL_SCOPE: ContextVar[str | None] = ContextVar("spineagent_approval_scope", default=None)
+
+
+@contextmanager
+def approval_scope(scope: str) -> Iterator[str]:
+    """在 with 块内把审批作用域设为 scope(会话 / 用户 / run 的不透明标识)。
+
+    作用域折进 request id:A 作用域的批准对 B 无效。缺省(未设)时每次 ApprovalMiddleware 包裹的
+    step 都新建一个作用域——resume 时在同一作用域里重跑:`with approval_scope(ticket.scope): ...`
+    (ApprovalPending.context["scope"] 同值)。只作用于当前上下文;自建线程需自己带过去
+    (见 spineagent.orchestration.coordinator.run_in_context / contextvars.copy_context)。
+    """
+    if not isinstance(scope, str) or not scope:
+        raise ValueError("approval scope 必须是非空字符串")
+    token = _APPROVAL_SCOPE.set(scope)
+    try:
+        yield scope
+    finally:
+        _APPROVAL_SCOPE.reset(token)
+
+
+def current_approval_scope() -> str | None:
+    """当前上下文里生效的审批作用域(未设为 None)。"""
+    return _APPROVAL_SCOPE.get()
+
+
 @dataclass(frozen=True)
 class _ApprovalGuard:
-    """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code(+ 可选 trace 落点)。"""
+    """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code + 作用域 + 脱敏钩子(+ 可选 trace 落点)。"""
 
     gate: ApprovalGate
     gated: frozenset[str]
@@ -389,12 +667,74 @@ class _ApprovalGuard:
     trace: TraceSink | None = None
     agent: str = ""
     step: int = 0
+    scope: str | None = None  # None:执行时取外层 approval_scope,再退回 default_scope
+    default_scope: str = ""
+    redact: Redactor = default_redactor
 
-    def check(self, tool: str, arguments: Mapping[str, object]) -> None:
-        """对一次真实工具调用审批:approved 返回;rejected / pending / 门故障一律抛错(不执行)。"""
+    def resolve_scope(self) -> str:
+        if self.scope is not None:
+            return self.scope
+        ambient = _APPROVAL_SCOPE.get()
+        return ambient if ambient is not None else self.default_scope
+
+    def check(
+        self,
+        tool: str,
+        arguments: Mapping[str, object],
+        *,
+        available: Collection[str] = (),
+        seen: set[tuple[int, str]] | None = None,
+    ) -> None:
+        """对一次真实工具调用审批:approved(且核销到额度)返回;否则一律抛错(不执行)。"""
+        if available:
+            _check_near_miss(self.gated, available)
         if tool not in self.gated:
             return
-        request = make_approval_request(self.code, tool, arguments, bind_values=True)
+        request = make_approval_request(
+            self.code,
+            tool,
+            arguments,
+            bind_values=True,
+            scope=self.resolve_scope(),
+            redact=self.redact,
+        )
+        key = (id(self.gate), request.id)
+        if seen is not None and key in seen:
+            return  # 同一次调用已被同一个门批准并核销(叠加的审批配置不重复消耗额度)
+        decision = self._review(request, tool)
+        if decision is Decision.APPROVED and isinstance(self.gate, ConsumableApprovalGate):
+            if not self._consume(request, tool):
+                # 额度已被用尽(一次性批准已被核销):重新登记为待审,本次不执行。
+                decision = self._review(request, tool)
+                if decision is Decision.APPROVED:
+                    decision = Decision.PENDING
+        if self.trace is not None:
+            self.trace.emit(
+                "mw_approval",
+                agent=self.agent,
+                step=self.step,
+                gated_count=1,
+                decision=decision.value,
+            )
+        if decision is Decision.APPROVED:
+            if seen is not None:
+                seen.add(key)
+            return
+        if decision is Decision.REJECTED:
+            raise ApprovalRejected(
+                "审批被拒:受审批工具调用被断路",
+                request_id=request.id,
+                tool=tool,
+                scope=request.scope,
+            )
+        raise ApprovalPending(
+            "审批待定:受审批工具调用待人类拍板",
+            request_id=request.id,
+            tool=tool,
+            scope=request.scope,
+        )
+
+    def _review(self, request: ApprovalRequest, tool: str) -> Decision:
         try:
             decision = self.gate.review(request)
         except Exception as exc:  # noqa: BLE001 —— fail-closed:门的任何故障都等同「未批准」
@@ -410,21 +750,20 @@ class _ApprovalGuard:
                 request_id=request.id,
                 tool=tool,
             )
-        if self.trace is not None:
-            self.trace.emit(
-                "mw_approval",
-                agent=self.agent,
-                step=self.step,
-                gated_count=1,
-                decision=decision.value,
-            )
-        if decision is Decision.APPROVED:
-            return
-        if decision is Decision.REJECTED:
-            raise ApprovalRejected(
-                "审批被拒:受审批工具调用被断路", request_id=request.id, tool=tool
-            )
-        raise ApprovalPending("审批待定:受审批工具调用待人类拍板", request_id=request.id, tool=tool)
+        return decision
+
+    def _consume(self, request: ApprovalRequest, tool: str) -> bool:
+        gate: Any = self.gate
+        try:
+            consumed = gate.consume(request)
+        except Exception as exc:  # noqa: BLE001 —— fail-closed
+            raise ApprovalGateError(
+                "审批门核销故障,受审批工具不执行(fail-closed)",
+                request_id=request.id,
+                tool=tool,
+                cause=type(exc).__name__,
+            ) from exc
+        return consumed is True
 
 
 _ACTIVE_GUARDS: ContextVar[tuple[_ApprovalGuard, ...]] = ContextVar(
@@ -432,15 +771,33 @@ _ACTIVE_GUARDS: ContextVar[tuple[_ApprovalGuard, ...]] = ContextVar(
 )
 
 
-def enforce_tool_approval(tool: str, arguments: Mapping[str, object]) -> None:
-    """工具执行点在【每一次】真实调用工具前调它:按当前生效的全部审批配置逐一审批。
+def enforce_tool_approval(
+    tool: str,
+    arguments: Mapping[str, object],
+    *,
+    target: object | None = None,
+    available: Collection[str] = (),
+) -> None:
+    """工具执行点在【每一次】真实调用工具前调它:按当前生效的全部审批配置逐一审批并核销。
 
-    未配置审批时只读一次 contextvar 即返回(零行为变化);命中受审批工具时:approved 放行,
-    rejected 抛 ApprovalRejected、pending 抛 ApprovalPending、门故障抛 ApprovalGateError——调用方
-    据此【不执行】该工具。自定义 agent 若自己执行工具,也应在调用前调它(或改用 require_approval)。
+    未配置审批时只读一次 contextvar 即返回(零行为变化);命中受审批工具时:approved 放行(可核销的
+    门在此扣减一次额度),rejected 抛 ApprovalRejected、pending 抛 ApprovalPending、门故障抛
+    ApprovalGateError——调用方据此【不执行】该工具。target 传被执行的工具对象:若它自带
+    require_approval 闸,同一个门交给工具自己审(避免同一调用被同一个门审两次、扣两次额度)。
+    available 传本执行点已注册的工具名:受审批名与之仅大小写 / 分隔符不同时 fail-closed。
+    自定义 agent 若自己执行工具,也应在调用前调它(或改用 require_approval)。
     """
-    for guard in _ACTIVE_GUARDS.get():
-        guard.check(tool, arguments)
+    guards = _ACTIVE_GUARDS.get()
+    if not guards:
+        return
+    skip = _wrapper_gate_ids(target)
+    seen: set[tuple[int, str]] = set()
+    for guard in guards:
+        if id(guard.gate) in skip:
+            if available:
+                _check_near_miss(guard.gated, available)
+            continue
+        guard.check(tool, arguments, available=available, seen=seen)
 
 
 def _push_guard(guard: _ApprovalGuard) -> Callable[[], None]:
@@ -449,20 +806,30 @@ def _push_guard(guard: _ApprovalGuard) -> Callable[[], None]:
     return lambda: _ACTIVE_GUARDS.reset(token)
 
 
+def _set_scope(scope: str) -> Callable[[], None]:
+    """把审批作用域设进当前上下文,返回对应的复位回调。"""
+    token = _APPROVAL_SCOPE.set(scope)
+    return lambda: _APPROVAL_SCOPE.reset(token)
+
+
 class _ApprovalGatedTool:
     """require_approval 对单串参 Tool 的包装:run 前先过闸(参数按 {"arg": arg} 规范化)。"""
 
     def __init__(self, tool: Tool, guard: _ApprovalGuard) -> None:
-        self._tool = tool
-        self._guard = guard
+        self.inner = tool
+        self.guard = guard
 
     @property
     def name(self) -> str:
-        return self._tool.name
+        return self.inner.name
 
     def run(self, arg: str) -> ToolResult:
-        self._guard.check(self._tool.name, {"arg": arg})
-        return self._tool.run(arg)
+        self.guard.check(self.inner.name, {"arg": arg})
+        return self.inner.run(arg)
+
+    def tool_inventory(self) -> frozenset[str] | None:
+        nested = reachable_tool_names(self.inner)
+        return frozenset({self.inner.name}) | (nested or frozenset())
 
 
 class _GuardedCall:
@@ -470,29 +837,67 @@ class _GuardedCall:
 
     def __init__(self, name: str, func: Callable[..., Any], guard: _ApprovalGuard) -> None:
         self._name = name
-        self._func = func
-        self._guard = guard
+        self.inner = func
+        self.guard = guard
 
     def __call__(self, **kwargs: Any) -> Any:
-        self._guard.check(self._name, kwargs)
-        return self._func(**kwargs)
+        self.guard.check(self._name, kwargs)
+        return self.inner(**kwargs)
+
+
+def _wrapper_gate_ids(target: object | None) -> frozenset[int]:
+    """被执行工具自带的 require_approval 闸所用的门(按对象身份;可多层包装)。"""
+    ids: set[int] = set()
+    node: object | None = target.func if isinstance(target, FunctionTool) else target
+    while isinstance(node, (_GuardedCall, _ApprovalGatedTool)):
+        ids.add(id(node.guard.gate))
+        node = node.inner
+    return frozenset(ids)
 
 
 @overload
 def require_approval(
-    tool: FunctionTool, gate: ApprovalGate, *, code: str = APPROVAL_TOOL_CALL
+    tool: FunctionTool,
+    gate: ApprovalGate,
+    *,
+    code: str = APPROVAL_TOOL_CALL,
+    scope: str | None = None,
+    redact: Redactor | None = None,
 ) -> FunctionTool: ...
 @overload
-def require_approval(tool: Tool, gate: ApprovalGate, *, code: str = APPROVAL_TOOL_CALL) -> Tool: ...
 def require_approval(
-    tool: FunctionTool | Tool, gate: ApprovalGate, *, code: str = APPROVAL_TOOL_CALL
+    tool: Tool,
+    gate: ApprovalGate,
+    *,
+    code: str = APPROVAL_TOOL_CALL,
+    scope: str | None = None,
+    redact: Redactor | None = None,
+) -> Tool: ...
+def require_approval(
+    tool: FunctionTool | Tool,
+    gate: ApprovalGate,
+    *,
+    code: str = APPROVAL_TOOL_CALL,
+    scope: str | None = None,
+    redact: Redactor | None = None,
 ) -> FunctionTool | Tool:
-    """把审批闸【绑进工具本身】:无论哪个 agent、哪条线程执行它,调用前都先过闸。
+    """把审批闸【绑进工具对象本身】:无论哪个 agent、哪条线程、以什么名字执行它,调用前都先过闸。
 
-    与 ApprovalMiddleware(动态作用域)互补:这条通道不依赖 contextvar,裸线程 / 第三方 agent 也
-    绕不过去。两者叠加时同一调用会被同一 gate 审两次,决议幂等,结果一致。
+    【安全场景的首选】按名字 gate(ApprovalMiddleware 的 gated_tools)只认工具名:同一个函数换个名字
+    再注册一遍、或调用方自建线程脱离动态作用域时都不设防;require_approval 绑在对象上,两者都挡得住。
+    scope:显式作用域;缺省取执行时外层的 approval_scope,再退回本包装实例自己的作用域(同一个包装
+    对象在多次重跑间作用域稳定)。与 ApprovalMiddleware 用同一个门叠加时,同一调用只审 / 核销一次。
     """
-    guard = _ApprovalGuard(gate=gate, gated=frozenset({tool.name}), code=code)
+    if scope is not None and (not isinstance(scope, str) or not scope):
+        raise ValueError("approval scope 必须是非空字符串")
+    guard = _ApprovalGuard(
+        gate=gate,
+        gated=frozenset({tool.name}),
+        code=code,
+        scope=scope,
+        default_scope=f"tool-{secrets.token_hex(8)}",
+        redact=redact if redact is not None else default_redactor,
+    )
     if isinstance(tool, FunctionTool):
         return replace(tool, func=_GuardedCall(tool.name, tool.func, guard))
     return _ApprovalGatedTool(tool, guard)
@@ -504,23 +909,23 @@ def require_approval(
 class ApprovalMiddleware:
     """审批门 middleware:把审批配置下沉到本步内【每一次真实工具调用】的执行点上。
 
-    before_step 把 (gate, gated_tools) 压进当前上下文的审批作用域,MiddlewareAgent 在本步结束(含
-    抛错)时弹出。作用域内,任何执行点(FunctionCallingAgent / ToolUsingAgent / 嵌套 agent /
-    run_parallel 的工作线程)在调用受审批工具前都按「真实工具名 + 规范化参数」向 gate review:
-    approved -> 执行;rejected -> 抛 ApprovalRejected(工具不执行);pending -> 抛 ApprovalPending 挂起
-    run,等 out-of-band resolve 后重跑本步(同一工具 + 同一参数命中已落决议,放行);门故障 ->
-    抛 ApprovalGateError(fail-closed)。编排层弹性模式经 corespine.error_to_dict 把它们归一进
-    AgentResult.error。
+    before_step 把 (gate, gated_tools, 作用域) 压进当前上下文的审批作用域,MiddlewareAgent 在本步结束
+    (含抛错)时弹出。作用域内,任何执行点(FunctionCallingAgent / ToolUsingAgent / 嵌套 agent /
+    run_parallel 的工作线程)在调用受审批工具前都按「真实工具名 + 规范化参数 + 作用域」向 gate review:
+    approved -> 核销一次额度后执行;rejected -> 抛 ApprovalRejected;pending -> 抛 ApprovalPending 挂起
+    run(context 带 request_id / scope);门故障 -> 抛 ApprovalGateError(fail-closed)。
 
-    【为何不再检查 ctx.tools】ctx.tools 只是「声明的可用面」,与内层 agent 真正执行什么无关:不播种
-    它、或重跑使步序变化,旧闸就看不见工具而放行(fail-open)。见 docs/adr/0002。
+    作用域:构造参数 scope > 外层 approval_scope(...) > 缺省每次 step 新建一个(并作为外层作用域传给
+    嵌套 agent)。resume:resolve 后在【同一作用域】里重跑本步(`with approval_scope(scope): ...`)。
 
-    【为何是「抛类型化错误」而非同步阻塞 / 新增续体机制】同 ADR 0001:pending 抛可重试、带 request_id
-    的 ApprovalPending,调用方 resolve 后重跑 step 恢复;决议幂等使重跑安全。
+    受审批工具名在构造时校验(不支持通配符);首次使用时若能推断被包裹 agent 的工具清单(见
+    spineagent.tools.tool.reachable_tool_names),对应不到已知工具的名字直接抛 ApprovalConfigError,
+    推断不了(不透明 agent)时在执行点检测「仅大小写 / 分隔符不同」的写错。按名字 gate 对「同一函数
+    以别名注册」不设防——安全场景首选 require_approval(按工具对象绑定)。
 
-    默认 gated_tools 为空 => before_step 恒早退,零行为变化(opt-in)。若在 MiddlewareAgent 之外手动
-    调 before_step 却不跑 ctx.cleanups,作用域会留在当前上下文里——只会多拦、不会少拦(偏 fail-closed)。
-    隐私:trace 只记 code / 计数 / 决议,绝不记工具参数正文。
+    参数预览:gate 收到的 ApprovalRequest 带 redact 钩子(缺省 default_redactor)产出的预览,只给
+    审批人看;trace 只记 code / 计数 / 决议,绝不记参数正文或预览。默认 gated_tools 为空 =>
+    before_step 恒早退,零行为变化(opt-in)。
     """
 
     def __init__(
@@ -529,14 +934,31 @@ class ApprovalMiddleware:
         *,
         gated_tools: Sequence[str] = (),
         code: str = APPROVAL_TOOL_CALL,
+        scope: str | None = None,
+        redact: Redactor | None = None,
     ) -> None:
+        if scope is not None and (not isinstance(scope, str) or not scope):
+            raise ValueError("approval scope 必须是非空字符串")
         self._gate = gate
-        self._gated = frozenset(gated_tools)
+        self._gated = _validate_gated_names(gated_tools)
         self._code = code
+        self._scope = scope
+        self._redact = redact if redact is not None else default_redactor
 
     def before_step(self, ctx: StepContext) -> None:
         if not self._gated:
             return  # 未配置受审批工具:零行为变化
+        inventory = reachable_tool_names(ctx.inner_agent)
+        if inventory is not None:
+            unknown = sorted(self._gated - inventory)
+            if unknown:
+                raise ApprovalConfigError(
+                    "受审批工具名对应不到被包裹 agent 的任何已知工具(拼写 / 大小写?),fail-closed",
+                    unknown=unknown,
+                )
+        scope = self._scope or _APPROVAL_SCOPE.get() or f"run-{secrets.token_hex(8)}"
+        # 作用域同时设为外层作用域:嵌套的审批配置 / require_approval 包装与本步共享同一作用域。
+        ctx.cleanups.append(_set_scope(scope))
         guard = _ApprovalGuard(
             gate=self._gate,
             gated=self._gated,
@@ -544,6 +966,8 @@ class ApprovalMiddleware:
             trace=ctx.trace,
             agent=ctx.agent,
             step=ctx.step,
+            scope=scope,
+            redact=self._redact,
         )
         ctx.cleanups.append(_push_guard(guard))
 

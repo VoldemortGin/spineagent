@@ -9,17 +9,22 @@ import pytest
 from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
 
 from spineagent.agent.approval import (
+    ApprovalConfigError,
     ApprovalConflict,
+    ApprovalError,
     ApprovalGateError,
     ApprovalMiddleware,
     ApprovalPending,
     ApprovalRejected,
     AutoApprovalGate,
+    ConsumableApprovalGate,
     Decision,
     InMemoryResumeTokenStore,
     InvalidResumeToken,
     ManualApprovalGate,
+    UnknownApprovalRequest,
     approval_gates,
+    approval_scope,
     enforce_tool_approval,
     make_approval_gate,
     make_approval_request,
@@ -102,6 +107,7 @@ def test_manual_gate_pending_until_resolved():
 def test_manual_gate_idempotent_and_conflict():
     gate = ManualApprovalGate()
     req = make_approval_request("tool_call", "rm")
+    gate.review(req)  # 只能决议已登记的请求
     gate.resolve(req.id, Decision.APPROVED)
     gate.resolve(req.id, Decision.APPROVED)  # 相同决议重复 resolve 幂等
     assert gate.review(req) is Decision.APPROVED
@@ -121,6 +127,7 @@ def test_manual_resolve_rejects_pending_target():
 def test_resume_token_is_single_use():
     gate = ManualApprovalGate()
     req = make_approval_request("tool_call", "rm")
+    gate.review(req)  # 只能决议已登记的请求
     token = gate.resolve(req.id, Decision.APPROVED)
     ticket = gate.redeem(token)  # 首次 redeem 成功
     assert ticket.request_id == req.id and ticket.decision is Decision.APPROVED
@@ -273,11 +280,14 @@ def test_pending_suspends_then_resumes():
     assert ei.value.retryable is True
     assert deleter.paths == []
     assert [r.id for r in gate.pending()] == [request_id]
-    # out-of-band 批准 -> 铸一次性 resume token -> redeem 授权恢复。
+    # out-of-band 批准 -> 铸一次性 resume token -> redeem 拿回 ticket(带作用域)。
     token = gate.resolve(request_id, Decision.APPROVED)
-    assert gate.redeem(token).request_id == request_id
-    # 重跑本步:同一工具 + 同一参数命中已落决议 -> 放行,真实工具执行恰好一次。
-    assert agent.step("go").output == "finished"
+    ticket = gate.redeem(token)
+    assert ticket.request_id == request_id
+    assert ticket.scope == ei.value.context["scope"]
+    # 在同一作用域里重跑本步:同一工具 + 同一参数命中批准 -> 核销后执行恰好一次。
+    with approval_scope(ticket.scope):
+        assert agent.step("go").output == "finished"
     assert deleter.paths == ["/x"]
 
 
@@ -285,7 +295,8 @@ def test_approval_binds_to_arguments_not_just_tool_name():
     # 批准只对指纹相同(工具名 + 规范化参数)的调用有效:模型改了参数就必须重新审批。
     deleter = _Deleter()
     gate = ManualApprovalGate()
-    mw = ApprovalMiddleware(gate, gated_tools=["delete_file"])
+    # 固定作用域:只让「参数不同」成为变量(缺省每次 step 一个新作用域,会掩盖本测试要钉的东西)。
+    mw = ApprovalMiddleware(gate, gated_tools=["delete_file"], scope="session")
     with pytest.raises(ApprovalPending) as ei:
         MiddlewareAgent("g", _fc(deleter, "/safe"), [mw]).step("go")
     gate.resolve(ei.value.context["request_id"], Decision.APPROVED)
@@ -389,3 +400,326 @@ def test_approval_trace_is_privacy_safe():
         assert not {k for k in event.fields if k.strip().lower() in FORBIDDEN_KEYS}
         for value in event.fields.values():
             assert _SENTINEL not in str(value)  # 绝不泄露任务 / 参数正文
+
+
+# ---- 审查复现(修复 2):批准语义 —— 一次性消费 / 作用域 / 只能决议已存在的请求 ----------------------
+
+
+def _fc_calls(deleter: _Deleter, calls: int, path: str = "/a", name: str = "fc"):
+    script = ScriptedToolCallProvider([("delete_file", {"path": path})] * calls, final="finished")
+    return FunctionCallingAgent(name, script, [_delete_tool(deleter)])
+
+
+def _guarded(agent, gate, **kw):
+    return MiddlewareAgent(
+        "mw", agent, [ApprovalMiddleware(gate, gated_tools=["delete_file"], **kw)]
+    )
+
+
+def test_review_a1_one_approval_never_buys_unlimited_executions():
+    # 审查 A1:只 resolve 一次、从不 redeem,之后同一步里重复 6 次、换一个 agent 再 6 次,共执行了 12 次。
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    with pytest.raises(ApprovalPending) as ei:
+        _guarded(_fc_calls(deleter, 1), gate).step("x")
+    gate.resolve(ei.value.context["request_id"], Decision.APPROVED)
+    for name in ("fc", "other-agent"):
+        with pytest.raises(ApprovalPending):
+            _guarded(_fc_calls(deleter, 6, name=name), gate).step("again")
+    assert len(deleter.paths) <= 1
+
+
+def test_review_resolve_cannot_preapprove_an_offline_computed_id():
+    # 审查:request id 只由 code + 工具名 + 参数派生,resolve 不要求请求被 review 过 —— 可离线算出 id 预先批准。
+    gate = ManualApprovalGate()
+    forged = make_approval_request("tool_call", "delete_file", {"path": "/a"}, bind_values=True)
+    with pytest.raises(ApprovalError):
+        gate.resolve(forged.id, Decision.APPROVED)
+    deleter = _Deleter()
+    with pytest.raises(ApprovalPending):
+        _guarded(_fc_calls(deleter, 1), gate).step("x")
+    assert deleter.paths == []
+
+
+def test_review_a11_approver_sees_what_is_being_approved():
+    # 审查 A11:审批人经 pending() 只看到工具名与 schema 指纹 —— transfer(1) 与 transfer(1000000) 一模一样。
+    gate = ManualApprovalGate()
+    for amount in ("1", "1000000"):
+        with pytest.raises(ApprovalPending):
+            _guarded(_fc_calls(_Deleter(), 1, path=amount), gate).step("t")
+    previews = {dict(r.preview)["path"] for r in gate.pending()}
+    assert previews == {"'1'", "'1000000'"} or previews == {"1", "1000000"}
+
+
+def test_review_a6_misspelled_gated_name_fails_closed():
+    # 审查 A6:gated_tools=["Delete_File"](大小写写错)静默放行。
+    deleter = _Deleter()
+    agent = MiddlewareAgent(
+        "mw",
+        _fc_calls(deleter, 1),
+        [ApprovalMiddleware(AutoApprovalGate(deny=["*"]), gated_tools=["Delete_File"])],
+    )
+    with pytest.raises(ApprovalError):
+        agent.step("t")
+    assert deleter.paths == []
+
+
+def test_review_glob_gated_name_is_refused():
+    with pytest.raises(ValueError):
+        ApprovalMiddleware(AutoApprovalGate(deny=["*"]), gated_tools=["delete_*"])
+
+
+# ---- 修复 2:新语义的细节(作用域 / 额度 / 生命周期 / 预览 / ticket / 名字校验)-------------------
+
+
+def _pending_id(agent, task="t"):
+    with pytest.raises(ApprovalPending) as ei:
+        agent.step(task)
+    return ei.value
+
+
+def test_default_scope_is_per_run_and_resume_needs_the_same_scope():
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    agent = _guarded(_fc_calls(deleter, 1), gate)
+    first = _pending_id(agent)
+    gate.resolve(first.context["request_id"], Decision.APPROVED)
+    second = _pending_id(agent)  # 不带作用域重跑 = 新 run = 新作用域 -> 新请求
+    assert second.context["request_id"] != first.context["request_id"]
+    assert deleter.paths == []
+    with approval_scope(first.context["scope"]):
+        assert agent.step("t").output == "finished"
+    assert deleter.paths == ["/a"]
+
+
+def test_shared_gate_does_not_leak_between_explicit_scopes():
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    alice = _guarded(_fc_calls(deleter, 1), gate, scope="alice")
+    bob = _guarded(_fc_calls(deleter, 1), gate, scope="bob")
+    gate.resolve(_pending_id(alice).context["request_id"], Decision.APPROVED)
+    _pending_id(bob)
+    assert deleter.paths == []
+    alice.step("t")
+    assert deleter.paths == ["/a"]
+
+
+def test_uses_n_and_reusable_mode():
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    agent = _guarded(_fc_calls(deleter, 3), gate, scope="s")
+    gate.resolve(_pending_id(agent).context["request_id"], Decision.APPROVED, uses=2)
+    _pending_id(agent)  # 第三次调用额度用尽
+    assert deleter.paths == ["/a", "/a"]
+
+    deleter2, gate2 = _Deleter(), ManualApprovalGate()
+    agent2 = _guarded(_fc_calls(deleter2, 3), gate2, scope="s")
+    # 显式可选的幂等模式:有效期内不限次(风险见 ADR 0002)。
+    gate2.resolve(_pending_id(agent2).context["request_id"], Decision.APPROVED, uses=None)
+    agent2.step("t")
+    agent2.step("t")
+    assert len(deleter2.paths) == 6
+
+
+def test_resolve_validates_uses_and_ttl():
+    gate = ManualApprovalGate()
+    req = make_approval_request("tool_call", "rm")
+    gate.review(req)
+    with pytest.raises(ValueError):
+        gate.resolve(req.id, Decision.APPROVED, uses=0)
+    with pytest.raises(ValueError):
+        gate.resolve(req.id, Decision.APPROVED, ttl_seconds=0)
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_pending_table_is_bounded():
+    gate = ManualApprovalGate(max_requests=3)
+    ids = []
+    for i in range(5):
+        req = make_approval_request("tool_call", "rm", {"i": i}, bind_values=True)
+        gate.review(req)
+        ids.append(req.id)
+    assert {r.id for r in gate.pending()} == set(ids[2:])  # 最早登记的被淘汰
+    with pytest.raises(UnknownApprovalRequest):
+        gate.resolve(ids[0], Decision.APPROVED)
+
+
+def test_requests_and_approvals_expire():
+    clock = _Clock()
+    gate = ManualApprovalGate(request_ttl=10.0, now_fn=clock)
+    req = make_approval_request("tool_call", "rm", {"p": "/a"}, bind_values=True)
+    gate.review(req)
+    clock.now = 11.0
+    assert gate.pending() == []
+    with pytest.raises(UnknownApprovalRequest):
+        gate.resolve(req.id, Decision.APPROVED)
+    assert gate.review(req) is Decision.PENDING  # 过期后重新登记
+    gate.resolve(req.id, Decision.APPROVED, ttl_seconds=5.0)
+    clock.now = 17.0
+    assert gate.review(req) is Decision.PENDING  # 批准过期,不再放行
+    assert gate.consume(req) is False
+
+
+def test_rejection_is_not_consumed():
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    agent = _guarded(_fc_calls(deleter, 1), gate, scope="s")
+    gate.resolve(_pending_id(agent).context["request_id"], Decision.REJECTED)
+    for _ in range(2):
+        with pytest.raises(ApprovalRejected):
+            agent.step("t")
+    assert deleter.paths == []
+
+
+def test_preview_is_redacted_truncated_and_never_traced():
+    calls = [
+        ("transfer", {"amount": 1000000, "password": "hunter2-SENTINEL", "memo": "x" * 500}),
+    ]
+    hits: list[dict] = []
+
+    def transfer(amount: int, password: str, memo: str) -> str:
+        hits.append({"amount": amount})
+        return "ok"
+
+    tool = FunctionTool(
+        "transfer",
+        "",
+        {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "integer"},
+                "password": {"type": "string"},
+                "memo": {"type": "string"},
+            },
+        },
+        func=transfer,
+    )
+    gate = ManualApprovalGate()
+    agent = MiddlewareAgent(
+        "mw",
+        FunctionCallingAgent("fc", ScriptedToolCallProvider(calls), [tool]),
+        [ApprovalMiddleware(gate, gated_tools=["transfer"])],
+    )
+    sink = InProcessPrivacyTraceSink()
+    with pytest.raises(ApprovalPending):
+        agent.step("t", trace=sink)
+    [request] = gate.pending()
+    preview = dict(request.preview)
+    assert preview["amount"] == "1000000"  # 审批人看得到要批的是什么
+    assert preview["password"] == "***"  # 敏感键打码
+    assert len(preview["memo"]) < 260 and preview["memo"].startswith("'xxx")  # 截断
+    assert "hunter2" not in repr(request)  # 预览不进 repr
+    for event in sink.events:
+        for value in event.fields.values():
+            assert "hunter2" not in str(value) and "1000000" not in str(value)
+    assert hits == []
+
+
+def test_custom_redactor_and_failing_redactor():
+    gate = ManualApprovalGate()
+
+    def hide_all(key, value):
+        return "<hidden>"
+
+    agent = _guarded(_fc_calls(_Deleter(), 1, path="/secret"), gate, redact=hide_all)
+    _pending_id(agent)
+    assert dict(gate.pending()[0].preview) == {"path": "<hidden>"}
+
+    def broken(key, value):
+        raise RuntimeError("boom")
+
+    gate2 = ManualApprovalGate()
+    _pending_id(_guarded(_fc_calls(_Deleter(), 1, path="/secret"), gate2, redact=broken))
+    assert dict(gate2.pending()[0].preview) == {"path": "***"}  # 钩子出错整值打码,不回退原文
+
+
+def test_ticket_replay_cannot_execute_twice():
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    agent = _guarded(_fc_calls(deleter, 1), gate)
+    pending = _pending_id(agent)
+    ticket = gate.redeem(gate.resolve(pending.context["request_id"], Decision.APPROVED))
+    with approval_scope(ticket.scope):
+        agent.step("t")
+        with pytest.raises(ApprovalPending):
+            agent.step("t")  # 重放同一 ticket 的作用域:批准已核销
+    assert deleter.paths == ["/a"]
+
+
+def test_stacked_static_and_dynamic_gate_consume_once():
+    # require_approval 与 ApprovalMiddleware 用同一个门叠加:同一调用只审 / 核销一次。
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    tool = require_approval(_delete_tool(deleter), gate)
+    script = ScriptedToolCallProvider([("delete_file", {"path": "/a"})], final="finished")
+    agent = _guarded(FunctionCallingAgent("fc", script, [tool]), gate, scope="s")
+    gate.resolve(_pending_id(agent).context["request_id"], Decision.APPROVED)
+    assert agent.step("t").output == "finished"
+    assert deleter.paths == ["/a"]
+
+
+def test_nested_middlewares_with_same_gate_share_scope_and_consume_once():
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    inner = _guarded(_fc_calls(deleter, 1), gate)
+    outer = _guarded(inner, gate)
+    pending = _pending_id(outer)
+    assert len(gate.pending()) == 1  # 嵌套共享外层作用域:一次调用只产生一个待审请求
+    gate.resolve(pending.context["request_id"], Decision.APPROVED)
+    with approval_scope(pending.context["scope"]):
+        outer.step("t")
+    assert deleter.paths == ["/a"]
+
+
+def test_unknown_gated_name_fails_closed_when_inventory_is_known():
+    deleter = _Deleter()
+    agent = MiddlewareAgent(
+        "mw",
+        _fc_calls(deleter, 1),
+        [ApprovalMiddleware(AutoApprovalGate(deny=["*"]), gated_tools=["rm_rf"])],
+    )
+    with pytest.raises(ApprovalConfigError):
+        agent.step("t")
+    assert deleter.paths == []
+
+
+def test_misspelled_gated_name_fails_closed_for_opaque_and_tool_using_agents():
+    from spineagent.agent.agent import FunctionAgent
+
+    deleter = _Deleter()
+    inner = _fc_calls(deleter, 1)
+    opaque = FunctionAgent("opaque", lambda t: inner.step(t).output)  # 推断不了工具清单
+    gate = AutoApprovalGate(deny=["*"])
+    with pytest.raises(ApprovalConfigError):
+        MiddlewareAgent("mw", opaque, [ApprovalMiddleware(gate, gated_tools=["DELETE-file"])]).step(
+            "t"
+        )
+    assert deleter.paths == []
+
+    hits: list[str] = []
+
+    class Nuke:
+        name = "nuke_db"
+
+        def run(self, arg):
+            hits.append(arg)
+            return ToolResult(tool=self.name, output="boom")
+
+    tu = ToolUsingAgent("tu", SyntaxToolPolicy(), [Nuke()])
+    with pytest.raises(ApprovalConfigError):
+        MiddlewareAgent("mw", tu, [ApprovalMiddleware(gate, gated_tools=["Nuke_DB"])]).step(
+            "nuke_db: now"
+        )
+    assert hits == []
+
+
+def test_invalid_gated_names_are_refused_at_construction():
+    for bad in (["delete_?"], ["[a-z]"], [""], ["*"]):
+        with pytest.raises(ApprovalConfigError):
+            ApprovalMiddleware(AutoApprovalGate(), gated_tools=bad)
+    with pytest.raises(ValueError):
+        ApprovalMiddleware(AutoApprovalGate(), gated_tools=["x"], scope="")
+
+
+def test_consumable_protocol():
+    assert isinstance(ManualApprovalGate(), ConsumableApprovalGate)
+    assert not isinstance(AutoApprovalGate(), ConsumableApprovalGate)

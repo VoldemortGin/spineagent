@@ -83,7 +83,8 @@ agent 在一步里可调用的能力:有 `name`,`run(arg: str) -> ToolResult`(�
 - **approval(审批门 / Wait)**:`ApprovalGate`(`AutoApprovalGate` 策略表 / `ManualApprovalGate` 人工挂起 +
   一次性 resume token)。审批是**工具调用点上的强制闸**(ADR 0002):`ApprovalMiddleware` 把审批配置压进
   当前上下文,`FunctionCallingAgent` / `ToolUsingAgent` 在**每一次**真实调用工具前按「工具名 + 规范化参数」
-  review;未批准不执行,门故障 fail-closed;`require_approval(tool, gate)` 把闸直接绑进工具本身。
+  review;未批准不执行,门故障 fail-closed;`require_approval(tool, gate)` 把闸直接绑进工具本身。批准缺省
+  一次性消费、绑定作用域(会话 / 用户 / run),`ManualApprovalGate.pending()` 带脱敏的参数预览。
 - **sandbox**:`InProcessSandbox` 受限白名单表达式求值器(先验规模守卫、工作量预算、值上限、输出上限;
   协作式 timeout 只是第二道闸,打断不了单个内建调用);
   `subprocess` / `container` 是占位、尚未实现。
@@ -129,10 +130,10 @@ agent 在一步里可调用的能力:有 `name`,`run(arg: str) -> ToolResult`(�
 - `AGENT_INVARIANTS` — 步必产出非空、结果可溯源到 agent、步级 trace 隐私安全。
 - `TOOL_INVARIANTS` — 工具结果可溯源、调用必产出非空。
 - `POLICY_INVARIANTS` — 决策是 ToolCall/Finish 之一、不幻觉不存在的工具、空工具集必收尾且非空、`decide` 是纯函数、数据段绝不变成工具调用。
-- `LLM_INVARIANTS` / `STREAMING_INVARIANTS` / `SANDBOX_INVARIANTS`(含超时生效)/ `SKILL_INVARIANTS` /
+- `LLM_INVARIANTS` / `STREAMING_INVARIANTS` / `SANDBOX_INVARIANTS`(含超时生效、值放大型表达式有界)/ `SKILL_INVARIANTS` /
   `MIDDLEWARE_INVARIANTS` / `ARTIFACT_INVARIANTS` / `APPROVAL_INVARIANTS`。
 - `APPROVAL_ENFORCEMENT_INVARIANTS` — 参数化所有会执行工具的 agent 形态:未批准执行 0 次、重跑不绕过、
-  改参数须重新审批、门故障 fail-closed、未受审批工具不受影响。
+  改参数须重新审批、一次批准只放行一次、A 作用域的批准对 B 无效、门故障 fail-closed、未受审批工具不受影响。
 - `TOOL_TRACE_INVARIANTS` — 模型编造的未知工具名绝不进 trace。
 
 任何号称 Agent / Tool / ToolPolicy 的(含第三方)实现,都可丢进对应不变量包跑 conformance——没过直接红,而非埋雷。

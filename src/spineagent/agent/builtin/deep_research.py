@@ -70,6 +70,9 @@ class DeepResearchAgent:
     def name(self) -> str:
         return self._name
 
+    def tool_inventory(self) -> frozenset[str] | None:
+        return frozenset(tool.name for tool in self._tools)
+
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
         # 1) 分解:子查询列表(封顶 max_subqueries;planner 返空则回落整条任务)。
         subqueries = (self._planner(task) or [task])[: self._max_subqueries]
