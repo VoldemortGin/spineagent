@@ -14,8 +14,11 @@ Call / 非白名单 Name),用「工作量预算」作为确定性的 CPU 代理�
 【超时与代价上界(诚实表述)】协作式 deadline 只在节点之间检查,【无法中断单个内建调用】;单次求值的
 耗时 / 内存上界来自【先验的规模守卫】:值规模硬上限(整数位数 / 文本长度 / 容器元素数 / 嵌套深度)、
 按参数的值预测结果规模的守卫(幂、序列重复与拼接、round 的 ndigits、int() 的数字串长度、sum 只做数值
-累加),以及总工作量预算(每个节点 1 单位,单节点内按输入 / 结果规模折算,如 sorted(x) 记 len(x) 单位;
-不可关闭的硬上限 _MAX_WORK_UNITS)。deadline 是第二道闸:每个节点前后各检查一次,超时判 limit_exceeded。真实
+累加),总工作量预算(每个节点 1 单位,单节点内按输入 / 结果规模折算,如 sorted(x) 记 len(x) 单位、文本按
+存储字节折算;不可关闭的硬上限 _MAX_WORK_UNITS),以及【内存预算】:每个节点产生的值按估算字节(sys.getsizeof,
+宽字符串按实际存储宽度;容器按元素递归)在产生的那一刻累加并检查——容器字面量与调用实参逐个元素求值时就会
+在超限处停下,而不是全部物化后才检查(缺省 DEFAULT_LIMITS.max_memory_bytes = 32 MiB,不可关闭的硬上限
+_MAX_MEMORY_BYTES = 128 MiB)。deadline 是第二道闸:每个节点前后各检查一次,超时判 limit_exceeded。真实
 硬隔离后端(subprocess / container)走 [sandbox] extra 延迟 import,是使用者按其平台接入的事。
 
 隐私:Sandbox 不发 trace(它是被 skill / agent 调用的底层执行原语);其结果只含代码自己的产出
@@ -25,9 +28,10 @@ Call / 非白名单 Name),用「工作量预算」作为确定性的 CPU 代理�
 import ast
 import math
 import operator
+import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
 from corespine.errors import SeamError
@@ -42,7 +46,8 @@ class ResourceUsage:
     """一次沙箱执行的资源记账:确定性的 ops(工作量单位,CPU 代理)+ 输出字符数 + 墙钟秒。
 
     InProcessSandbox 的 ops = 求值的节点数 + 单节点内大操作按输入 / 结果规模折算的单位(遍历一个容器
-    元素、处理 1024 个字符 / 位各记 1;迭代型内建对文本按字符记)。
+    元素、处理 1024 字节文本 / 1024 位整数各记 1;迭代型内建对文本按字符记);memory_bytes = 求值过程中
+    物化的值的估算字节累计(sys.getsizeof 口径,确定性)。
 
     ops / output_chars 对同一输入恒定(可断言、可复现);wall_seconds 是【信息性】的耗时观测,
     仅供排障,不参与任何不变量断言(它随机器负载浮动)。
@@ -51,6 +56,7 @@ class ResourceUsage:
     ops: int = 0
     output_chars: int = 0
     wall_seconds: float = 0.0
+    memory_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -63,16 +69,24 @@ class Limits:
       subprocess / container 后端的职责;
     - max_output_chars:产出字符上限,超出即判失败(任何后端都能事后度量,故这是最中立的上限);
     - max_ops:InProcessSandbox 的工作量单位上限(确定性 CPU 代理,见 ResourceUsage),超出即判失败;
-      None 时仍受不可关闭的硬上限(100 万单位)约束,大于硬上限的值按硬上限算。
+      None 时仍受不可关闭的硬上限(100 万单位)约束,大于硬上限的值按硬上限算;
+    - max_memory_bytes:InProcessSandbox 求值时物化的值的估算字节累计上限(见 ResourceUsage.memory_bytes),
+      超出即判 limit_exceeded;None 时仍受不可关闭的硬上限(128 MiB)约束,大于硬上限的值按硬上限算。
+      累计口径(不随临时值释放而回退)是刻意的保守:确定性、可复现,宁可多拒也不放过。
     """
 
     timeout_seconds: float | None = None
     max_output_chars: int | None = None
     max_ops: int | None = None
+    max_memory_bytes: int | None = None
 
 
-# 缺省上限:离线默认路径开箱即用的温和护栏(可被 run() 的 limits / timeout 覆盖)。
-DEFAULT_LIMITS = Limits(timeout_seconds=5.0, max_output_chars=64_000, max_ops=100_000)
+# 缺省上限:离线默认路径开箱即用的温和护栏(可被 run() 的 limits / timeout 覆盖)。内存缺省 32 MiB 的依据:
+# 单个值最大约 256 KiB(64k 个 4 字节宽字符),合法的 skill 预检表达式物化的总量远小于 1 MiB;而
+# spinestudio 的演示机只有 1 GiB 内存,几个并发预检各 32 MiB 仍留足余量。
+DEFAULT_LIMITS = Limits(
+    timeout_seconds=5.0, max_output_chars=64_000, max_ops=100_000, max_memory_bytes=32 * 2**20
+)
 
 # InProcessSandbox 与宿主进程共享内存，节点数预算本身挡不住少量 AST 节点制造巨值
 # （如 ``"x" * 10**9`` / ``2 ** 10**9``）。这些硬上限先于真实运算检查，属于
@@ -91,10 +105,13 @@ _MAX_INT_STR_CHARS = 4_300
 # 值的容器嵌套深度上限(深嵌套 env 会让规模检查本身递归爆栈)。
 _MAX_NESTING_DEPTH = 100
 # 总工作量单位的硬上限:即使调用方传 max_ops=None 也不可关闭。一个单位约等于求值一个节点、遍历一个
-# 容器元素、或处理 _UNIT_CHARS 个字符 / 位。
+# 容器元素、或处理 _UNIT_BYTES 字节的文本 / _UNIT_BITS 位的整数。
 _MAX_WORK_UNITS = 1_000_000
-_UNIT_CHARS = 1_024
-# 会【迭代】实参的内建:对 str / bytes 实参按字符数(而非 /_UNIT_CHARS)计费。
+_UNIT_BYTES = 1_024
+_UNIT_BITS = 1_024
+# 估算字节累计的硬上限:即使调用方传 max_memory_bytes=None 也不可关闭。
+_MAX_MEMORY_BYTES = 128 * 2**20
+# 会【迭代】实参的内建:对 str / bytes 实参按字符数(而非 /_UNIT_BYTES)计费。
 _ITERATING_BUILTINS = frozenset({"list", "tuple", "set", "dict", "sorted", "min", "max", "sum"})
 # O(1) 内建:不按实参规模计费。
 _CONSTANT_TIME_BUILTINS = frozenset({"len", "bool"})
@@ -146,11 +163,7 @@ def _effective_limits(timeout: float | None, limits: Limits | None) -> Limits:
     """把便捷入口 timeout 折叠进 limits;二者皆缺则退回 DEFAULT_LIMITS。"""
     base = limits if limits is not None else DEFAULT_LIMITS
     if timeout is not None:
-        base = Limits(
-            timeout_seconds=timeout,
-            max_output_chars=base.max_output_chars,
-            max_ops=base.max_ops,
-        )
+        base = replace(base, timeout_seconds=timeout)
     return base
 
 
@@ -230,6 +243,22 @@ class _WorkMeter:
             raise _LimitExceeded(f"求值工作量超过硬上限 {_MAX_WORK_UNITS}")
 
 
+class _MemoryMeter:
+    """内存预算:求值中物化的值按估算字节(sys.getsizeof 口径)累加,超限即 _LimitExceeded。
+
+    预算 = min(max_memory_bytes, _MAX_MEMORY_BYTES);max_memory_bytes=None 时仍受不可关闭的硬上限约束。
+    """
+
+    def __init__(self, max_bytes: int | None) -> None:
+        self.used = 0
+        self._limit = _MAX_MEMORY_BYTES if max_bytes is None else min(max_bytes, _MAX_MEMORY_BYTES)
+
+    def charge(self, nbytes: int) -> None:
+        self.used += nbytes
+        if self.used > self._limit:
+            raise _LimitExceeded(f"求值物化的值估算超过内存预算 {self._limit} 字节")
+
+
 def _plain_int(value: Any) -> bool:
     """bool 是 int 子类，但不按大整数运算参与预测。"""
     return type(value) is int
@@ -264,21 +293,26 @@ def _bounded_render_cost(
     remaining: int = _MAX_VALUE_CHARS,
     stack: set[int] | None = None,
     meter: _WorkMeter | None = None,
+    memory: _MemoryMeter | None = None,
 ) -> int:
     """保守估算 ``str(value)`` 物化成本，并递归拒绝非 JSON-like / 循环 / 过深嵌套的巨值。
 
-    给了 meter 时,遍历本身按「每个值 1 单位 + 每 _UNIT_CHARS 字符 / 位 1 单位」计入总工作量预算——
-    反复检查同一个大值的写法因此会被预算截住,而不是每次都免费地遍历一遍。
+    给了 meter 时,遍历本身按「每个值 1 单位 + 每 _UNIT_BYTES 字节文本 / _UNIT_BITS 位整数 1 单位」计入总
+    工作量预算——反复检查同一个大值的写法因此会被预算截住,而不是每次都免费地遍历一遍。给了 memory 时,
+    每个被遍历到的值按 sys.getsizeof 计入内存预算(容器递归到元素,深度受 _MAX_NESTING_DEPTH 限制)。
     """
     stack = stack if stack is not None else set()
     value_type = type(value)
     if meter is not None:
         if value_type is str or value_type is bytes:
-            meter.charge(1 + len(value) // _UNIT_CHARS)
+            # 按实际存储字节折算:宽字符串(每字符 2 / 4 字节)的代价与它占的内存成正比。
+            meter.charge(1 + sys.getsizeof(value) // _UNIT_BYTES)
         elif value_type is int:
-            meter.charge(1 + value.bit_length() // _UNIT_CHARS)
+            meter.charge(1 + value.bit_length() // _UNIT_BITS)
         else:
             meter.charge(1)
+    if memory is not None:
+        memory.charge(sys.getsizeof(value))
     if value is None or value_type is bool:
         return _charge(5, remaining)
     if value_type is int:
@@ -300,7 +334,7 @@ def _bounded_render_cost(
     if value_type is slice:
         total = 8
         for part in (value.start, value.stop, value.step):
-            total += _bounded_render_cost(part, remaining - total, stack, meter)
+            total += _bounded_render_cost(part, remaining - total, stack, meter, memory)
         return _charge(total, remaining)
     if value_type not in {list, tuple, set, frozenset, dict}:
         raise _Disallowed("只允许 JSON-like 标量/容器值，不允许自定义对象")
@@ -319,10 +353,10 @@ def _bounded_render_cost(
         for item in items:
             if value_type is dict:
                 key, child = item
-                total += _bounded_render_cost(key, remaining - total, stack, meter) + 2
-                total += _bounded_render_cost(child, remaining - total, stack, meter) + 2
+                total += _bounded_render_cost(key, remaining - total, stack, meter, memory) + 2
+                total += _bounded_render_cost(child, remaining - total, stack, meter, memory) + 2
             else:
-                total += _bounded_render_cost(item, remaining - total, stack, meter) + 2
+                total += _bounded_render_cost(item, remaining - total, stack, meter, memory) + 2
             _charge(total, remaining)
         return _charge(total, remaining)
     finally:
@@ -400,11 +434,13 @@ class _Evaluator:
         env: dict[str, object],
         max_ops: int | None,
         *,
+        max_memory_bytes: int | None = None,
         deadline: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._env = env
         self._meter = _WorkMeter(max_ops)
+        self._memory = _MemoryMeter(max_memory_bytes)
         self._deadline = deadline
         self._clock = clock
 
@@ -413,6 +449,11 @@ class _Evaluator:
         """已消耗的工作量单位(节点数 + 大操作按规模折算的单位)。"""
         return self._meter.used
 
+    @property
+    def memory_bytes(self) -> int:
+        """已物化的值的估算字节累计。"""
+        return self._memory.used
+
     def eval(self, node: ast.AST) -> Any:
         self._meter.charge(1)
         self._check_deadline()
@@ -420,12 +461,26 @@ class _Evaluator:
         if handler is None:
             raise _Disallowed(f"不允许的表达式节点:{type(node).__name__}")
         value = handler(self, node)
+        self._finish(node, value)
+        return value
+
+    def _finish(self, node: ast.AST, value: Any) -> None:
+        """一个节点产出值之后:复核 deadline、做结果规模检查(遍历计费)并把新物化的值计入内存预算。"""
         # 单个节点内部的工作无法被协作式打断:节点完成后立即复核 deadline,超时不得返回成功。
         self._check_deadline()
-        # 结果规模检查(遍历本身计费)。env 的值在 run() 入口已整体校验,引用它不再重复遍历。
-        if type(node) is not ast.Name:
+        node_type = type(node)
+        # env 的值在 run() 入口已整体校验,引用它既不重复遍历,也不是新物化的内存。
+        if node_type is ast.Name:
+            return
+        if node_type in _PASSTHROUGH_NODES:
+            # 结果就是某个子节点的值(已计过内存):只做规模检查。
             _bounded_render_cost(value, meter=self._meter)
-        return value
+        elif node_type in _LITERAL_NODES:
+            # 容器字面量的元素在逐个求值时已各自计入内存:这里只计容器自身(浅)。
+            _bounded_render_cost(value, meter=self._meter)
+            self._memory.charge(sys.getsizeof(value))
+        else:
+            _bounded_render_cost(value, meter=self._meter, memory=self._memory)
 
     def _check_deadline(self) -> None:
         # 协作式 deadline:每个节点前后各查一次时钟(单调时钟读取,开销远小于节点求值本身)。
@@ -448,14 +503,27 @@ class _Evaluator:
         raise _Disallowed(f"未绑定的名字:{node.id!r}(仅允许 env 提供的变量)")
 
     def _binop(self, node: ast.BinOp) -> Any:
-        op = _BIN_OPS.get(type(node.op))
-        if op is None:
-            raise _Disallowed(f"不允许的二元运算符:{type(node.op).__name__}")
-        left = self.eval(node.left)
-        right = self.eval(node.right)
-        self._charge_operands(left, right)
-        _guard_expensive_binop(node.op, left, right)
-        return op(left, right)
+        # 左结合链(1+2+…+n)迭代求值:不随链长递归(长链曾触发 RecursionError)。每个中间结果与独立
+        # 节点一样计费、复核 deadline、计入内存预算。
+        chain: list[ast.BinOp] = []
+        leaf: ast.expr = node
+        while isinstance(leaf, ast.BinOp):
+            if type(leaf.op) not in _BIN_OPS:
+                raise _Disallowed(f"不允许的二元运算符:{type(leaf.op).__name__}")
+            chain.append(leaf)
+            leaf = leaf.left
+        value = self.eval(leaf)
+        for step in reversed(chain):
+            if step is not node:
+                self._meter.charge(1)
+                self._check_deadline()
+            right = self.eval(step.right)
+            self._charge_operands(value, right)
+            _guard_expensive_binop(step.op, value, right)
+            value = _BIN_OPS[type(step.op)](value, right)
+            if step is not node:
+                self._finish(step, value)
+        return value
 
     def _unaryop(self, node: ast.UnaryOp) -> Any:
         op = _UNARY_OPS.get(type(node.op))
@@ -507,10 +575,20 @@ class _Evaluator:
         return {self.eval(e) for e in node.elts}
 
     def _dict(self, node: ast.Dict) -> Any:
-        return {
-            (self.eval(k) if k is not None else None): self.eval(v)
-            for k, v in zip(node.keys, node.values, strict=True)
-        }
+        result: dict[Any, Any] = {}
+        for key_node, value_node in zip(node.keys, node.values, strict=True):
+            if key_node is None:
+                # {**d}:展开另一个 dict(只接受 dict;语义与 Python 一致,后者覆盖前者)。
+                unpacked = self.eval(value_node)
+                if type(unpacked) is not dict:
+                    raise _Disallowed("** 只能展开 dict")
+                result.update(unpacked)
+            else:
+                key = self.eval(key_node)
+                result[key] = self.eval(value_node)
+            if len(result) > _MAX_COLLECTION_ITEMS:
+                raise _LimitExceeded(f"容器元素数超过 {_MAX_COLLECTION_ITEMS}")
+        return result
 
     def _subscript(self, node: ast.Subscript) -> Any:
         container = self.eval(node.value)
@@ -529,8 +607,10 @@ class _Evaluator:
         if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_BUILTINS:
             raise _Disallowed("只允许调用白名单内建函数(len/str/int/…),不允许任意调用")
         func = _SAFE_BUILTINS[node.func.id]
+        if any(kw.arg is None for kw in node.keywords):
+            raise _Disallowed("调用里不支持 ** 展开参数")
         args = [self.eval(a) for a in node.args]
-        kwargs = {kw.arg: self.eval(kw.value) for kw in node.keywords if kw.arg is not None}
+        kwargs = {str(kw.arg): self.eval(kw.value) for kw in node.keywords}
         _charge_call(node.func.id, args, kwargs, self._meter)
         _guard_builtin_call(node.func.id, args, kwargs)
         return func(*args, **kwargs)
@@ -558,6 +638,10 @@ class _Evaluator:
             return ascii(value)
         return str(value)
 
+
+# 结果就是某个子节点的值的节点(不是新物化的内存)/ 容器字面量(元素已逐个计入内存)。
+_PASSTHROUGH_NODES: frozenset[type[ast.AST]] = frozenset({ast.IfExp, ast.BoolOp})
+_LITERAL_NODES: frozenset[type[ast.AST]] = frozenset({ast.List, ast.Tuple, ast.Set, ast.Dict})
 
 # 节点类型 -> 处理器方法(白名单闭集:不在此表即 _Disallowed)。
 _HANDLERS: dict[type[ast.AST], Callable[[_Evaluator, Any], Any]] = {
@@ -612,7 +696,7 @@ class InProcessSandbox:
     ) -> SandboxResult:
         eff = _effective_limits(timeout, limits)
         started = time.perf_counter()
-        evaluator = _Evaluator({}, eff.max_ops)
+        evaluator = _Evaluator({}, eff.max_ops, max_memory_bytes=eff.max_memory_bytes)
         if type(code) is not str:
             return self._fail("disallowed", "code 必须是普通 str", evaluator, started)
         if env is not None and type(env) is not dict:
@@ -627,7 +711,13 @@ class InProcessSandbox:
         except _LimitExceeded as exc:
             return self._fail("limit_exceeded", str(exc), evaluator, started)
         deadline = None if eff.timeout_seconds is None else self._clock() + eff.timeout_seconds
-        evaluator = _Evaluator(namespace, eff.max_ops, deadline=deadline, clock=self._clock)
+        evaluator = _Evaluator(
+            namespace,
+            eff.max_ops,
+            max_memory_bytes=eff.max_memory_bytes,
+            deadline=deadline,
+            clock=self._clock,
+        )
         if len(code) > _MAX_CODE_CHARS:
             return self._fail(
                 "limit_exceeded",
@@ -637,14 +727,29 @@ class InProcessSandbox:
             )
         try:
             tree = ast.parse(code, mode="eval")
-        except (SyntaxError, ValueError, RecursionError) as exc:
+        except (SyntaxError, ValueError) as exc:
             return self._fail("syntax", f"语法错误:{exc}", evaluator, started)
+        except (MemoryError, RecursionError) as exc:
+            # 解析器自身的栈 / 内存上限(如 '-'*6000+'1'):失败一律容住,不冒泡出 run()。
+            return self._fail(
+                "limit_exceeded",
+                f"代码嵌套过深,解析器拒绝:{type(exc).__name__}",
+                evaluator,
+                started,
+            )
         try:
             value = evaluator.eval(tree.body)
         except _Disallowed as exc:
             return self._fail("disallowed", str(exc), evaluator, started)
         except _LimitExceeded as exc:
             return self._fail("limit_exceeded", str(exc), evaluator, started)
+        except (MemoryError, RecursionError) as exc:
+            return self._fail(
+                "limit_exceeded",
+                f"表达式嵌套过深或内存不足:{type(exc).__name__}",
+                evaluator,
+                started,
+            )
         except Exception as exc:  # noqa: BLE001 —— 沙箱容住代码自身的运行时错误,如实上报
             return self._fail("error", f"{type(exc).__name__}: {exc}", evaluator, started)
 
@@ -682,6 +787,7 @@ class InProcessSandbox:
             ops=evaluator.ops,
             output_chars=output_chars,
             wall_seconds=time.perf_counter() - started,
+            memory_bytes=evaluator.memory_bytes,
         )
 
 

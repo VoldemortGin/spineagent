@@ -21,9 +21,10 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
                  发了 tool_calls 时,每条 tool_call 形状可往返(id / function.name 非空、
                  function.arguments 是合法 JSON)。绝不预设具体文本/工具名——那是各适配器单测的事。
   sandbox     —— 【隔离契约,实现中立】①结果可溯源到产出它的沙箱(provenance);②执行必产出非空
-                 文本;③资源记账非负(ops / output_chars / wall_seconds);④资源上限生效(给 0
-                 字符产出上限必判失败);⑤无网络出口(网络探针必被拒绝 / 判失败);⑥超时生效(0 秒
-                 预算必判失败)。
+                 文本;③资源记账非负(ops / output_chars / wall_seconds / memory_bytes);④资源上限
+                 生效(给 0 字符产出上限必判失败);⑤无网络出口(网络探针必被拒绝 / 判失败);⑥超时生效
+                 (0 秒预算必判失败);⑦值放大型表达式在超时量级内被拒;⑧内存上界(超出 max_memory_bytes
+                 时在上限附近判 limit_exceeded,不先全部物化)。
   skill       —— ①describe() 返回确定性 schema(同一 skill 恒定同一);②invoke 结果可溯源到产出
                  它的 skill(provenance)且产出非空。
   middleware  —— ①before_step 返回 None(形状);②after_step 返回 AgentResult 且保留结果 provenance;
@@ -323,6 +324,7 @@ def _usage_is_accounted(sandbox: Sandbox) -> None:
     assert usage.ops >= 0, "usage.ops 不得为负"
     assert usage.output_chars >= 0, "usage.output_chars 不得为负"
     assert usage.wall_seconds >= 0.0, "usage.wall_seconds 不得为负"
+    assert usage.memory_bytes >= 0, "usage.memory_bytes 不得为负"
 
 
 def _resource_limit_takes_effect(sandbox: Sandbox) -> None:
@@ -362,6 +364,27 @@ def _amplifying_expression_is_bounded(sandbox: Sandbox) -> None:
         )
 
 
+# 一段每个元素都要物化约 256 KB 宽字符串(非 BMP 字符,每字符 4 字节)的列表字面量:总量远超下面的内存
+# 上限。守约沙箱必须在物化到上限附近时就判失败,而不是全部物化完再检查(复审实测旧实现约 370 MB)。
+_SANDBOX_MEMORY_PROBE = "len([" + ",".join(["'\U0010fffd'*63990"] * 64) + "])"
+_SANDBOX_MEMORY_LIMIT = 1_000_000
+# 允许越过上限的余量:最多一个元素(约 256 KB)外加容器开销。
+_SANDBOX_MEMORY_SLACK = 512_000
+
+
+def _memory_is_bounded(sandbox: Sandbox) -> None:
+    result = sandbox.run(
+        _SANDBOX_MEMORY_PROBE, limits=Limits(max_memory_bytes=_SANDBOX_MEMORY_LIMIT)
+    )
+    assert not result.ok and result.error == "limit_exceeded", (
+        "超出内存上限的求值必须判 limit_exceeded"
+    )
+    assert result.usage.memory_bytes > 0, "被截住时必须如实报告已物化的内存量"
+    assert result.usage.memory_bytes <= _SANDBOX_MEMORY_LIMIT + _SANDBOX_MEMORY_SLACK, (
+        f"内存必须在上限附近就被截住(实测记账 {result.usage.memory_bytes} 字节)"
+    )
+
+
 SANDBOX_INVARIANTS: InvariantPack[Sandbox] = (
     InvariantPack("sandbox")
     .add("result_carries_sandbox_provenance", _result_carries_sandbox_provenance)
@@ -371,6 +394,7 @@ SANDBOX_INVARIANTS: InvariantPack[Sandbox] = (
     .add("no_network_egress", _no_network_egress)
     .add("timeout_takes_effect", _timeout_takes_effect)
     .add("amplifying_expression_is_bounded", _amplifying_expression_is_bounded)
+    .add("memory_is_bounded", _memory_is_bounded)
 )
 
 

@@ -431,3 +431,85 @@ def test_skill_bundle_round_amplifier_is_refused(tmp_path):
     with pytest.raises(SkillError) as ei:
         skill.invoke({"x": 1})
     assert ei.value.reason == "limit_exceeded"
+
+
+# ---- 第三轮修改 5:按估算字节计的内存预算 / MemoryError 与 RecursionError 归一 / 语义错误 ----------------
+
+_WIDE = "\U0010fffd"  # 非 BMP 字符:CPython 里每字符 4 字节
+
+
+def _wide_list(count: int) -> str:
+    return "len([" + ",".join([f"'{_WIDE}'*63990"] * count) + "])"
+
+
+def test_review_r2_wide_strings_stop_mid_literal_within_the_memory_budget():
+    # 复审:14 KB 代码造出 1400 个各 64k 字符的宽字符串(约 370 MB):列表字面量先全部求值,最后才做一次规模检查。
+    budget = 2_000_000
+    one_value = sys.getsizeof(_WIDE * 63990)  # 单个元素约 256 KB
+    small = InProcessSandbox().run(
+        _wide_list(40), limits=Limits(max_memory_bytes=budget, max_ops=None)
+    )
+    assert small.error == "limit_exceeded" and "内存" in small.output
+    assert small.usage.memory_bytes <= budget + one_value  # 最多越过预算一个值
+    # 在求值中途就停止:没有把 40 个元素都物化出来。
+    assert small.usage.memory_bytes < 10 * one_value
+    full = InProcessSandbox().run(
+        _wide_list(40), limits=Limits(max_memory_bytes=10**8, max_ops=None)
+    )
+    assert small.usage.ops < full.usage.ops / 2
+
+
+def test_default_memory_budget_applies_and_none_still_has_a_hard_cap():
+    default = InProcessSandbox().run(_wide_list(200))
+    assert default.error == "limit_exceeded"
+    assert default.usage.memory_bytes <= DEFAULT_LIMITS.max_memory_bytes + 300_000
+    unlimited = InProcessSandbox().run(
+        _wide_list(700),
+        limits=Limits(timeout_seconds=None, max_output_chars=None, max_ops=None),
+    )
+    assert unlimited.error == "limit_exceeded"
+    assert unlimited.usage.memory_bytes <= 128 * 2**20 + 300_000  # 不可关闭的硬上限
+
+
+def test_call_arguments_are_charged_as_they_are_evaluated():
+    code = "max(" + ",".join([f"'{_WIDE}'*63990"] * 40) + ")"
+    result = InProcessSandbox().run(code, limits=Limits(max_memory_bytes=1_000_000))
+    assert result.error == "limit_exceeded"
+    assert result.usage.memory_bytes < 10 * sys.getsizeof(_WIDE * 63990)
+
+
+def test_work_budget_counts_bytes_not_characters():
+    ascii_run = InProcessSandbox().run("len('a'*60000)")
+    wide_run = InProcessSandbox().run(f"len('{_WIDE}'*60000)")
+    assert ascii_run.ok and wide_run.ok
+    assert wide_run.usage.ops >= ascii_run.usage.ops + 150  # 4 倍宽的字符串折算出约 4 倍单位
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["-" * 6000 + "1", "-" * 1000 + "1"],
+    ids=["unary-6000", "unary-1000"],
+)
+def test_review_r2_memory_and_recursion_errors_are_contained(code):
+    # 复审:'-'*6000+'1' 一类表达式让 MemoryError 冒泡出 run()(违反「失败一律容住」)。
+    result = InProcessSandbox().run(code)
+    assert not result.ok and result.error == "limit_exceeded"
+
+
+def test_review_r2_dict_unpacking_is_correct_or_refused():
+    # 复审:{**d} 得到 {None: d}、dict(**d) 得到 {} —— 静默算错。
+    env = {"d": {"a": 1}, "e": {"b": 2}}
+    assert (
+        InProcessSandbox().run("{**d, 'c': 3, **e}", env=env).output == "{'a': 1, 'c': 3, 'b': 2}"
+    )
+    assert InProcessSandbox().run("{**x}", env={"x": [1]}).error == "disallowed"
+    refused = InProcessSandbox().run("dict(**d)", env=env)
+    assert refused.error == "disallowed" and "**" in refused.output
+
+
+@pytest.mark.parametrize("terms", [250, 400, 2000])
+def test_review_r2_long_left_associative_chains_evaluate(terms):
+    # 复审:250 项以上的连加 1+…+400 报 RecursionError。
+    result = InProcessSandbox().run("+".join(["1"] * terms))
+    assert result.ok and result.output == str(terms)
+    assert InProcessSandbox().run("-".join(["1"] * terms)).output == str(2 - terms)
