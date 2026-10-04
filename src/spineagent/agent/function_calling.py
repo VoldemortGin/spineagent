@@ -50,6 +50,9 @@ TOOL_EXECUTION_FAILED = "tool.execution_failed"
 # 「先审后行」下同一轮里因别的调用待审而整轮未执行时,喂回给模型的文本。
 _BATCH_HELD = "error: not executed [code=approval.batch_held] 本轮有工具调用待审批,整轮未执行"
 
+# 一轮 tool_calls 超过上限时,喂回给每个调用的文本(整轮不执行、不送审)。
+_TOO_MANY_CALLS = "error: not executed [code=tool.too_many_calls] 本轮工具调用数超过上限,整轮未执行"
+
 # 一轮里一个待执行调用的规划:(tool_call, 本地工具或 None, 校验后的参数或 None, 失败文本或 None)。
 type _Planned = tuple[Any, FunctionTool | None, dict[str, Any] | None, str | None]
 
@@ -69,6 +72,7 @@ class FunctionCallingAgent:
         include_error_message: bool = False,
         approve_before_execute: bool = True,
         on_approval: Literal["raise", "feed_back"] = "raise",
+        max_tool_calls_per_turn: int = 64,
     ) -> None:
         if on_approval not in ("raise", "feed_back"):
             raise ValueError(f"on_approval 只接受 'raise' / 'feed_back',收到:{on_approval!r}")
@@ -81,6 +85,9 @@ class FunctionCallingAgent:
         self._include_error_message = include_error_message
         self._approve_before_execute = approve_before_execute
         self._on_approval = on_approval
+        if max_tool_calls_per_turn < 1:
+            raise ValueError(f"max_tool_calls_per_turn 必须 ≥ 1:{max_tool_calls_per_turn}")
+        self._max_tool_calls_per_turn = max_tool_calls_per_turn
 
     @property
     def name(self) -> str:
@@ -129,7 +136,11 @@ class FunctionCallingAgent:
                 }
             )
             planned = [self._plan(tc) for tc in tool_calls]
-            held = self._preflight(planned, held_approvals)
+            if len(planned) > self._max_tool_calls_per_turn:
+                # 一轮调用过多:一个都不执行、不送审(不让单个模型回合灌满审批收件箱),告诉模型拆小。
+                held: dict[int, str] | None = {i: _TOO_MANY_CALLS for i in range(len(planned))}
+            else:
+                held = self._preflight(planned, held_approvals)
             for i, (tc, tool, validated, failure) in enumerate(planned):
                 if held is not None:
                     output = held.get(i, failure if failure is not None else _BATCH_HELD)

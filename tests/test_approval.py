@@ -522,18 +522,6 @@ class _Clock:
         return self.now
 
 
-def test_pending_table_is_bounded():
-    gate = ManualApprovalGate(max_requests=3)
-    ids = []
-    for i in range(5):
-        req = make_approval_request("tool_call", "rm", {"i": i}, bind_values=True)
-        gate.review(req)
-        ids.append(req.id)
-    assert {r.id for r in gate.pending()} == set(ids[2:])  # 最早登记的被淘汰
-    with pytest.raises(UnknownApprovalRequest):
-        gate.resolve(ids[0], Decision.APPROVED)
-
-
 def test_requests_and_approvals_expire():
     clock = _Clock()
     gate = ManualApprovalGate(request_ttl=10.0, now_fn=clock)
@@ -645,18 +633,6 @@ def test_nested_middlewares_with_same_gate_share_scope_and_consume_once():
     gate.resolve(pending.context["request_id"], Decision.APPROVED)
     outer.step("t")
     assert deleter.paths == ["/a"]
-
-
-def test_unknown_gated_name_fails_closed_when_inventory_is_known():
-    deleter = _Deleter()
-    agent = MiddlewareAgent(
-        "mw",
-        _fc_calls(deleter, 1),
-        [ApprovalMiddleware(AutoApprovalGate(deny=["*"]), gated_tools=["rm_rf"])],
-    )
-    with pytest.raises(ApprovalConfigError):
-        agent.step("t")
-    assert deleter.paths == []
 
 
 def test_misspelled_gated_name_fails_closed_for_opaque_and_tool_using_agents():
@@ -1000,3 +976,228 @@ def test_consume_requires_the_registered_full_arguments():
     )
     assert gate.consume(forged) is False
     assert gate.consume(real) is True
+
+
+# ---- 第三轮修改 4:有界状态(fail-closed 而不是淘汰别人的)与名字校验 -----------------------------
+
+
+def test_review_r2_one_model_turn_cannot_evict_another_scopes_pending_request():
+    # 复审 T:请求表满了就淘汰最早登记的——一个模型回合 1100 个调用就把另一个作用域里的合法待审请求挤掉。
+    deleter, gate = _Deleter(), ManualApprovalGate()
+    victim = _pending_id(_guarded(_fc_calls(deleter, 1, path="/legit"), gate, scope="victim"))
+    flood = FunctionCallingAgent(
+        "fc",
+        _BatchScript([[("delete_file", {"path": f"/f{i}"}) for i in range(1100)]]),
+        [_delete_tool(deleter)],
+    )
+    _guarded(flood, gate, scope="attacker").step("one model turn")
+    assert deleter.paths == []
+    assert [r.id for r in gate.pending()] == [victim.context["request_id"]]
+    # 即使调用方把每轮上限调得很大,按作用域的待审配额也让洪泛 fail-closed,而不是挤掉别人的请求。
+    unbounded = FunctionCallingAgent(
+        "fc",
+        _BatchScript([[("delete_file", {"path": f"/f{i}"}) for i in range(1100)]]),
+        [_delete_tool(deleter)],
+        max_tool_calls_per_turn=5000,
+    )
+    with pytest.raises(ApprovalError):  # 整轮 fail-closed(超出配额的请求被拒绝登记)
+        _guarded(unbounded, gate, scope="attacker").step("one model turn")
+    assert len([r for r in gate.pending() if r.scope == "attacker"]) == 64
+    assert deleter.paths == []
+    assert victim.context["request_id"] in {r.id for r in gate.pending()}
+    gate.resolve(victim.context["request_id"], Decision.APPROVED)  # 仍可决议
+
+
+class _BatchScript:
+    """一轮回放多个 tool_calls 的离线 provider。"""
+
+    def __init__(self, batches, final="finished") -> None:
+        self._batches = batches
+        self._final = final
+
+    def chat(self, messages, *, tools=None):
+        import json
+
+        from corespine.llm.provider import ChatCompletion, Choice, FunctionCall, ResponseMessage
+        from corespine.llm.provider import ToolCall as LLMToolCall
+
+        index = sum(1 for m in messages if m.get("role") == "assistant")
+        if index < len(self._batches):
+            calls = tuple(
+                LLMToolCall(
+                    id=f"c{index}_{j}", function=FunctionCall(name=n, arguments=json.dumps(a))
+                )
+                for j, (n, a) in enumerate(self._batches[index])
+            )
+            message = ResponseMessage(role="assistant", content=None, tool_calls=calls)
+        else:
+            message = ResponseMessage(role="assistant", content=self._final)
+        return ChatCompletion(choices=(Choice(index=0, message=message),))
+
+
+def test_too_many_tool_calls_in_one_turn_runs_none_of_them():
+    hits: list[str] = []
+    tool = FunctionTool(
+        "echo",
+        "",
+        {"type": "object", "properties": {"v": {"type": "string"}}},
+        func=lambda v: hits.append(v) or v,
+    )
+    agent = FunctionCallingAgent(
+        "fc",
+        _BatchScript([[("echo", {"v": str(i)}) for i in range(5)]]),
+        [tool],
+        max_tool_calls_per_turn=4,
+    )
+    assert agent.step("t").output == "finished"
+    assert hits == []
+    ok = FunctionCallingAgent(
+        "fc",
+        _BatchScript([[("echo", {"v": str(i)}) for i in range(4)]]),
+        [tool],
+        max_tool_calls_per_turn=4,
+    )
+    ok.step("t")
+    assert hits == ["0", "1", "2", "3"]
+
+
+def test_per_scope_pending_quota_refuses_new_requests_fail_closed():
+    gate = ManualApprovalGate(max_pending_per_scope=2)
+
+    def req(scope, i):
+        return make_approval_request("tool_call", "rm", {"i": i}, bind_values=True, scope=scope)
+
+    for i in range(2):
+        assert gate.review(req("a", i)) is Decision.PENDING
+    with pytest.raises(ApprovalGateError):
+        gate.review(req("a", 2))  # 本作用域的待审已达上限:拒绝新请求,而不是淘汰旧的
+    assert gate.review(req("a", 0)) is Decision.PENDING  # 已登记的照常可查
+    assert gate.review(req("b", 0)) is Decision.PENDING  # 其它作用域不受影响
+    assert {r.id for r in gate.pending()} == {req("a", 0).id, req("a", 1).id, req("b", 0).id}
+
+
+def test_global_cap_refuses_new_requests_and_never_evicts_approved_ones():
+    gate = ManualApprovalGate(max_requests=3, max_pending_per_scope=3)
+
+    def req(scope, i):
+        return make_approval_request("tool_call", "rm", {"i": i}, bind_values=True, scope=scope)
+
+    for i in range(3):
+        gate.review(req("a", i))
+    gate.resolve(req("a", 0).id, Decision.APPROVED)
+    with pytest.raises(ApprovalGateError):
+        gate.review(req("b", 0))  # 全局上限:fail-closed
+    assert gate.consume(req("a", 0)) is True  # 已批准未核销的条目没有被新请求挤掉
+    assert gate.review(req("b", 0)) is Decision.PENDING  # 核销腾出位置后可以登记
+
+
+def test_capacity_refusal_reaches_the_caller_as_a_gate_error_without_executing():
+    deleter = _Deleter()
+    gate = ManualApprovalGate(max_pending_per_scope=1)
+    _pending_id(_guarded(_fc_calls(deleter, 1, path="/a"), gate))
+    with pytest.raises(ApprovalGateError) as ei:
+        _guarded(_fc_calls(deleter, 1, path="/b"), gate).step("t")
+    assert "上限" in str(ei.value)
+    assert deleter.paths == []
+
+
+def test_resume_token_store_is_bounded_and_expires():
+    clock = _Clock()
+    store = InMemoryResumeTokenStore(max_tokens=2, ttl=10.0, now_fn=clock)
+    tokens = [store.issue(f"req-{i}", Decision.APPROVED) for i in range(3)]
+    assert repr(store) == "InMemoryResumeTokenStore(records=2)"
+    with pytest.raises(InvalidResumeToken):
+        store.redeem(tokens[0])  # 超出上限时最早签发的句柄失效(它不是执行凭据)
+    assert store.redeem(tokens[1]).request_id == "req-1"
+    clock.now = 11.0
+    with pytest.raises(InvalidResumeToken):
+        store.redeem(tokens[2])  # 过期
+    assert repr(store) == "InMemoryResumeTokenStore(records=0)"
+
+
+def test_resume_ticket_has_no_separate_scope_table():
+    gate = ManualApprovalGate()
+    req = make_approval_request("tool_call", "rm", scope="s")
+    gate.review(req)
+    ticket = gate.redeem(gate.resolve(req.id, Decision.APPROVED))
+    assert ticket.request_id == req.id and not hasattr(ticket, "scope")
+
+
+def test_review_r2_gated_name_absent_from_this_agent_warns_once_instead_of_failing():
+    # 复审 N:全站共用一份受审批名单 / 同一配置用于缺少该工具的 agent 变体 / FunctionTool 里套着带受审批工具的
+    # agent —— 名字校验误伤三种合法配置且没有逃生口。现在找不到的名字只警告一次,近似名仍然报错。
+    log: list[str] = []
+    email = FunctionTool(
+        "send_email",
+        "",
+        {"type": "object", "properties": {"path": {"type": "string"}}},
+        func=lambda path: log.append(path) or "sent",
+    )
+    agent = MiddlewareAgent(
+        "mw",
+        FunctionCallingAgent(
+            "fc", ScriptedToolCallProvider([("send_email", {"path": "a"})] * 2), [email]
+        ),
+        [ApprovalMiddleware(AutoApprovalGate(), gated_tools=["delete_file", "send_email"])],
+    )
+    with pytest.warns(UserWarning, match="找不到") as record:
+        agent.step("t")
+        agent.step("t")
+    assert len(record) == 1
+    assert log == ["a", "a", "a", "a"]
+
+
+def test_strict_names_turns_the_warning_into_a_config_error():
+    deleter = _Deleter()
+    agent = MiddlewareAgent(
+        "mw",
+        _fc_calls(deleter, 1),
+        [
+            ApprovalMiddleware(
+                AutoApprovalGate(deny=["*"]), gated_tools=["rm_rf"], strict_names=True
+            )
+        ],
+    )
+    with pytest.raises(ApprovalConfigError):
+        agent.step("t")
+    assert deleter.paths == []
+
+
+def test_function_tool_hiding_an_inner_agent_is_still_gated_in_the_same_thread():
+    deleter = _Deleter()
+    inner = _fc_calls(deleter, 1)
+    delegate = FunctionTool(
+        "delegate",
+        "",
+        {"type": "object", "properties": {"task": {"type": "string"}}},
+        func=lambda task: inner.step(task).output,
+    )
+    outer = MiddlewareAgent(
+        "mw",
+        FunctionCallingAgent(
+            "outer", ScriptedToolCallProvider([("delegate", {"task": "t"})]), [delegate]
+        ),
+        [ApprovalMiddleware(AutoApprovalGate(deny=["*"]), gated_tools=["delete_file"])],
+    )
+    with pytest.warns(UserWarning), pytest.raises(ApprovalRejected):
+        outer.step("t")
+    assert deleter.paths == []
+
+
+def test_review_r2_approval_trace_has_one_event_per_call():
+    # 复审:先审后行时 mw_approval trace 每次调用记了 2 条,CHANGELOG 写的是 1 条。
+    for approve_before_execute, gate in (
+        (True, AutoApprovalGate()),
+        (False, AutoApprovalGate()),
+        (True, ManualApprovalGate()),
+    ):
+        sink = InProcessPrivacyTraceSink()
+        script = ScriptedToolCallProvider([("delete_file", {"path": "/x"})], final="finished")
+        fc = FunctionCallingAgent(
+            "fc", script, [_delete_tool(_Deleter())], approve_before_execute=approve_before_execute
+        )
+        try:
+            _guarded(fc, gate).step("t", trace=sink)
+        except ApprovalPending:
+            pass
+        assert sink.codes().count("mw_approval") == 1

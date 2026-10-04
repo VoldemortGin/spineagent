@@ -81,10 +81,14 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
        工具 / 参数指纹与计数 / 作用域 / 完整规范化参数),手工拼一个同 id 的请求核销不了别人的批准。
      - **`feed_back` 模式**:喂回模型的文本只有 code 与 request id(不含作用域);调用方从
        `AgentResult.held_approvals`(每项 `code` / `request_id` / `scope` / `tool`)拿到待审请求,据它 resolve。
-   - **请求生命周期**:`ManualApprovalGate.resolve` 只能决议**已登记、未过期**的待审请求,未知 id 抛
-     `UnknownApprovalRequest`(不得预先批准)。请求表有上限(`max_requests`,满了先清过期再淘汰最早
-     登记的)与存活期(`request_ttl`;批准 / 拒绝的有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定),
-     防止「真实模型每次重跑参数略有变化就生成新 pending」造成的无界增长。拒绝不被消耗。
+   - **请求生命周期(第三轮修订:有界且 fail-closed)**:`ManualApprovalGate.resolve` 只能决议**已登记、未过期**的
+     待审请求,未知 id 抛 `UnknownApprovalRequest`(不得预先批准)。请求表有存活期(`request_ttl`;批准 / 拒绝的
+     有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定)与两级上限:每个作用域最多 `max_pending_per_scope`(缺省 64)
+     条待审、全表最多 `max_requests`(缺省 1024)条(含已批准未核销)。到上限时**拒绝新请求**(`review` 抛
+     `ApprovalGateError`,执行闸据此不执行),绝不淘汰别人的待审或已批准条目——第二轮「满了淘汰最早登记的」让一个
+     模型回合的 1100 个调用挤掉了另一个作用域里的合法待审请求。另外 `FunctionCallingAgent(max_tool_calls_per_turn=64)`
+     限制一轮 tool_calls 的数量:超出时整轮不执行、不送审,喂回模型「调用数超过上限」。拒绝不被消耗。核销发生在
+     **执行之前**:工具随后抛异常,这次批准也已用掉(要重试须重新批准)。
    - **审批人看得到要批准的完整内容(第三轮修订)**:request id 哈希的是完整规范化参数(批准 X 只放行字节完全相同的
      X),所以审批人也必须能看到完整的 X。第二轮只给了截断 + 按键名子串打码的 preview:200 字符之后才不同的两次调用
      preview 逐字节相同;`author` / `passage` / `max_tokens` / `session_name` 都被打成 `***`;嵌套 dict 的键是模型
@@ -101,19 +105,25 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
        给无授权的人看),所以 trace 只记 code / 计数 / 决议;审批接口是有授权的人决定「放不放行这次具体动作」的通道,
        看不到参数的审批没有意义。完整参数与 preview 不进 trace、不进 `repr`(也就不进以 repr 打日志的地方),只出现在
        gate 收到的请求与 `pending()` 里;核销时要求请求与登记时逐字段相等(含完整参数)。
-   - **ticket 只是 resume 句柄**:`redeem(token)` 拿回 `ResumeTicket(request_id, decision, scope)`,告诉
-     调用方在哪个作用域里重跑;它不参与执行闸判定。放行额度在执行点核销,所以持有 / 重放 ticket
-     都不能让同一批准多执行一次;token 本身仍一次性(ADR 0001 不变)。
+   - **ticket 只是 resume 句柄**:`redeem(token)` 拿回 `ResumeTicket(request_id, decision)`;它不参与执行闸判定。
+     放行额度在执行点核销,所以持有 / 重放 ticket 都不能让同一批准多执行一次;token 本身仍一次性(ADR 0001 不变)。
+     作用域由调用方显式提供,ticket 不再携带(第二轮那张「request id -> 作用域」的旁表先进先出淘汰后作用域变成空串,
+     已删除)。`InMemoryResumeTokenStore` 有界(`max_tokens`,超出时最早签发的未兑现 token 失效——它只是句柄)、
+     过期(`ttl`)、加锁,兑现即删除。
    - **叠加**:同一调用被同一个门在一次执行闸里只审 / 核销一次(嵌套 `ApprovalMiddleware` 共享作用域;
      执行点把被执行的工具对象传给 `enforce_tool_approval(target=)`,工具自带 `require_approval` 闸时
      同一个门交给工具自己审)。
-4a. **受审批工具名的校验(fail-closed)。** 名字必须是确切工具名:构造时拒绝空名与通配符
-   (`*?[]`——不支持 glob,写了就报错,不再静默放行);首次使用时若能推断被包裹 agent 的工具清单
-   (`reachable_tool_names`:`FunctionCallingAgent` / `ToolUsingAgent` / `MiddlewareAgent` /
-   `ChainAgent` / `AgentTool` / `DeepResearchAgent` 实现 `tool_inventory()`),对应不到已知工具的名字
-   在任何工具执行前抛 `ApprovalConfigError`;推断不了(闭包式 `FunctionAgent` 等不透明 agent)时,
-   执行点检测「受审批名与已注册工具仅大小写 / 分隔符不同」并 fail-closed。**按名字 gate 对「同一函数
-   以别名注册」不设防**——安全场景首选 `require_approval`(按工具对象绑定,别名、自建线程都绕不过)。
+4a. **受审批工具名的校验。** 名字必须是确切工具名:构造时拒绝空名与通配符(`*?[]`——不支持 glob,写了就报错)。
+   首次使用时若能推断被包裹 agent 的工具清单(`reachable_tool_names`:`FunctionCallingAgent` / `ToolUsingAgent` /
+   `MiddlewareAgent` / `ChainAgent` / `AgentTool` / `DeepResearchAgent` 实现 `tool_inventory()`):
+   - 与清单里某个工具**只差大小写 / 分隔符**的名字:抛 `ApprovalConfigError`(这几乎一定是笔误);
+   - **在清单里找不到**的名字:发一次 `UserWarning`(每个 `ApprovalMiddleware` 实例一次;消息只含配置里的工具名),
+     不报错——第二轮报错误伤了三种合法配置且没有逃生口:`FunctionTool` 里套着带受审批工具的 agent(清单看不到
+     工具函数内部)、全站共用一份受审批名单、同一配置用于缺少该工具的 agent 变体。需要严格校验的调用方传
+     `ApprovalMiddleware(strict_names=True)`,找不到即报 `ApprovalConfigError`。
+   推断不了清单(闭包式 `FunctionAgent` 等不透明 agent)时,执行点检测「受审批名与已注册工具仅大小写 / 分隔符
+   不同」并 fail-closed。**名字校验只防笔误,不是安全边界**:按名字 gate 对「同一函数以别名注册」不设防,也挡不住
+   调用方自建线程(见「已知边界」);安全场景用 `require_approval`(按工具对象绑定)。
 5. **未批准 = 不执行。** 缺省 rejected 抛 `ApprovalRejected`、pending 抛 `ApprovalPending`(带
    `request_id` / `scope`)。异常从执行点一路冒到调用方;`AgentTool` 嵌套照常上抛;`DeepResearchAgent`
    不让弹性并行把审批错误吞成一条失败发现,而是在收集后原样重抛。`FunctionCallingAgent(on_approval=
@@ -159,9 +169,12 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 ## 已知边界
 
 - 动态作用域靠 contextvar:**动态作用域不跨越调用方自建的线程**。调用方(或工具函数内部)自行起线程 /
-  线程池执行 agent 时,用 `bind_context(fn)`(`contextvars.copy_context().run` 的薄封装)把当前上下文带过去;
-  不带就不生效(审查复现:工具内用 `ThreadPoolExecutor` 跑子 agent,在 deny-all 下受审批工具仍执行了 1 次)。
-  安全场景用 `require_approval` 绑在工具对象上(静态绑定,conformance 已覆盖裸线程)。
+  线程池执行 agent 时,`ApprovalMiddleware` 的闸在那条线程里不存在——审查复现:工具内用 `ThreadPoolExecutor` 跑子
+  agent,在 deny-all 下受审批工具仍执行了 1 次;复审换个形状(外层 agent 自己也注册了同名工具,名字校验因此看不出
+  问题)同样绕过。**名字校验不能也不打算发现这种情形。** 这种场景只有 `require_approval`(静态绑在工具对象上,
+  conformance 覆盖裸线程)可靠。若必须用动态作用域,在起线程的地方用 `bind_context` 把当前上下文带过去:
+  `pool.submit(bind_context(inner.step), task)`(`spineagent.orchestration.coordinator.bind_context`,
+  `contextvars.copy_context().run` 的薄封装)。
 - 自定义 agent 若自己执行工具,须在调用前调 `enforce_tool_approval`,或只接受经
   `require_approval` 包装过的工具。
 - request id 是参数值的哈希而非明文;对低熵参数(如 `yes` / `no`)可被字典猜测,request id 不是
