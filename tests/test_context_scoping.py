@@ -172,3 +172,20 @@ def test_concurrent_requests_do_not_share_scope():
     for t in threads:
         t.join()
     assert seen == {"r0": "scope-0", "r1": "scope-1"}
+
+
+def test_context_set_inside_a_step_never_leaks_even_without_cleanup():
+    # 结构性保证:middleware 在 before_step 里设了 contextvar 却没登记收尾,也不会泄漏给调用方。
+    import contextvars
+
+    probe: contextvars.ContextVar[str | None] = contextvars.ContextVar("probe", default=None)
+
+    class Sloppy:
+        def before_step(self, ctx: StepContext) -> None:
+            probe.set("leaked")
+
+        def after_step(self, ctx, result):
+            return result
+
+    MiddlewareAgent("m", FunctionAgent("f", lambda t: "ok"), [Sloppy()]).step("t")
+    assert probe.get() is None

@@ -216,3 +216,69 @@ def test_successful_step_clears_the_ledger():
         agent.step("t")
         agent.step("t")
     assert log.count("send_email") == 2
+
+
+# ---- 变异验证补测:ToolUsingAgent 的记账 / 执行闸路径上的挂起标记 / 喂回模式的逐个执行路径 ------------
+
+
+def test_tool_using_rerun_replays_instead_of_reexecuting():
+    from spineagent.agent.policy import SyntaxToolPolicy
+    from spineagent.agent.tool_using import ToolUsingAgent
+    from spineagent.tools.tool import ToolResult
+
+    hits: list[str] = []
+
+    class Plain:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def run(self, arg: str) -> ToolResult:
+            hits.append(self.name)
+            return ToolResult(tool=self.name, output="ok")
+
+    gate = ManualApprovalGate()
+    tu = ToolUsingAgent("tu", SyntaxToolPolicy(), [Plain("send_email"), Plain("delete_file")])
+    agent = MiddlewareAgent("mw", tu, [ApprovalMiddleware(gate, gated_tools=["delete_file"])])
+    task = "send_email: boss\ndelete_file: /a"
+    with approval_scope("session-1"):
+        for _ in range(2):
+            with pytest.raises(ApprovalPending) as ei:
+                agent.step(task)
+        gate.resolve(ei.value.context["request_id"], Decision.APPROVED)
+        agent.step(task)
+    assert hits == ["send_email", "delete_file"]
+
+
+def test_per_call_path_keeps_ledger_and_feeds_back():
+    # 关掉先审后行:挂起发生在执行闸(check)上,同样要保留记账;喂回模式在逐个执行路径上也不抛。
+    log, gate = _Log(), ManualApprovalGate()
+    script = _BatchProvider([[("send_email", "boss"), ("delete_file", "/a")]])
+    agent = _agent(log, gate, script, approve_before_execute=False)
+    with approval_scope("session-1"):
+        request_id = _pending(agent).context["request_id"]
+        _pending(agent)
+        gate.resolve(request_id, Decision.APPROVED)
+        agent.step("t")
+    assert log.calls == [("send_email", "boss"), ("delete_file", "/a")]
+
+    log2, gate2 = _Log(), ManualApprovalGate()
+    fed = _agent(
+        log2,
+        gate2,
+        _BatchProvider([[("send_email", "boss"), ("delete_file", "/a")]]),
+        approve_before_execute=False,
+        on_approval="feed_back",
+    )
+    assert fed.step("t").output == "finished"
+    assert log2.calls == [("send_email", "boss")]
+
+
+def test_ledger_is_cleared_when_a_fed_back_step_completes():
+    # 喂回模式下挂起被转成 tool 结果、整步成功收尾:记账必须清空,下一次 run 照常执行工具。
+    log, gate = _Log(), ManualApprovalGate()
+    script = _BatchProvider([[("send_email", "boss")], [("delete_file", "/a")]])
+    agent = _agent(log, gate, script, on_approval="feed_back")
+    with approval_scope("session-1"):
+        agent.step("t")
+        agent.step("t")
+    assert log.count("send_email") == 2
