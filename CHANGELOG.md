@@ -30,6 +30,9 @@
   同一作用域重跑时复用已执行调用的结果(含并行分支);`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls
   里有任何受审批调用未获批则整轮不执行;新增不中断模式 `on_approval="feed_back"` 与预检 API
   `preflight_tool_approvals`。
+- `MiddlewareAgent`:收尾回调逐个执行、各自捕获(一个失败不再跳过其余的),整步在调用方上下文的副本里跑——
+  自定义中间件的 cleanup 抛异常不再让审批作用域 / trace 落点泄漏到同一线程之后的请求。新增 `bind_context`,
+  把当前上下文带进调用方自建的线程(动态作用域本身不跨线程)。
 - 指令 / 数据分通道(ADR 0003):pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
   `McpClientTool` / `A2AAgentAdapter` 的返回都标为数据(`TaskText`),`SyntaxToolPolicy` 不再把其中的
   `<tool>: <arg>` 当指令执行。
@@ -104,7 +107,9 @@
 - `ApprovalMiddleware` 不再在 `before_step` 依据 `ctx.tools` 抛错;审批 request id 不再依赖本步
   宣告的工具集,而由工具名 + 参数内容派生。`mw_approval` trace 改为每次受审批调用一条
   (`gated_count=1`)。
-- `MiddlewareAgent.step` 无论成败都会逆序执行 `ctx.cleanups`。
+- `MiddlewareAgent.step` 无论成败都会逆序执行 `ctx.cleanups`(逐个执行、各自捕获;本步出错时收尾失败只作为
+  `__notes__` 附注,本步成功时单个原样抛出、多个抛 `ExceptionGroup`);整步在上下文副本里运行,步内设置的
+  contextvar 不再泄漏给调用方。
 - `Coordinator.run_parallel` 把调用方的 `contextvars` 上下文复制进每个工作线程。
 - `DeepResearchAgent` 遇到审批挂起 / 拒绝时原样上抛,而不是当作一条失败的检索发现继续综合。
 

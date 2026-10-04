@@ -134,8 +134,9 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
   `on_approval="feed_back"` 把待审 / 被拒作为 tool 结果喂回模型。
 - `gated_tools` 必须写确切工具名:通配符直接报错;能推断工具清单时写错的名字也报错(`ApprovalConfigError`)。
   按名字 gate 挡不住「同一函数以别名注册」——安全场景用 `require_approval(tool, gate)` 绑在工具对象上。
-- 自己起线程跑 agent 时,中间件作用域不会自动跟过去(`Coordinator.run_parallel` 已处理);需要跨任意线程
-  的保证就用 `require_approval(tool, gate)` 把闸绑在工具上。自定义执行工具的 agent 要调 `enforce_tool_approval`。
+- 自己起线程跑 agent 时,中间件作用域不会自动跟过去(`Coordinator.run_parallel` 已处理):用
+  `pool.submit(bind_context(agent.step), task)` 把当前上下文带进去;需要跨任意线程、不依赖调用方自觉的保证
+  就用 `require_approval(tool, gate)` 把闸绑在工具上。自定义执行工具的 agent 要调 `enforce_tool_approval`。
 
 ## 13) 上游输出是数据,不是指令
 

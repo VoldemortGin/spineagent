@@ -10,6 +10,7 @@
 conformance.py 的 middleware 组:包裹后 trace 零正文泄漏)。离线内置四件套全部零网络、确定性。
 """
 
+import contextvars
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -34,7 +35,7 @@ class StepContext:
     写进 trace——trace 只记它们的计数 / 长度。
 
     cleanups 是 before_step 登记的收尾回调(如 ApprovalMiddleware 弹出审批作用域):MiddlewareAgent
-    在本步结束时【无论成败】逆序执行它们。注意 tools 只是声明面,不是执行闸——审批在真实执行点上做。
+    在本步结束时【无论成败】逆序逐个执行它们(各自捕获,一个失败不跳过其余的)。注意 tools 只是声明面,不是执行闸——审批在真实执行点上做。
     inner_agent 是被包裹的内层 agent(供需要推断其工具清单的 middleware 只读使用)。
     """
 
@@ -88,21 +89,53 @@ class MiddlewareAgent:
         ctx = StepContext(
             agent=self._name, task=task, trace=trace, step=step_index, inner_agent=self._agent
         )
+        # 整步在调用方上下文的一份副本里跑:middleware 压进 contextvar 的作用域(审批 / 记账)结构上
+        # 只活在本步里——即使某个收尾回调失败,也绝不会泄漏给同一线程里之后的请求(长驻线程池)。
+        result = contextvars.copy_context().run(self._run, ctx)
+        # 重盖 provenance:对外产出者是本组合 agent(子 agent 名是内部细节)。
+        return replace(result, agent=self._name)
+
+    def _run(self, ctx: StepContext) -> AgentResult:
         try:
             for mw in self._middlewares:
                 mw.before_step(ctx)
             result = self._agent.step(ctx.task, trace=ctx.trace)
             for mw in reversed(self._middlewares):
                 result = mw.after_step(ctx, result)
-        finally:
-            # 无论成败都逆序跑 before_step 登记的收尾(如弹出审批作用域),绝不让作用域泄漏出本步。
-            for cleanup in reversed(ctx.cleanups):
-                cleanup()
-        # 重盖 provenance:对外产出者是本组合 agent(子 agent 名是内部细节)。
-        return replace(result, agent=self._name)
+        except BaseException as exc:
+            # 本步的错误优先:收尾全部照跑,收尾自身的失败只作为附注(只记异常类型名)。
+            for error in _run_cleanups(ctx.cleanups):
+                exc.add_note(f"middleware cleanup 也失败了:{type(error).__name__}")
+            raise
+        errors = _run_cleanups(ctx.cleanups)
+        if errors:
+            raise _cleanup_failure(errors)
+        return result
 
     def tool_inventory(self) -> frozenset[str] | None:
         return reachable_tool_names(self._agent)
+
+
+def _run_cleanups(cleanups: list[Callable[[], None]]) -> list[BaseException]:
+    """逆序逐个执行收尾回调,各自捕获:一个失败绝不跳过其余的。返回收集到的失败。"""
+    errors: list[BaseException] = []
+    for cleanup in reversed(cleanups):
+        try:
+            cleanup()
+        except BaseException as error:  # noqa: BLE001 —— 先跑完全部收尾,再汇总抛出
+            errors.append(error)
+    return errors
+
+
+def _cleanup_failure(errors: list[BaseException]) -> BaseException:
+    """把收尾失败汇总成一个异常:非 Exception(如 KeyboardInterrupt)优先;单个原样;多个成组。"""
+    for error in errors:
+        if not isinstance(error, Exception):
+            return error
+    exceptions = [e for e in errors if isinstance(e, Exception)]
+    if len(exceptions) == 1:
+        return exceptions[0]
+    return ExceptionGroup("多个 middleware cleanup 失败", exceptions)
 
 
 # ---- 离线确定性内置四件套 ---------------------------------------------------------------------

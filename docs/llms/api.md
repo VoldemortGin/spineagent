@@ -160,9 +160,13 @@
 - `run_sequential(task: str, *, resilient: bool = False) -> list[AgentResult]`:逐个跑同一任务,保序。
 - `run_parallel(task: str, *, max_workers: int | None = None, resilient: bool = False, timeout: float | None = None, task_timeout: float | None = None, clock: Callable[[], float] = time.monotonic) -> list[AgentResult]`:
   线程池并发跑同一任务,结果仍按 agent 输入顺序返回(`max_workers` 默认 = agent 数)。每个分支在调用方
-  `contextvars` 上下文的副本里跑(审批作用域随之生效)。`timeout`(整批,自调用起)/ `task_timeout`
+  `contextvars` 上下文的副本里跑(审批作用域随之生效;带 / 不带超时两条路径都是)。`timeout`(整批,自调用起)/ `task_timeout`
   (单任务,自该任务开始跑起)缺省不限;到点未返回的任务以 `AgentTimeoutError`(code
   `orchestration.timeout`)归一的 `AgentResult.error` 返回,不挂住整批(挂死线程无法强杀,仍在后台)。
+- `bind_context(fn) -> Callable`(模块级,顶层亦导出):在调用时刻复制当前 `contextvars` 上下文并绑到 `fn` 上,
+  交给自建线程 / 线程池执行时 `fn` 在这份副本里跑(`pool.submit(bind_context(agent.step), task)`)。线程池缺省
+  **不**传播上下文:不包这一层,`ApprovalMiddleware` 的动态作用域到不了自建线程里的执行点。安全场景仍首选
+  `require_approval`(静态绑定在工具对象上,不依赖上下文)。
 - `run_pipeline(task: str, *, resilient: bool = False) -> list[AgentResult]`:链式——上一个 agent 的
   `output` 以**数据**身份(`untrusted(...)`)作下一个的输入,保序收集每段;下游指令解析器不执行其中的
   指令语法(ADR 0003)。
@@ -322,14 +326,17 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 `before_step(self, ctx: StepContext) -> None`(就地改写 ctx);`after_step(self, ctx, result) -> AgentResult`(须保留 provenance)。
 
 ### `class StepContext`
-`StepContext(agent: str, task: str, trace: TraceSink | None = None, step: int = 0, tools: list[str] = [], attachments: list[str] = [], extras: dict[str, Any] = {}, cleanups: list[Callable[[], None]] = [])`
+`StepContext(agent: str, task: str, trace: TraceSink | None = None, step: int = 0, tools: list[str] = [], attachments: list[str] = [], extras: dict[str, Any] = {}, cleanups: list[Callable[[], None]] = [], inner_agent: Agent | None = None)`
 - `tools` 只是**声明面**(给协作 middleware 用),不是执行闸。`cleanups`:before_step 登记的收尾回调,
-  `MiddlewareAgent` 在本步结束时无论成败逆序执行。
+  `MiddlewareAgent` 在本步结束时无论成败逆序**逐个**执行,一个失败不跳过其余的。`inner_agent`:被包裹的内层 agent(只读)。
 
 ### `class MiddlewareAgent`
 `MiddlewareAgent(name: str, agent: Agent, middlewares: Iterable[Middleware])`
 - 洋葱链:before 正序 → 内层 `agent.step(ctx.task, trace=ctx.trace)` → after 逆序 → provenance 重盖为本名。
-  步序取号加锁(线程安全)。
+  步序取号加锁(线程安全)。整步在调用方 `contextvars` 上下文的**副本**里跑:middleware 压进的作用域(审批、
+  记账)结构上只活在本步里,不会泄漏给同一线程里之后的请求。收尾失败的汇总:本步自身抛错时以本步的错误为准
+  (收尾失败只作为 `__notes__` 附注,只含异常类型名);本步成功而收尾失败时,单个失败原样抛出、多个抛
+  `ExceptionGroup`(`KeyboardInterrupt` 等非 `Exception` 优先)。
 
 ### 内置 middleware
 - `TokenUsageMiddleware(tokenizer: Callable[[str], int] | None = None)`:记 token 计数(`.totals`)。

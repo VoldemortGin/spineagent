@@ -37,8 +37,10 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
    ToolUsingAgent 用 `{"arg": <替换 $prev 后的实参>}`。
 2. **门到达执行点的两条通道。**
    - 动态作用域:`ApprovalMiddleware.before_step` 把 `(gate, gated_tools, code)` 压进一个
-     `contextvars.ContextVar`,并在 `StepContext.cleanups` 登记弹出回调;`MiddlewareAgent` 在
-     `finally` 里逆序执行 cleanups,作用域严格限定在被包裹的那一步。contextvar 天然覆盖同一上下文里的
+     `contextvars.ContextVar`,并在 `StepContext.cleanups` 登记弹出回调;`MiddlewareAgent` 无论成败
+     逆序**逐个**执行 cleanups(各自捕获,一个失败不跳过其余的),并且整步在调用方上下文的**副本**里跑
+     ——作用域结构上严格限定在被包裹的那一步(修订:审查复现自定义 cleanup 抛异常时弹出被跳过,同一线程
+     之后无审批配置的请求被拦下、trace 串到上一个请求的 sink;长驻线程池会被永久污染)。contextvar 天然覆盖同一上下文里的
      嵌套 agent、闭包里的 agent、`AgentTool`;`Coordinator.run_parallel` 为每个分支复制调用方上下文
      (`contextvars.copy_context()`),故并行编排与 `DeepResearchAgent` 的并行检索里闸同样生效。
    - 静态绑定:`require_approval(tool, gate)` 把闸包进工具本身(`FunctionTool` 换包装函数、单串参
@@ -140,8 +142,10 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 
 ## 已知边界
 
-- 动态作用域靠 contextvar:调用方若自行起线程 / 线程池执行 agent 且不复制上下文,中间件作用域
-  不会跟过去。需要跨任意线程的强保证时用 `require_approval` 绑在工具上(conformance 已覆盖)。
+- 动态作用域靠 contextvar:**动态作用域不跨越调用方自建的线程**。调用方(或工具函数内部)自行起线程 /
+  线程池执行 agent 时,用 `bind_context(fn)`(`contextvars.copy_context().run` 的薄封装)把当前上下文带过去;
+  不带就不生效(审查复现:工具内用 `ThreadPoolExecutor` 跑子 agent,在 deny-all 下受审批工具仍执行了 1 次)。
+  安全场景用 `require_approval` 绑在工具对象上(静态绑定,conformance 已覆盖裸线程)。
 - 自定义 agent 若自己执行工具,须在调用前调 `enforce_tool_approval`,或只接受经
   `require_approval` 包装过的工具。
 - request id 是参数值的哈希而非明文;对低熵参数(如 `yes` / `no`)可被字典猜测,request id 不是

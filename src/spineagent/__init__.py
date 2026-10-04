@@ -113,7 +113,7 @@ from spineagent.llm.provider import (
     load_openai_sdk,
 )
 from spineagent.orchestration.chain import ChainAgent
-from spineagent.orchestration.coordinator import AgentTimeoutError, Coordinator
+from spineagent.orchestration.coordinator import AgentTimeoutError, Coordinator, bind_context
 from spineagent.protocol.a2a.seam import (
     A2AAgent,
     A2AAgentAdapter,
@@ -223,6 +223,7 @@ __all__ = [
     "approval_scope",
     "current_approval_scope",
     "default_redactor",
+    "bind_context",
     "ToolCallLedger",
     "InMemoryToolCallLedger",
     "RecordedCall",
