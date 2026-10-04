@@ -139,10 +139,13 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
 原文,`include_error_message=True` 才带);要旧的「直接冒泡」行为传 `fail_fast=True`。审批错误与
 `KeyboardInterrupt` / `SystemExit` 不会被吞。`ToolUsingAgent` 仍让工具异常冒泡。
 
-## 15) 沙箱 timeout 现在真的生效;CalcTool 有上限
+## 15) 沙箱的代价上界来自先验守卫,timeout 只是第二道闸;CalcTool 有上限
 
-`InProcessSandbox.run(timeout=...)`(以及 `DEFAULT_LIMITS` 的 5 秒)按节点做协作式 deadline,超时判
-`limit_exceeded`。`CalcTool` 拒绝超长(> 4096 字符)、过深(> 100 层)、超大幂 / 乘法结果的表达式,立即抛
+`InProcessSandbox.run(timeout=...)`(以及 `DEFAULT_LIMITS` 的 5 秒)在每个节点前后做协作式 deadline 检查,
+超时判 `limit_exceeded`。**协作式超时无法中断单个内建调用**:`round(1, -10**7)` 这类在一个节点内部按参数的
+**值**放大代价的调用,是靠先验规则(`round` 的 `|ndigits|` ≤ 2467、`int()` 数字串 ≤ 4300 字符、`sum` 只做
+数值累加、幂 / 重复 / 拼接按结果规模预判)在调用前拒绝的;反复引用同一个大值的写法由工作量预算(`max_ops`,
+`sorted(x)` 记 `len(x)` 单位)截住。要真正的抢占式超时,用 OS 级沙箱后端(子进程 / 容器)。`CalcTool` 拒绝超长(> 4096 字符)、过深(> 100 层)、超大幂 / 乘法结果的表达式,立即抛
 `ValueError`。
 
 ## 16) failover 不会替坏请求「换一家再试」

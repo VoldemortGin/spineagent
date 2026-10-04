@@ -11,7 +11,13 @@
   agent、`AgentTool`、`ChainAgent`、`Coordinator.run_parallel`、`DeepResearchAgent` 下均生效;
   审批门故障时 fail-closed。
 - `InProcessSandbox`:消除热路径上被 beartype claw 每次调用重新装饰的嵌套函数(大 env 求值从秒级
-  降到毫秒级);`timeout` 现在真正生效(按节点检查的协作式 deadline,超时判 `limit_exceeded`)。
+  降到毫秒级);`timeout` 作为协作式 deadline 在节点之间检查(超时判 `limit_exceeded`)。注:这一条
+  **不能**中断单个内建调用,单次求值的代价上界见下一条。
+- `InProcessSandbox` 的代价上界改由**先验规模守卫**保证(审查复现 `round(1, -10**7)` 在一个节点内部跑了
+  10 秒且返回成功):`round` 的 `|ndigits|` ≤ 2467、`int()` 的数字串 ≤ 4300 字符、`sum` 只做数值累加、
+  值的嵌套深度 ≤ 100;每个节点**之后**也检查 deadline;新增总工作量预算(`max_ops` 计工作量单位,单节点内
+  的大操作按输入 / 结果规模折算,`max_ops=None` 时仍有 100 万单位硬上限),反复引用同一个大值的写法被提前
+  截住。深嵌套 env 不再让 `run()` 抛 `RecursionError`。
 - `CalcTool`:表达式长度 ≤ 4096、嵌套深度 ≤ 100,幂 / 乘法结果位数复用 sandbox 的昂贵二元运算
   守卫;越界立即抛 `ValueError`。
 - 指令 / 数据分通道(ADR 0003):pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
@@ -89,6 +95,11 @@
   就不会抛。ManualApprovalGate 上旧的按「工具集」派生的 request id 不再出现,待审请求改为按调用派生。
 - `InProcessSandbox.run(timeout=...)` / `Limits.timeout_seconds` 从「只记录」变为强制:求值超过
   timeout(缺省 `DEFAULT_LIMITS` 为 5 秒)判失败。
+- `InProcessSandbox` 新增拒绝规则:`round(x, n)` 要求 `|n|` ≤ 2467(`limit_exceeded`);`int(s)` 要求
+  数字串 ≤ 4300 字符(`limit_exceeded`,此前由宿主的 `int_max_str_digits` 判 `error`);`sum` 的 `start`
+  只接受数值(`sum(lists, [])` 判 `disallowed`);值的容器嵌套深度 ≤ 100。`max_ops` / `ResourceUsage.ops`
+  的单位从「AST 节点数」改为「工作量单位」(节点 + 按规模折算的大操作),同一表达式的 `ops` 会变大;
+  `max_ops=None` 不再是无上限(硬上限 100 万单位)。
 - `CalcTool` 拒绝超过上述上限的表达式(此前会长时间计算或抛 `RecursionError`)。
 - `FunctionCallingAgent` 缺省不再让工具异常冒泡(需要旧行为传 `fail_fast=True`)。
 - `McpClientTool` 缺结果键时抛 `McpProtocolError` 而非 `KeyError`。

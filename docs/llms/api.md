@@ -378,8 +378,12 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - `SandboxResult(sandbox, output, returncode=0, usage=ResourceUsage(), error=None)`,`ok` = `returncode == 0`;
   `error` 为 `disallowed` / `limit_exceeded` / `syntax` / `error`。`ResourceUsage(ops, output_chars, wall_seconds)`。
 - `InProcessSandbox(*, clock: Callable[[], float] = time.monotonic)`;`run(code, *, timeout=None, limits=None, env=None) -> SandboxResult`:
-  受限白名单表达式求值器(无 Import / Attribute / 任意调用),节点预算、值大小上限、输出上限;`timeout`
-  为**协作式 deadline**(每个节点查一次时钟,超时判 `limit_exceeded`;单个白名单内建调用内部不可抢占)。
+  受限白名单表达式求值器(无 Import / Attribute / 任意调用),工作量预算、值大小上限、输出上限;`timeout`
+  为**协作式 deadline**(每个节点前后各查一次时钟,超时判 `limit_exceeded`)。协作式超时**无法中断单个内建
+  调用**:单次求值的代价上界来自**先验规模守卫**(整数位数 / 文本长度 / 容器元素数 / 嵌套深度上限;幂、序列
+  重复与拼接按结果规模预判;`round` 的 `|ndigits|` ≤ 2467;`int()` 的数字串 ≤ 4300 字符;`sum` 只做数值累加)
+  与**工作量预算**(`max_ops`:节点 1 单位,大操作按输入 / 结果规模折算,如 `sorted(x)` 记 `len(x)`;
+  `max_ops=None` 时仍有 100 万单位的硬上限)。`ResourceUsage.ops` 即消耗的工作量单位。
 - `sandboxes` Registry:`in_process`;`subprocess` / `container` 是**占位、尚未实现**(`subprocess` 必抛
   `SeamError`;`container` 缺 `[sandbox]` extra 抛 `ImportError`,装了也必抛 `SeamError`)。`load_container_sdk()`。
 

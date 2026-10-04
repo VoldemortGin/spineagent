@@ -131,7 +131,9 @@ def test_repeated_large_fstring_value_is_rejected_before_join():
 
     assert not result.ok
     assert result.error == "limit_exceeded"
-    assert result.usage.ops < 10  # 第二个片段即拒绝，不遍历余下片段或物化完整结果
+    # 第二个片段即拒绝，不遍历余下片段或物化完整结果(ops 含按 32k 文本规模折算的工作量单位;
+    # 走完 1000 个片段至少要上万单位)。
+    assert result.usage.ops < 300
 
 
 def test_syntax_error_is_contained():
@@ -237,7 +239,8 @@ def test_render_cost_check_does_not_redecorate_per_call(monkeypatch):
     result = InProcessSandbox().run("sorted(x)", env={"x": list(range(2000))})
     assert result.ok
     assert counter["n"] == 0
-    assert result.usage.ops == 2  # Call + 实参 Name:节点预算与元素数无关
+    # ops 现为工作量单位:sorted(x) 按 len(x) 计费、结果规模检查按元素计费(与运行期装饰次数无关)。
+    assert 2_000 <= result.usage.ops < 10_000
 
 
 def test_tool_loops_do_not_redecorate_per_call(monkeypatch):
@@ -301,3 +304,130 @@ def test_no_timeout_means_no_deadline():
     clock = _StepClock(1000.0)
     limits = Limits(timeout_seconds=None, max_output_chars=100, max_ops=100)
     assert InProcessSandbox(clock=clock).run("1 + 2", limits=limits).ok
+
+
+# ---- 先验规模守卫:单个节点内部的代价必须由先验规则封顶(协作式 deadline 只是第二道闸)----------
+# 协作式超时无法中断单个内建调用:round(1, -10**7) 在【一个】节点里计算 10**10**7。以下用例都在
+# 「无 deadline + 冻结时钟」下跑,断言它们被【先验】拒绝(不靠计时);规模刻意调到毫秒量级。
+
+_NO_DEADLINE = Limits(timeout_seconds=None, max_output_chars=64_000, max_ops=100_000)
+
+
+def _frozen_clock() -> float:
+    return 0.0
+
+
+def _run_prior(code: str, env: dict[str, object] | None = None) -> SandboxResult:
+    return InProcessSandbox(clock=_frozen_clock).run(code, limits=_NO_DEADLINE, env=env)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "round(1, -5000)",  # 审查复现的放大器(缩小规模):int 的负 ndigits 在内部算 10**|ndigits|
+        "round(1, ndigits=-5000)",  # 关键字形式同样拦
+        "round(x, -5000)",
+    ],
+)
+def test_round_ndigits_amplification_is_refused_before_call(code):
+    result = _run_prior(code, env={"x": 1})
+    assert not result.ok
+    assert result.error == "limit_exceeded"
+    assert result.usage.ops < 50  # 先验拒绝:没有真的去算 10**5000
+
+
+def test_round_normal_usage_is_unaffected():
+    sandbox = InProcessSandbox()
+    assert sandbox.run("round(3.14159, 2)").output == "3.14"
+    assert sandbox.run("round(1234, -2)").output == "1200"
+    assert sandbox.run("round(2.5)").output == "2"
+
+
+def test_int_from_overlong_digit_string_is_refused_before_conversion():
+    # 十进制串 -> int 是超线性的;不依赖宿主进程可被改掉的 sys int_max_str_digits 全局设置。
+    result = _run_prior("int(s)", env={"s": "1" * 5_000})
+    assert result.error == "limit_exceeded"
+    assert _run_prior("int('ff', 16)").output == "255"
+
+
+def test_sum_only_accumulates_numbers():
+    # 序列累加(sum(lists, []))是二次的:start 只接受数值。
+    result = _run_prior("sum([[1], [2]], [])")
+    assert not result.ok and result.error == "disallowed"
+    assert _run_prior("sum([1, 2], 10)").output == "13"
+    assert _run_prior("sum([1.5, 2])").output == "3.5"
+
+
+_LIST_ENV = {"x": list(range(5_000))}
+_TEXT_ENV = {"s": "ab" * 25_000}
+
+
+@pytest.mark.parametrize(
+    ("code", "env"),
+    [
+        ("max(" + ", ".join(["x"] * 50) + ")", _LIST_ENV),  # 内建实参按输入规模计费
+        ("[" + ", ".join(["x == x"] * 30) + "]", _LIST_ENV),  # 比较的操作数按规模计费
+        ("[" + ", ".join(["len(str(x))"] * 30) + "]", _LIST_ENV),  # str() 的实参按规模计费
+        ("[" + ", ".join(["max(s)"] * 5) + "]", _TEXT_ENV),  # 迭代型内建对 str 按字符数计费
+        ("[" + ", ".join(["[x][0][0]"] * 30) + "]", _LIST_ENV),  # 节点结果的规模检查也计费
+    ],
+)
+def test_repeated_reference_to_large_value_is_charged_to_work_budget(code, env):
+    # 修复前:反复引用同一个大值,每个节点都很「小」,却在节点内部做 O(len) 的工作,要到墙钟才停。
+    result = _run_prior(code, env=env)
+    assert not result.ok
+    assert result.error == "limit_exceeded"
+
+
+def test_large_builtin_work_is_counted_in_ops():
+    result = _run_prior("sorted(x)[0]", env={"x": list(range(2_000))})
+    assert result.ok and result.output == "0"
+    assert result.usage.ops >= 2_000  # sorted(x) 记 len(x) 个工作量单位
+
+
+def test_hard_work_cap_applies_even_without_max_ops():
+    limits = Limits(timeout_seconds=None, max_output_chars=64_000, max_ops=None)
+    code = "max(" + ", ".join(["x"] * 300) + ")"
+    result = InProcessSandbox(clock=_frozen_clock).run(code, limits=limits, env=_LIST_ENV)
+    assert not result.ok and result.error == "limit_exceeded"
+
+
+class _ScriptedClock:
+    """按预设序列返回时刻(耗尽后停在最后一个值)。"""
+
+    def __init__(self, *values: float) -> None:
+        self._values = list(values)
+
+    def __call__(self) -> float:
+        return self._values.pop(0) if len(self._values) > 1 else self._values[0]
+
+
+def test_deadline_is_checked_after_each_node():
+    # 单节点:求值前未超时,求值完成时已超时 -> 不得返回 ok=True(修复前节点跑完后不再检查)。
+    clock = _ScriptedClock(0.0, 0.0, 10.0)
+    result = InProcessSandbox(clock=clock).run("1", timeout=1.0)
+    assert not result.ok
+    assert result.error == "limit_exceeded"
+
+
+def test_deeply_nested_env_is_contained_not_raised():
+    value: object = 1
+    for _ in range(800):
+        value = [value]
+    result = InProcessSandbox().run("1", env={"x": value})
+    assert not result.ok and result.error == "limit_exceeded"
+
+
+def test_skill_bundle_round_amplifier_is_refused(tmp_path):
+    from spineagent.skills import SkillBundle, SkillError
+
+    (tmp_path / "manifest.toml").write_text(
+        'name = "dos"\ndescription = "d"\n[inputs]\ntype = "object"\n'
+        '[inputs.properties.x]\ntype = "integer"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "skill.py").write_text("round(x, -5000)", encoding="utf-8")
+    skill = SkillBundle.load(tmp_path)
+    with pytest.raises(SkillError) as ei:
+        skill.invoke({"x": 1})
+    assert ei.value.reason == "limit_exceeded"

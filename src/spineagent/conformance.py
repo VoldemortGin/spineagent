@@ -46,6 +46,7 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
 """
 
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -341,6 +342,24 @@ def _timeout_takes_effect(sandbox: Sandbox) -> None:
     assert not result.ok, "超时必须生效:0 秒预算下执行不得成功"
 
 
+# 单个求值步内部就能把代价按参数的【值】无界放大的表达式(round 的负 ndigits 在一步里算 10**10**7)。
+# 协作式超时打断不了单个内建调用:守约沙箱要么先验拒绝、要么抢占式终止,都必须在超时量级内判失败。
+_SANDBOX_AMPLIFIERS: tuple[str, ...] = ("round(1, -10**7)", "round(1, ndigits=-10**7)")
+# 判定「在超时量级内返回」的宽松墙钟上界(秒):远大于 0.5 秒的 timeout,远小于放大器的真实耗时。
+_SANDBOX_AMPLIFIER_WALL_BOUND = 5.0
+
+
+def _amplifying_expression_is_bounded(sandbox: Sandbox) -> None:
+    for code in _SANDBOX_AMPLIFIERS:
+        started = time.monotonic()
+        result = sandbox.run(code, timeout=0.5)
+        elapsed = time.monotonic() - started
+        assert not result.ok, f"值放大型表达式不得成功:{code}"
+        assert elapsed < _SANDBOX_AMPLIFIER_WALL_BOUND, (
+            f"值放大型表达式必须在超时量级内被拒 / 被终止(实测 {elapsed:.1f}s):{code}"
+        )
+
+
 SANDBOX_INVARIANTS: InvariantPack[Sandbox] = (
     InvariantPack("sandbox")
     .add("result_carries_sandbox_provenance", _result_carries_sandbox_provenance)
@@ -349,6 +368,7 @@ SANDBOX_INVARIANTS: InvariantPack[Sandbox] = (
     .add("resource_limit_takes_effect", _resource_limit_takes_effect)
     .add("no_network_egress", _no_network_egress)
     .add("timeout_takes_effect", _timeout_takes_effect)
+    .add("amplifying_expression_is_bounded", _amplifying_expression_is_bounded)
 )
 
 
