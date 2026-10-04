@@ -75,6 +75,15 @@ def _agent(log, gate, script, tools=("send_email", "delete_file"), gated=("delet
     return MiddlewareAgent("mw", fc, [ApprovalMiddleware(gate, gated_tools=list(gated))])
 
 
+def _scoped(log, gate, script, **fc_kw):
+    fc = FunctionCallingAgent(
+        "fc", script, [log.tool(t) for t in ("send_email", "delete_file")], **fc_kw
+    )
+    return MiddlewareAgent(
+        "mw", fc, [ApprovalMiddleware(gate, gated_tools=["delete_file"], scope="session-1")]
+    )
+
+
 def _pending(agent):
     with pytest.raises(ApprovalPending) as ei:
         agent.step("t")
@@ -224,7 +233,7 @@ def test_approve_before_execute_runs_nothing_in_a_batch_until_all_approved():
 def test_approve_before_execute_can_be_turned_off():
     log, gate = _Log(), ManualApprovalGate()
     script = _BatchProvider([[("send_email", "boss"), ("delete_file", "/a")]])
-    agent = _agent(log, gate, script, approve_before_execute=False)
+    agent = _scoped(log, gate, script, approve_before_execute=False)
     _pending(agent)
     assert log.calls == [("send_email", "boss")]  # 逐个执行:闸只拦受审批的那一个
 
@@ -238,7 +247,7 @@ def test_feed_back_mode_reports_approval_to_the_model_instead_of_raising():
             seen.extend(m["content"] for m in messages if m.get("role") == "tool")
             return super().chat(messages, tools=tools)
 
-    agent = _agent(
+    agent = _scoped(
         log,
         gate,
         Recording([[("send_email", "boss"), ("delete_file", "/a")]]),
@@ -253,7 +262,7 @@ def test_feed_back_mode_reports_approval_to_the_model_instead_of_raising():
 def test_per_call_path_feeds_back():
     # 关掉先审后行:喂回模式在逐个执行路径(执行闸 check)上也不抛。
     log2, gate2 = _Log(), ManualApprovalGate()
-    fed = _agent(
+    fed = _scoped(
         log2,
         gate2,
         _BatchProvider([[("send_email", "boss"), ("delete_file", "/a")]]),

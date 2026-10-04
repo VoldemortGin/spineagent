@@ -93,6 +93,8 @@ class FunctionCallingAgent:
         schemas = [tool.schema() for tool in self._tools.values()] or None
         # usage 逐轮累加(工具轮的 token 同样要算;缺 usage 的轮不计)。
         total_usage: dict[str, int] | None = None
+        # 喂回模式下没有执行、而是喂回模型的审批挂起 / 拒绝(交给调用方,见 AgentResult.held_approvals)。
+        held_approvals: list[dict[str, str]] = []
         for index in range(self._max_steps):
             result = self._model.chat(messages, tools=schemas)
             total_usage = merge_usage(total_usage, _usage_dict(result.usage))
@@ -102,7 +104,12 @@ class FunctionCallingAgent:
                 _emit_finish(trace, self._name, index, message.content or "")
                 report_usage(total_usage)
                 # 模型的最终文本是数据(源头打标,ADR 0003)。
-                return AgentResult(self._name, untrusted(message.content or ""), usage=total_usage)
+                return AgentResult(
+                    self._name,
+                    untrusted(message.content or ""),
+                    usage=total_usage,
+                    held_approvals=tuple(held_approvals),
+                )
             # 把这一轮的 assistant(带 tool_calls)按 OpenAI 形状追加进对话历史。
             messages.append(
                 {
@@ -122,7 +129,7 @@ class FunctionCallingAgent:
                 }
             )
             planned = [self._plan(tc) for tc in tool_calls]
-            held = self._preflight(planned)
+            held = self._preflight(planned, held_approvals)
             for i, (tc, tool, validated, failure) in enumerate(planned):
                 if held is not None:
                     output = held.get(i, failure if failure is not None else _BATCH_HELD)
@@ -131,7 +138,7 @@ class FunctionCallingAgent:
                 else:
                     # 工具函数里嵌套的 agent 花掉的 token 一并计入本 agent 的 usage。
                     with collect_usage() as nested:
-                        output = self._execute(tool, validated)
+                        output = self._execute(tool, validated, held_approvals)
                     total_usage = merge_usage(total_usage, *nested)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 # trace 只记本地注册表里存在的工具名;模型编造的名字记成固定占位。
@@ -142,7 +149,12 @@ class FunctionCallingAgent:
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)
         report_usage(total_usage)
-        return AgentResult(self._name, untrusted(_NO_OUTPUT), usage=total_usage)
+        return AgentResult(
+            self._name,
+            untrusted(_NO_OUTPUT),
+            usage=total_usage,
+            held_approvals=tuple(held_approvals),
+        )
 
     def tool_inventory(self) -> frozenset[str] | None:
         return frozenset(self._tools)
@@ -159,7 +171,9 @@ class FunctionCallingAgent:
         except InvalidToolArguments as exc:
             return tc, tool, None, f"error: {exc}"
 
-    def _preflight(self, planned: list[_Planned]) -> dict[int, str] | None:
+    def _preflight(
+        self, planned: list[_Planned], held_approvals: list[dict[str, str]]
+    ) -> dict[int, str] | None:
         """先审后行:本轮有任何一个调用未获批时一个都不执行(抛错,或在喂回模式下返回各调用的喂回文本)。"""
         if not self._approve_before_execute:
             return None
@@ -179,9 +193,11 @@ class FunctionCallingAgent:
             isinstance(e, (ApprovalPending, ApprovalRejected)) for e in blocked.values()
         ):
             raise blocked[min(blocked)]
-        return {i: _approval_text(e) for i, e in blocked.items()}
+        return {i: _feed_back(e, held_approvals) for i, e in blocked.items()}
 
-    def _execute(self, tool: FunctionTool, validated: dict[str, Any]) -> str:
+    def _execute(
+        self, tool: FunctionTool, validated: dict[str, Any], held_approvals: list[dict[str, str]]
+    ) -> str:
         """执行一次调用:先过执行闸(未批准则不执行),再执行工具。"""
         try:
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
@@ -189,7 +205,7 @@ class FunctionCallingAgent:
         except (ApprovalPending, ApprovalRejected) as exc:
             if self._on_approval == "raise":
                 raise
-            return _approval_text(exc)
+            return _feed_back(exc, held_approvals)
         return self._invoke(tool, validated)
 
     def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> str:
@@ -204,9 +220,18 @@ class FunctionCallingAgent:
             return _tool_error_text(exc, include_message=self._include_error_message)
 
 
-def _approval_text(exc: ApprovalError) -> str:
-    """喂回模式下审批挂起 / 拒绝的 tool 文本:只含稳定 code 与 request id(不含参数)。"""
-    return f"error: approval required [code={exc.code} request_id={exc.context.get('request_id')}]"
+def _feed_back(exc: ApprovalError, held_approvals: list[dict[str, str]]) -> str:
+    """喂回模式:把挂起 / 拒绝记给调用方(含作用域),返回喂给模型的 tool 文本(只含 code 与 request id)。"""
+    request_id = str(exc.context.get("request_id", ""))
+    held_approvals.append(
+        {
+            "code": exc.code,
+            "request_id": request_id,
+            "scope": str(exc.context.get("scope", "")),
+            "tool": str(exc.context.get("tool", "")),
+        }
+    )
+    return f"error: approval required [code={exc.code} request_id={request_id}]"
 
 
 # include_error_message=True 时附上的异常消息最大字符数(超出截断)。

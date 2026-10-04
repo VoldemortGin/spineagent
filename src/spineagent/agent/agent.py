@@ -37,6 +37,11 @@ class AgentResult:
 
     artifacts 挂本步产出的【文件级交付物引用】(ArtifactRef,轻量带 provenance;重字节在
     ArtifactSink 里)。与 usage / error 同类的一等元数据,默认空 tuple——不产 artifact 的 agent 无感。
+
+    held_approvals 是 FunctionCallingAgent(on_approval="feed_back") 本步里【没有执行】、而是作为 tool 结果
+    喂回模型的审批挂起 / 拒绝:每项 {"code", "request_id", "scope", "tool"},给调用方(不是模型)完成审批流程用
+    (按 request_id resolve;作用域是调用方自己提供的)。只由直接执行工具的 FunctionCallingAgent 填写,
+    MiddlewareAgent 原样保留;其它组合 agent 不汇总——审批人侧以 gate.pending() 为准。
     """
 
     agent: str
@@ -44,6 +49,7 @@ class AgentResult:
     usage: dict[str, int] | None = None
     error: dict[str, object] | None = None
     artifacts: tuple[ArtifactRef, ...] = field(default_factory=tuple)
+    held_approvals: tuple[dict[str, str], ...] = field(default_factory=tuple)
 
     @property
     def ok(self) -> bool:

@@ -35,7 +35,8 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
                  ④请求摘要不含参数正文(只 schema 指纹 + 计数)。
   approval_enforcement —— 【执行闸,参数化所有会执行工具的 agent 实现 / 组合】①未获批准的受审批
                  工具执行次数为 0;②原样重跑不绕过;③改参数须重新审批;④审批门故障时 fail-closed;
-                 ⑤未受审批的工具不受影响。全部用带副作用计数的真实工具函数断言(见 docs/adr/0002)。
+                 ⑤未受审批的工具不受影响;⑥批准只放行一次、绑定作用域;⑦会产生待审请求的门缺显式作用域
+                 时报配置错误。全部用带副作用计数的真实工具函数断言(见 docs/adr/0002)。
   tool_trace  —— 【同一 harness 矩阵】模型编造的未知工具名绝不进 trace(只记本地注册表里的名字)。
   streaming   —— 【叠加协议 StreamingLLMProvider】①stream_chat 各 chunk 是 ChatCompletionChunk 形状、
                  末块 finish_reason 合法;②流式各 chunk 的 delta.content 顺序拼接 == 非流式 chat()
@@ -66,6 +67,7 @@ from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceS
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
 from spineagent.agent.approval import (
+    ApprovalConfigError,
     ApprovalError,
     ApprovalGate,
     ApprovalGateError,
@@ -603,7 +605,7 @@ class ToolExecutionHarness(Protocol):
     - calls:要依次尝试的 (工具名, 单个字符串参数值);
     - tools:工具名 -> 真实副作用函数(参数值进、文本出),harness 把它包成该 agent 吃的工具形状;
     - gate / gated_tools:审批配置;gate 为 None 表示未配置审批;
-    - scope:审批作用域(None = 缺省,每次 run 一个新作用域;resume 须在同一作用域里重跑)。
+    - scope:审批作用域(None = 调用方没有提供;会产生待审请求的门此时必须报 ApprovalConfigError)。
     审批的拒绝 / 挂起 / 闸故障以异常形式冒出(ApprovalRejected / ApprovalPending / ApprovalGateError)。
     """
 
@@ -663,9 +665,25 @@ def _unapproved_gated_tool_never_executes(harness: ToolExecutionHarness) -> None
     assert deny.calls == [], "被拒的受审批工具执行次数必须为 0"
     pending = _Counter()
     _expect_approval_error(
-        harness, ApprovalPending, calls, {"delete_file": pending}, ManualApprovalGate()
+        harness,
+        ApprovalPending,
+        calls,
+        {"delete_file": pending},
+        ManualApprovalGate(),
+        scope="session-a",
     )
     assert pending.calls == [], "待审的受审批工具执行次数必须为 0"
+
+
+def _pending_gate_requires_explicit_scope(harness: ToolExecutionHarness) -> None:
+    # 会产生待审请求的门(可核销,如 ManualApprovalGate)没有显式作用域:明确的配置错误,绝不生成隐式作用域,
+    # 工具不执行、收件箱里也不留下永远批不掉的请求。
+    counter, gate = _Counter(), ManualApprovalGate()
+    _expect_approval_error(
+        harness, ApprovalConfigError, [("delete_file", "/x")], {"delete_file": counter}, gate
+    )
+    assert counter.calls == [], "缺作用域时受审批工具执行次数必须为 0"
+    assert gate.pending() == [], "缺作用域时不得登记待审请求"
 
 
 def _rerun_does_not_bypass(harness: ToolExecutionHarness) -> None:
@@ -786,6 +804,7 @@ TOOL_TRACE_INVARIANTS: InvariantPack[ToolExecutionHarness] = InvariantPack("tool
 APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness] = (
     InvariantPack("approval_enforcement")
     .add("unapproved_gated_tool_never_executes", _unapproved_gated_tool_never_executes)
+    .add("pending_gate_requires_explicit_scope", _pending_gate_requires_explicit_scope)
     .add("rerun_does_not_bypass", _rerun_does_not_bypass)
     .add("changed_arguments_require_reapproval", _changed_arguments_require_reapproval)
     .add("approval_is_consumed_once", _approval_is_consumed_once)

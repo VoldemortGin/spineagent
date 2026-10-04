@@ -504,7 +504,13 @@ class ManualApprovalGate:
     def consume(self, request: ApprovalRequest) -> bool:
         with self._lock:
             record = self._live(request.id, self._now())
-            if record is None or record.decision is not Decision.APPROVED:
+            # 批准绑定到登记时的请求对象:id 相同还不够,必须是同一条登记记录的同一请求(code / 工具 /
+            # 参数指纹与计数 / 作用域逐字段相等)。
+            if (
+                record is None
+                or record.decision is not Decision.APPROVED
+                or record.request != request
+            ):
                 return False
             if record.uses_left is not None:
                 record.uses_left -= 1
@@ -649,10 +655,11 @@ _APPROVAL_SCOPE: ContextVar[str | None] = ContextVar("spineagent_approval_scope"
 def approval_scope(scope: str) -> Iterator[str]:
     """在 with 块内把审批作用域设为 scope(会话 / 用户 / run 的不透明标识)。
 
-    作用域折进 request id:A 作用域的批准对 B 无效。缺省(未设)时每次 ApprovalMiddleware 包裹的
-    step 都新建一个作用域——resume 时在同一作用域里重跑:`with approval_scope(ticket.scope): ...`
-    (ApprovalPending.context["scope"] 同值)。只作用于当前上下文;自建线程需自己带过去
-    (见 spineagent.orchestration.coordinator.run_in_context / contextvars.copy_context)。
+    作用域折进 request id:A 作用域的批准对 B 无效。它是调用方给的不透明字符串,库无法保证唯一——
+    必须在共享同一个门的所有调用方之间唯一(建议 租户 id + 会话 id)。会产生待审请求的门要求显式作用域
+    (这里设的外层作用域、或 ApprovalMiddleware / require_approval 的 scope=),库不生成隐式作用域。
+    resume:批准后在同一作用域里重跑。只作用于当前上下文;自建线程需自己带过去
+    (spineagent.orchestration.coordinator.bind_context)。
     """
     if not isinstance(scope, str) or not scope:
         raise ValueError("approval scope 必须是非空字符串")
@@ -668,6 +675,21 @@ def current_approval_scope() -> str | None:
     return _APPROVAL_SCOPE.get()
 
 
+# 会产生待审请求的门没有显式作用域时的配置错误(信息原文写进文档,调用方据它定位)。
+_SCOPE_REQUIRED = (
+    "这个审批门会产生待审请求(需要人工决议 / 可核销),必须显式提供作用域:请传入 "
+    "scope=<会话或用户的唯一标识>(ApprovalMiddleware(scope=...) / require_approval(scope=...),"
+    "或在外层 with approval_scope(...))。原因:作用域折进 request id、决定批准归谁;库不再隐式生成作用域"
+    "——隐式作用域要么让批准后的重跑永远对不上原请求,要么让共享同一个门的调用方共用批准。"
+    "作用域须在共享同一个门的所有调用方之间唯一(建议 租户 id + 会话 id)。"
+)
+
+
+def _requires_scope(gate: ApprovalGate) -> bool:
+    """可核销的门(如 ManualApprovalGate)会产生需要人工决议的待审请求:必须有显式作用域。"""
+    return isinstance(gate, ConsumableApprovalGate)
+
+
 @dataclass(frozen=True)
 class _ApprovalGuard:
     """一份生效中的审批配置:门 + 受审批工具名集 + 类别 code + 作用域 + 脱敏钩子(+ 可选 trace 落点)。"""
@@ -678,15 +700,17 @@ class _ApprovalGuard:
     trace: TraceSink | None = None
     agent: str = ""
     step: int = 0
-    scope: str | None = None  # None:执行时取外层 approval_scope,再退回 default_scope
-    default_scope: str = ""
+    scope: str | None = None  # None:执行时取外层 approval_scope(都没有则见 resolve_scope)
     redact: Redactor = default_redactor
 
     def resolve_scope(self) -> str:
-        if self.scope is not None:
-            return self.scope
-        ambient = _APPROVAL_SCOPE.get()
-        return ambient if ambient is not None else self.default_scope
+        """显式作用域 > 外层 approval_scope;都没有时:会产生待审请求的门报配置错误,同步门用空作用域。"""
+        scope = self.scope if self.scope is not None else _APPROVAL_SCOPE.get()
+        if scope is not None:
+            return scope
+        if _requires_scope(self.gate):
+            raise ApprovalConfigError(_SCOPE_REQUIRED)
+        return ""
 
     def check(
         self,
@@ -697,6 +721,23 @@ class _ApprovalGuard:
         seen: set[tuple[int, str]] | None = None,
     ) -> None:
         """对一次真实工具调用审批:approved(且核销到额度)返回;否则一律抛错(不执行)。"""
+        self._decide(tool, arguments, available=available, seen=seen, consume=True)
+
+    def peek(
+        self, tool: str, arguments: Mapping[str, object], *, available: Collection[str] = ()
+    ) -> None:
+        """只 review、不核销:未放行时抛与 check 相同的错误(供预检)。"""
+        self._decide(tool, arguments, available=available, seen=None, consume=False)
+
+    def _decide(
+        self,
+        tool: str,
+        arguments: Mapping[str, object],
+        *,
+        available: Collection[str],
+        seen: set[tuple[int, str]] | None,
+        consume: bool,
+    ) -> None:
         if available:
             _check_near_miss(self.gated, available)
         if tool not in self.gated:
@@ -713,50 +754,23 @@ class _ApprovalGuard:
         if seen is not None and key in seen:
             return  # 同一次调用已被同一个门批准并核销(叠加的审批配置不重复消耗额度)
         decision = self._review(request, tool)
-        if decision is Decision.APPROVED and isinstance(self.gate, ConsumableApprovalGate):
-            if not self._consume(request, tool):
-                # 额度已被用尽(一次性批准已被核销):重新登记为待审,本次不执行。
-                decision = self._review(request, tool)
-                if decision is Decision.APPROVED:
-                    decision = Decision.PENDING
+        if (
+            consume
+            and decision is Decision.APPROVED
+            and isinstance(self.gate, ConsumableApprovalGate)
+            and not self._consume(request, tool)
+        ):
+            # 额度已被用尽(一次性批准已被核销):重新登记为待审,本次不执行。
+            decision = self._review(request, tool)
+            if decision is Decision.APPROVED:
+                decision = Decision.PENDING
+        if decision is Decision.PENDING and not request.scope:
+            # 不实现 consume 的第三方门也可能挂起:没有作用域的待审请求无法被正确恢复 / 归属。
+            raise ApprovalConfigError(_SCOPE_REQUIRED)
         self._emit(decision)
         if decision is Decision.APPROVED:
             if seen is not None:
                 seen.add(key)
-            return
-        if decision is Decision.REJECTED:
-            raise ApprovalRejected(
-                "审批被拒:受审批工具调用被断路",
-                request_id=request.id,
-                tool=tool,
-                scope=request.scope,
-            )
-        raise ApprovalPending(
-            _PENDING_MESSAGE,
-            request_id=request.id,
-            tool=tool,
-            scope=request.scope,
-        )
-
-    def peek(
-        self, tool: str, arguments: Mapping[str, object], *, available: Collection[str] = ()
-    ) -> None:
-        """只 review、不核销:未放行时抛与 check 相同的错误(供预检)。"""
-        if available:
-            _check_near_miss(self.gated, available)
-        if tool not in self.gated:
-            return
-        request = make_approval_request(
-            self.code,
-            tool,
-            arguments,
-            bind_values=True,
-            scope=self.resolve_scope(),
-            redact=self.redact,
-        )
-        decision = self._review(request, tool)
-        self._emit(decision)
-        if decision is Decision.APPROVED:
             return
         if decision is Decision.REJECTED:
             raise ApprovalRejected(
@@ -972,8 +986,9 @@ def require_approval(
 
     【安全场景的首选】按名字 gate(ApprovalMiddleware 的 gated_tools)只认工具名:同一个函数换个名字
     再注册一遍、或调用方自建线程脱离动态作用域时都不设防;require_approval 绑在对象上,两者都挡得住。
-    scope:显式作用域;缺省取执行时外层的 approval_scope,再退回本包装实例自己的作用域(同一个包装
-    对象在多次重跑间作用域稳定)。与 ApprovalMiddleware 用同一个门叠加时,同一调用只审 / 核销一次。
+    scope:显式作用域;不给时取【执行时】外层的 approval_scope(模块级共享的工具对象用这个,每个请求在
+    自己的作用域里调用)。两者都没有、而门会产生待审请求时,调用时抛 ApprovalConfigError(不执行,也不按
+    包装实例生成隐式作用域)。与 ApprovalMiddleware 用同一个门叠加时,同一调用只审 / 核销一次。
     """
     if scope is not None and (not isinstance(scope, str) or not scope):
         raise ValueError("approval scope 必须是非空字符串")
@@ -982,7 +997,6 @@ def require_approval(
         gated=frozenset({tool.name}),
         code=code,
         scope=scope,
-        default_scope=f"tool-{secrets.token_hex(8)}",
         redact=redact if redact is not None else default_redactor,
     )
     if isinstance(tool, FunctionTool):
@@ -1002,8 +1016,10 @@ class ApprovalMiddleware:
     approved -> 核销一次额度后执行;rejected -> 抛 ApprovalRejected;pending -> 抛 ApprovalPending 挂起
     run(context 带 request_id / scope);门故障 -> 抛 ApprovalGateError(fail-closed)。
 
-    作用域:构造参数 scope > 外层 approval_scope(...) > 缺省每次 step 新建一个(并作为外层作用域传给
-    嵌套 agent)。resume:resolve 后在【同一作用域】里重跑本步(`with approval_scope(scope): ...`)。
+    作用域:构造参数 scope > 外层 approval_scope(...),并作为外层作用域传给嵌套 agent / require_approval
+    包装。门会产生待审请求(可核销,如 ManualApprovalGate)而两者都没有时,before_step 在内层 agent 运行
+    之前抛 ApprovalConfigError;同步门(AutoApprovalGate 等,立即给出决定)不需要作用域。resume:resolve
+    后在【同一作用域】里重跑本步(至少一次语义,见 ApprovalPending)。
 
     受审批工具名在构造时校验(不支持通配符);首次使用时若能推断被包裹 agent 的工具清单(见
     spineagent.tools.tool.reachable_tool_names),对应不到已知工具的名字直接抛 ApprovalConfigError,
@@ -1043,9 +1059,15 @@ class ApprovalMiddleware:
                     "受审批工具名对应不到被包裹 agent 的任何已知工具(拼写 / 大小写?),fail-closed",
                     unknown=unknown,
                 )
-        scope = self._scope or _APPROVAL_SCOPE.get() or f"run-{secrets.token_hex(8)}"
-        # 作用域同时设为外层作用域:嵌套的审批配置 / require_approval 包装与本步共享同一作用域。
-        ctx.cleanups.append(_set_scope(scope))
+        scope = self._scope or _APPROVAL_SCOPE.get()
+        if scope is None:
+            if _requires_scope(self._gate):
+                # 在内层 agent 运行之前就报错:不生成隐式作用域。
+                raise ApprovalConfigError(_SCOPE_REQUIRED)
+            scope = ""  # 同步门(立即给出决定、永不挂起)不需要作用域
+        else:
+            # 作用域同时设为外层作用域:嵌套的审批配置 / require_approval 包装与本步共享同一作用域。
+            ctx.cleanups.append(_set_scope(scope))
         guard = _ApprovalGuard(
             gate=self._gate,
             gated=self._gated,

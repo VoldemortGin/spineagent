@@ -62,13 +62,25 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      **一次**匹配调用;`uses=N` 放行 N 次;`uses=None` 是显式可选的旧「决议幂等」模式(有效期内同一
      作用域里同参调用无限次放行——风险:一次批准可被任意多次重放,只应给确实需要的批处理场景)。
      不实现 `consume` 的门(`AutoApprovalGate` 策略表)的批准是常驻的策略放行。
-   - **作用域**:request 绑定到调用方的作用域(会话 / 用户 / run 的不透明字符串),作用域折进 id,
-     A 的批准对 B 无效。来源优先级:`ApprovalMiddleware(scope=)` / `require_approval(scope=)` >
-     外层 `approval_scope(...)` > 缺省。缺省时**每次被 `ApprovalMiddleware` 包裹的 step 新建一个
-     作用域**,并作为外层作用域传给嵌套 agent / `require_approval` 包装(嵌套与叠加共享同一请求);
-     `require_approval` 在没有任何外层作用域时用包装实例自己的作用域(同一包装对象重跑间稳定)。
-     resume 必须回到同一作用域:`ApprovalPending.context["scope"]` / `ResumeTicket.scope` 给出它,
-     `with approval_scope(scope): agent.step(...)`。同一个门实例被多个 agent / 会话共享时互不串。
+   - **作用域(第三轮修订:必须显式)**:request 绑定到调用方的作用域(会话 / 用户的不透明字符串),作用域折进
+     id,A 的批准对 B 无效。来源:`ApprovalMiddleware(scope=)` / `require_approval(scope=)` > 外层
+     `approval_scope(...)`;`ApprovalMiddleware` 把它设为外层作用域传给嵌套 agent / `require_approval` 包装(嵌套与
+     叠加共享同一请求)。**库不生成隐式作用域**:第二轮的「缺省每次 step 新建一个」让「挂起 → 批准 → 原样重跑」
+     三次得到三个 id、永远执行不了,收件箱里堆着批不掉的请求;「`require_approval` 按包装实例生成」让模块级共享的
+     工具对所有用户是同一个作用域。现在:
+     - **会产生待审请求的门**(可核销的 `ConsumableApprovalGate`,如 `ManualApprovalGate`)没有显式作用域时抛
+       `ApprovalConfigError`——`ApprovalMiddleware` 在 `before_step`(内层 agent 运行之前),`require_approval` 在
+       调用时(执行之前;构造时还不知道调用方会不会在外层设作用域);不实现 `consume` 的第三方门若在没有作用域时
+       返回 PENDING,同样抛 `ApprovalConfigError`。信息原文:「这个审批门会产生待审请求(需要人工决议 / 可核销),
+       必须显式提供作用域:请传入 scope=<会话或用户的唯一标识>……」(含原因与唯一性要求)。
+     - **同步门**(`AutoApprovalGate` 等立即给出决定、永不挂起的门)不需要作用域,行为不变。
+     - **唯一性由调用方保证**:作用域是不透明字符串,库无法保证唯一——它必须在共享同一个门的所有调用方之间唯一
+       (建议 租户 id + 会话 id)。在这个前提下,「同作用域 + 同工具 + 同参数」就是同一个请求、共用同一个批准,这是
+       定义内行为(审批人批准的正是这份内容);不同作用域互相隔离(conformance `approval_is_scope_bound`)。
+     - **批准绑定到登记记录**:`ManualApprovalGate.consume` 除 id 匹配外,还要求请求与登记时的请求逐字段相等(code /
+       工具 / 参数指纹与计数 / 作用域 / 完整规范化参数),手工拼一个同 id 的请求核销不了别人的批准。
+     - **`feed_back` 模式**:喂回模型的文本只有 code 与 request id(不含作用域);调用方从
+       `AgentResult.held_approvals`(每项 `code` / `request_id` / `scope` / `tool`)拿到待审请求,据它 resolve。
    - **请求生命周期**:`ManualApprovalGate.resolve` 只能决议**已登记、未过期**的待审请求,未知 id 抛
      `UnknownApprovalRequest`(不得预先批准)。请求表有上限(`max_requests`,满了先清过期再淘汰最早
      登记的)与存活期(`request_ttl`;批准 / 拒绝的有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定),
