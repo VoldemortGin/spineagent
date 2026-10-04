@@ -236,8 +236,7 @@ def _normalize_sensitive(paths: object) -> frozenset[tuple[str, ...]]:
     """校验并规范化敏感参数路径声明;写法不支持就在构造时报错,绝不静默不打码。
 
     - 必须是路径的集合(list / tuple / set ...);传成一个 str(如 "to")会被当成字符集合而静默不打码,直接报错;
-    - 元素是非空 str(点号分隔;含点号的还同时按【字面键名】匹配,键名里有点号的参数也打得到码)或
-      非空 str 组成的 tuple(显式分段);
+    - 元素是非空 str(点号分隔;键名本身含点号的参数也匹配得到,见 _descend)或非空 str 组成的 tuple(显式分段);
     - 路径可穿过 dict,也可穿过 list / tuple(对每个元素套用余下的路径)。
     """
     if isinstance(paths, (str, bytes)) or not isinstance(paths, Collection):
@@ -252,7 +251,6 @@ def _normalize_sensitive(paths: object) -> frozenset[tuple[str, ...]]:
             if not path or not all(segments):
                 raise ApprovalConfigError("sensitive_args 的路径不能为空或含空段", path=path)
             normalized.add(segments)
-            normalized.add((path,))  # 键名本身含点号:按字面键名也匹配
         elif isinstance(path, tuple) and path and all(isinstance(p, str) and p for p in path):
             normalized.add(path)
         else:
@@ -260,6 +258,24 @@ def _normalize_sensitive(paths: object) -> frozenset[tuple[str, ...]]:
                 "sensitive_args 的元素必须是非空 str 或非空 str 的 tuple", path=repr(path)[:80]
             )
     return frozenset(normalized)
+
+
+def _descend(paths: Collection[tuple[str, ...]], key: str) -> tuple[bool, list[tuple[str, ...]]]:
+    """某一层的键 key 与各路径的开头匹配:(是否整个值打码, 往更深一层继续匹配的剩余路径)。
+
+    路径的前 i 段用点号连起来等于 key 就算命中,所以键名本身含点号("a.b")也能被点号写法("a.b" /
+    "body.a.b")匹配到,不会静默不打码。
+    """
+    masked = False
+    deeper: list[tuple[str, ...]] = []
+    for path in paths:
+        for i in range(1, len(path) + 1):
+            if ".".join(path[:i]) == key:
+                if i == len(path):
+                    masked = True
+                else:
+                    deeper.append(path[i:])
+    return masked, deeper
 
 
 def _mask_paths(value: object, paths: Collection[tuple[str, ...]]) -> object:
@@ -273,11 +289,8 @@ def _mask_paths(value: object, paths: Collection[tuple[str, ...]]) -> object:
     out: dict[str, object] = {}
     for key, item in value.items():
         here = str(key)
-        if (here,) in paths:
-            out[here] = _MASK
-        else:
-            deeper = [path[1:] for path in paths if len(path) > 1 and path[0] == here]
-            out[here] = _mask_paths(item, deeper)
+        masked, deeper = _descend(paths, here)
+        out[here] = _MASK if masked else _mask_paths(item, deeper)
     return out
 
 
@@ -288,12 +301,12 @@ def _build_preview(
     preview: list[tuple[str, str]] = []
     for key in sorted(str(k) for k in args):
         value = args[key]
-        if (key,) in paths:
+        masked, nested = _descend(paths, key)
+        if masked:
             text = _MASK
         elif isinstance(value, str):
             text = repr(value)
         else:
-            nested = [path[1:] for path in paths if len(path) > 1 and path[0] == key]
             text = json.dumps(
                 _mask_paths(value, nested), ensure_ascii=False, sort_keys=True, default=repr
             )

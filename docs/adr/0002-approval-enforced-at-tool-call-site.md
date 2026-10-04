@@ -114,7 +114,7 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
        sha256 前缀,尾部不同的两个请求在 preview 层面也可区分。
      - **缺省不打码**模型提供的参数。打码是调用方的显式声明:`ApprovalMiddleware(sensitive_args={工具名: [参数路径]})`
        / `require_approval(sensitive_args=[参数路径])`,路径是点号分隔的 str(`"password"`、`"body.to_token"`)或显式
-       分段的 tuple(`("body", "x.y")`,键名含点号时用;含点号的 str 还同时按字面键名匹配),可穿过 dict 与 list;被打码的值
+       分段的 tuple(`("body", "x.y")`,键名含点号时用;键名本身含点号的参数也匹配得到:路径前 i 段用点号连起来等于键名即命中,如 `"memo.k.x"` 能打到 `{"memo": {"k.x": ...}}`),可穿过 dict 与 list;被打码的值
        显示为 `***`。**第四轮修订**:①构造时校验——传成 `str`(会被当成字符集合而静默不打码)、空路径 / 空段直接抛
        `ApprovalConfigError`,不再有「写了却静默不打码」的写法;②**不再附 sha256 前缀**:对 PIN / 验证码这类低熵值,摘要
        可被字典猜出(评估过按请求随机加盐的摘要:盐就在同一份 preview 里,查看者照样能暴力猜,所以选了更简单的不附摘要;

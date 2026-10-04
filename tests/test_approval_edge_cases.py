@@ -167,12 +167,14 @@ def test_masking_goes_through_lists_and_supports_dotted_keys_and_tuple_paths():
         "items": [{"token": "PIN-1111", "n": 1}, {"token": "PIN-2222", "n": 2}],
         "a.b": "DOT-SECRET",
         "body": {"x.y": "DEEP-SECRET", "keep": "visible"},
+        "memo": {"k.x": "DOTTED-NESTED"},
         "pin": "1234",
     }
     text = _preview_text(
-        arguments=args, sensitive_args=["items.token", "a.b", ("body", "x.y"), "pin"]
+        arguments=args,
+        sensitive_args=["items.token", "a.b", ("body", "x.y"), "memo.k.x", "pin"],
     )
-    for secret in ("PIN-1111", "PIN-2222", "DOT-SECRET", "DEEP-SECRET", "1234"):
+    for secret in ("PIN-1111", "PIN-2222", "DOT-SECRET", "DEEP-SECRET", "DOTTED-NESTED", "1234"):
         assert secret not in text
     assert "visible" in text  # 没声明的照常显示
 
