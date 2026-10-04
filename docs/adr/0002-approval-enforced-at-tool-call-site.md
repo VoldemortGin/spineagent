@@ -82,12 +82,21 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      - **`feed_back` 模式**:喂回模型的文本只有 code 与 request id(不含作用域);调用方从
        `AgentResult.held_approvals`(每项 `code` / `request_id` / `scope` / `tool`)拿到待审请求,据它 resolve。
    - **请求生命周期(第三轮修订:有界且 fail-closed)**:`ManualApprovalGate.resolve` 只能决议**已登记、未过期**的
-     待审请求,未知 id 抛 `UnknownApprovalRequest`(不得预先批准)。请求表有存活期(`request_ttl`;批准 / 拒绝的
-     有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定)与两级上限:每个作用域最多 `max_pending_per_scope`(缺省 64)
-     条待审、全表最多 `max_requests`(缺省 1024)条(含已批准未核销)。到上限时**拒绝新请求**(`review` 抛
+     待审请求,未知 id 抛 `UnknownApprovalRequest`(不得预先批准)。请求表有存活期(`request_ttl`;批准的
+     有效期缺省同此,`resolve(ttl_seconds=)` 可单独指定)与两级上限(第四轮修订:互相独立的构造参数):每个作用域最多
+     `max_pending_per_scope`(缺省 64)条「待审 + 未核销的已批准」、全表最多 `max_requests`(缺省 16384)条(同口径)。
+     到上限时**拒绝新请求**(`review` 抛
      `ApprovalGateError`,执行闸据此不执行),绝不淘汰别人的待审或已批准条目——第二轮「满了淘汰最早登记的」让一个
      模型回合的 1100 个调用挤掉了另一个作用域里的合法待审请求。另外 `FunctionCallingAgent(max_tool_calls_per_turn=64)`
-     限制一轮 tool_calls 的数量:超出时整轮不执行、不送审,喂回模型「调用数超过上限」。拒绝不被消耗。核销发生在
+     限制一轮 tool_calls 的数量:超出时整轮不执行、不送审,喂回模型「调用数超过上限」。拒绝不被消耗。
+     **第四轮修订:配额不能被少数会话占满。** 复审复现:全表 1024、每作用域 64 时,16 个会话各发一轮 64 个调用就占满全表,
+     之后所有用户都抛 `ApprovalGateError`(fail-closed,但等于拒绝服务);只用一个作用域也行——被审批人**拒绝**的记录在
+     TTL 内仍占全表名额、却不占本作用域名额,拒绝 16 批后全表满。修法:①全表上限缺省提到 16384(= 64 × 256 个满配额
+     会话;内存估算:一条登记记录含完整规范化参数 + preview,典型约 3-4 KB,满表约 50-60 MB,参数很大的部署应调低
+     `max_requests`),与每作用域上限是互相独立的构造参数;②已决议的记录不再占「待审」配额——批准核销完即删除,被拒绝
+     的移入单独的、较短 TTL(`decided_ttl`,缺省 600 秒)且有界(`max_decided`,缺省 4096,每条只存 id 与过期时刻)的
+     去重结构:再 review 同一请求仍得 REJECTED,超出上限 / 过期后丢弃,该请求重新待审(只会多问一次,绝不会变成批准);
+     ③每作用域上限对「待审 + 未核销的已批准」计数;④到上限仍拒绝新请求、不淘汰别人的。核销发生在
      **执行之前**:工具随后抛异常,这次批准也已用掉(要重试须重新批准)。
    - **审批人看得到要批准的完整内容(第三轮修订)**:request id 哈希的是完整规范化参数(批准 X 只放行字节完全相同的
      X),所以审批人也必须能看到完整的 X。第二轮只给了截断 + 按键名子串打码的 preview:200 字符之后才不同的两次调用
@@ -240,3 +249,5 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
 - 2026-10-04(复审第四轮,首条):新增决策 5b——`raise` 模式多轮多审批的 2^N 放大:门记录已核销次数、重新登记的待审
   请求带 `prior_executions`(preview 与 `ApprovalPending` 同步体现);缺省模式保持 `raise` 并写明理由;`run_parallel`
   的建议。
+- 2026-10-04(复审第四轮):配额解耦——全表上限缺省 16384 并与每作用域上限独立;已决议的记录不占待审配额,被拒绝的
+  记录进有界 / 较短 TTL 的去重结构(决策 4「请求生命周期」)。

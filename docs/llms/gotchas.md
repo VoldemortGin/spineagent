@@ -129,7 +129,8 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
   **必须在共享同一个门的所有调用方之间唯一**(建议 `f"{tenant_id}:{session_id}"`)——同作用域 + 同工具 + 同参数就是
   同一个请求、共用同一个批准。
 - `ManualApprovalGate.resolve` 只接受已登记的待审请求(先 review 过)。请求表有界且 fail-closed:每个作用域最多 64 条
-  待审、全表 1024 条,满了**拒绝新请求**(`ApprovalGateError`),不会挤掉别人的。`FunctionCallingAgent` 一轮最多
+  「待审 + 未核销的已批准」、全表 16384 条(两个上限独立,可调;被拒绝 / 已核销的记录不占配额),满了**拒绝新请求**
+  (`ApprovalGateError`),不会挤掉别人的。`FunctionCallingAgent` 一轮最多
   `max_tool_calls_per_turn=64` 个调用,超出整轮不执行。
 - **审批人看完整参数**:`pending()` 里的 `request.arguments()` 是完整规范化参数(request id 哈希的就是它),审批 UI
   应展示它;`request.preview` 只作列表展示(长值截断一次并注明省略字符数与摘要)。缺省**不打码**;要在 preview 里

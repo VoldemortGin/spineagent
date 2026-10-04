@@ -387,8 +387,9 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   抛异常,这次批准也已用掉)。可核销的门会产生需要人工决议的待审请求,**必须有显式作用域**。
 - `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,
   永不 pending;不可核销(常驻策略放行);不需要作用域。
-- `ManualApprovalGate(*, token_store=None, max_requests=1024, max_pending_per_scope=64, request_ttl=3600.0, max_decided=4096, decided_ttl=600.0, now_fn=time.monotonic)`:
-  `review` 登记待审;每个作用域最多 `max_pending_per_scope` 条待审、全表最多 `max_requests` 条,到上限时**拒绝新请求**
+- `ManualApprovalGate(*, token_store=None, max_requests=16384, max_pending_per_scope=64, request_ttl=3600.0, max_decided=4096, decided_ttl=600.0, now_fn=time.monotonic)`:
+  `review` 登记待审;每个作用域最多 `max_pending_per_scope` 条「待审 + 未核销的已批准」、全表最多 `max_requests` 条(互相独立;
+  被拒绝的记录进有界 / 短 TTL 的去重表,不占配额),到上限时**拒绝新请求**
   (抛 `ApprovalGateError`,fail-closed),绝不淘汰既有的待审 / 已批准条目。`resolve(request_id, decision, *, uses=1,
   ttl_seconds=None) -> str` 只接受**已登记、未过期**的请求(否则 `UnknownApprovalRequest`),返回一次性 resume token;
   `uses=1` 缺省只放行一次、`uses=N` 放行 N 次、`uses=None` 为显式可选的幂等模式(有效期内不限次,有重放风险);

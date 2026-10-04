@@ -467,7 +467,10 @@ class AutoApprovalGate:
 
 
 # ManualApprovalGate 缺省:请求表全局上限 / 每个作用域的待审上限 / 请求存活期(秒)。
-_DEFAULT_MAX_REQUESTS = 1_024
+# 全表上限与每作用域上限解耦:全表 = 64 × 256 个满配额会话。内存估算:一条登记记录(完整规范化参数 + preview + 数据类
+# 开销)典型约 3-4 KB(参数 ≈1 KB),满表约 50-60 MB;参数很大(单条上万字符)的部署应调低 max_requests。
+# 已决议的拒绝不进这张表(见 _decided),所以被拒绝的记录不占任何待审配额。
+_DEFAULT_MAX_REQUESTS = 16_384
 _DEFAULT_MAX_PENDING_PER_SCOPE = 64
 _DEFAULT_REQUEST_TTL = 3_600.0
 # 已核销次数表的上限(条数)与存活期(秒):只服务于「审批人可见的重复提示」,有界、较短 TTL,丢了不影响安全。
@@ -496,10 +499,13 @@ class ManualApprovalGate:
       记录,同一请求再来会重新登记为待审。核销发生在【执行之前】:工具随后抛异常,这次批准也已用掉。
     - pending():列举待审请求,带完整规范化参数(arguments())与预览(只给审批人看,绝不进 trace)。
 
-    有界且 fail-closed:每个作用域最多 max_pending_per_scope 条待审、全表最多 max_requests 条(含已批准未核销
-    的);到上限时【拒绝新请求】(review 抛 ApprovalGateError,执行闸据此不执行),绝不淘汰别人的待审或已批准
-    条目。过期条目(request_ttl 秒;批准 / 拒绝的有效期缺省同此,可由 resolve 的 ttl_seconds 单独指定)随时
-    清理。时钟可注入。线程安全。冲突决议抛 ApprovalConflict(先落者胜,绝不静默翻转)。
+    有界且 fail-closed:每个作用域最多 max_pending_per_scope 条【待审 + 未核销的已批准】、全表最多 max_requests
+    条(同口径);到上限时【拒绝新请求】(review 抛 ApprovalGateError,执行闸据此不执行),绝不淘汰别人的待审
+    或已批准条目。全表与每作用域上限是互相独立的构造参数(缺省全表远大于单作用域上限 × 合理并发会话数)。
+    已决议的记录不再占用这份配额:批准核销完即删除;被拒绝的记录移入单独的、较短 TTL(decided_ttl)且有界
+    (max_decided)的结构,只为幂等 / 去重——再 review 同一请求仍得 REJECTED,超出上限或过期后丢弃,该请求
+    重新待审(绝不会因此变成批准)。过期条目(request_ttl 秒;批准的有效期缺省同此,可由 resolve 的 ttl_seconds
+    单独指定)随时清理。时钟可注入。线程安全。冲突决议抛 ApprovalConflict(先落者胜,绝不静默翻转)。
     """
 
     name = "manual"
@@ -534,6 +540,8 @@ class ManualApprovalGate:
         self._decided_ttl = decided_ttl
         # request id -> (已核销次数, 过期时刻);有界(超出丢最早的)、较短 TTL。
         self._executed: dict[str, tuple[int, float]] = {}
+        # 被拒绝的 request id -> 过期时刻:不占待审配额;有界(超出丢最早的,丢了只会重新待审)、较短 TTL。
+        self._decided: dict[str, float] = {}
         self._now = now_fn
         self._lock = threading.Lock()
 
@@ -555,6 +563,19 @@ class ManualApprovalGate:
         with self._lock:
             return self._executed_count(request_id, self._now())
 
+    def _rejected(self, request_id: str, now: float) -> bool:
+        expires = self._decided.get(request_id)
+        if expires is not None and now >= expires:
+            del self._decided[request_id]
+            return False
+        return expires is not None
+
+    def _remember_rejection(self, request_id: str, expires: float) -> None:
+        self._decided.pop(request_id, None)
+        self._decided[request_id] = expires
+        while len(self._decided) > self._max_decided:
+            del self._decided[next(iter(self._decided))]  # 插入序:最早的
+
     def _live(self, request_id: str, now: float) -> _RequestRecord | None:
         record = self._records.get(request_id)
         if record is not None and now >= record.expires:
@@ -571,11 +592,8 @@ class ManualApprovalGate:
                 "审批请求表已达全局上限,新请求被拒绝(fail-closed);等待已有请求决议 / 核销 / 过期",
                 limit=self._max_requests,
             )
-        in_scope = sum(
-            1
-            for rec in self._records.values()
-            if rec.decision is Decision.PENDING and rec.request.scope == request.scope
-        )
+        # 本作用域名额 = 待审 + 未核销的已批准(被拒绝的、已核销完的都不在 _records 里)。
+        in_scope = sum(1 for rec in self._records.values() if rec.request.scope == request.scope)
         if in_scope >= self._max_pending_per_scope:
             raise ApprovalGateError(
                 "该作用域的待审请求已达上限,新请求被拒绝(fail-closed);先决议已有的待审请求",
@@ -587,6 +605,8 @@ class ManualApprovalGate:
             now = self._now()
             record = self._live(request.id, now)
             if record is None:
+                if self._rejected(request.id, now):
+                    return Decision.REJECTED
                 self._admit(request, now)
                 prior = self._executed_count(request.id, now)
                 if prior:
@@ -634,12 +654,29 @@ class ManualApprovalGate:
             now = self._now()
             record = self._live(request_id, now)
             if record is None:
+                if self._rejected(
+                    request_id, now
+                ):  # 已被拒绝(只留去重标记):同决议幂等,冲突决议报错
+                    if decision is not Decision.REJECTED:
+                        raise ApprovalConflict(
+                            f"request {request_id!r} 已落决议 'rejected',"
+                            f"不接受冲突决议 {decision.value!r}",
+                            request_id=request_id,
+                        )
+                    return self._store.issue(request_id, decision)
                 raise UnknownApprovalRequest(
                     "只能决议已登记、未过期的待审请求", request_id=request_id
                 )
-            if record.decision is Decision.PENDING:
+            if record.decision is Decision.PENDING and decision is Decision.REJECTED:
+                # 拒绝即决议完毕:移出配额表,只在较短 TTL 的有界结构里留一个去重标记。
+                del self._records[request_id]
+                self._remember_rejection(
+                    request_id,
+                    now + (ttl_seconds if ttl_seconds is not None else self._decided_ttl),
+                )
+            elif record.decision is Decision.PENDING:
                 record.decision = decision
-                record.uses_left = uses if decision is Decision.APPROVED else None
+                record.uses_left = uses
                 record.expires = now + (
                     ttl_seconds if ttl_seconds is not None else self._request_ttl
                 )

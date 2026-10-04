@@ -18,7 +18,10 @@
     `approval_scope(...)`),A 的批准对 B 无效;会产生待审请求的门(`ManualApprovalGate` 等可核销的门)没有作用域时
     在任何工具执行前抛 `ApprovalConfigError`,库不生成隐式作用域。作用域须在共享同一个门的调用方之间唯一。
   - `ManualApprovalGate.resolve` 只接受已登记、未过期的请求(不能离线算出 id 预先批准)。请求表有界且 fail-closed:
-    每个作用域最多 64 条待审、全表 1024 条,满了拒绝新请求(`ApprovalGateError`),不淘汰既有条目;
+    每个作用域最多 64 条「待审 + 未核销的已批准」、全表(缺省 16384,= 64 × 256 个满配额会话,构造参数
+    `max_requests`,与每作用域上限解耦)满了拒绝新请求(`ApprovalGateError`),不淘汰既有条目;已决议的记录不占这份配额
+    (批准核销完即删除,被拒绝的进另一张有界、较短 TTL 的去重表 `max_decided` / `decided_ttl`)——少数会话或一个被反复
+    拒绝的作用域占不满全表、拒绝其它用户;
     `FunctionCallingAgent` 一轮最多 64 个工具调用,超出整轮不执行、不送审。
   - 审批人看得到要批准的完整内容:`ApprovalRequest.canonical_arguments` / `arguments()` 是 request id 所哈希的完整
     规范化参数;`preview` 只作列表展示(截断一次,如实注明省略字符数与摘要)。缺省不打码,打码由
