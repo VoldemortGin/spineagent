@@ -14,7 +14,9 @@
 本包再用 conformance 把这条不变量绑死(见 spineagent/conformance.py)。
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -96,6 +98,7 @@ class LlmAgent:
         )
         # 模型输出是数据(源头打标)。
         result = AgentResult(agent=self._name, output=untrusted(message.content or ""), usage=usage)
+        report_usage(usage)
         _emit_step(trace, self._name, task, result)
         return result
 
@@ -127,6 +130,36 @@ def merge_usage(*usages: dict[str, int] | None) -> dict[str, int] | None:
         for key, value in usage.items():
             merged[key] = merged.get(key, 0) + value
     return merged
+
+
+# ---- 嵌套 usage 的收集:让「藏在工具函数里的 agent」花掉的 token 也算进外层结果 ----------------------
+#
+# 规则(每份 usage 只计一次):直接调模型的叶子 agent(LlmAgent / FunctionCallingAgent)与自己开了收集器
+# 的组合(DeepResearchAgent)在本步结束时把【自己的总 usage】上报给最近的外层收集器;FunctionCallingAgent
+# 在执行工具时开一个收集器,把工具函数里嵌套 agent 的 usage 并进自己的总数。其余组合(ChainAgent /
+# MiddlewareAgent / ToolUsingAgent / AgentTool)不上报——它们的子 agent 已各自上报。
+
+_USAGE_COLLECTOR: ContextVar[list[dict[str, int]] | None] = ContextVar(
+    "spineagent_usage_collector", default=None
+)
+
+
+def report_usage(usage: dict[str, int] | None) -> None:
+    """把一份 usage 上报给最近的外层收集器(没有收集器时什么也不做)。"""
+    collector = _USAGE_COLLECTOR.get()
+    if collector is not None and usage:
+        collector.append(dict(usage))
+
+
+@contextmanager
+def collect_usage() -> Iterator[list[dict[str, int]]]:
+    """在 with 块内收集嵌套 agent 上报的 usage(随 contextvars 进入 run_parallel 的工作线程)。"""
+    collected: list[dict[str, int]] = []
+    token = _USAGE_COLLECTOR.set(collected)
+    try:
+        yield collected
+    finally:
+        _USAGE_COLLECTOR.reset(token)
 
 
 def _emit_step(trace: TraceSink | None, name: str, task: str, result: AgentResult) -> None:

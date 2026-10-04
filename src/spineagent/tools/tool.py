@@ -127,8 +127,10 @@ _MAX_CALC_DEPTH = 100
 class CalcTool:
     """玩具工具:安全求值一个算术表达式(只认数字与 +-*/%**,绝不 eval 任意代码)。
 
-    有界:表达式长度 ≤ 4096 字符、嵌套深度 ≤ 100;幂指数 / 幂与乘法结果位数等先于真实运算按
-    sandbox 同一守卫检查(_guard_expensive_binop)。越界一律立即抛 ValueError(受控错误)。
+    有界:表达式长度 ≤ 4096 字符、真正的嵌套深度 ≤ 100(同一层的左结合连加 / 连乘不算嵌套,
+    `1+1+…+1` 不受项数限制);幂指数 / 幂与乘法结果位数等先于真实运算按 sandbox 同一守卫检查
+    (_guard_expensive_binop)。越界、语法错误、数值溢出一律抛 ValueError(受控错误);除零照常抛
+    ZeroDivisionError。
     """
 
     name = "calc"
@@ -140,7 +142,12 @@ class CalcTool:
             tree = ast.parse(arg, mode="eval")
         except (RecursionError, MemoryError) as exc:
             raise ValueError(f"表达式过深,无法解析({type(exc).__name__})") from exc
-        value = _safe_eval(tree.body, 0)
+        except SyntaxError as exc:
+            raise ValueError(f"表达式语法错误:{exc.msg}") from exc
+        try:
+            value = _safe_eval(tree.body, 0)
+        except (OverflowError, RecursionError) as exc:
+            raise ValueError(f"表达式结果越界({type(exc).__name__})") from exc
         # 整数值去掉多余的 .0,输出更干净。
         text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
         return ToolResult(tool=self.name, output=text)
@@ -153,13 +160,21 @@ def _safe_eval(node: ast.AST, depth: int) -> float:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        left = _safe_eval(node.left, depth + 1)
-        right = _safe_eval(node.right, depth + 1)
-        try:
-            _guard_expensive_binop(node.op, left, right)
-        except _LimitExceeded as exc:
-            raise ValueError(f"表达式开销超限:{exc}") from exc
-        return _BIN_OPS[type(node.op)](left, right)
+        # 左结合链(1+2+3+…)沿左脊迭代展开:按真正的嵌套深度计,不随链长加深递归。
+        chain: list[ast.BinOp] = []
+        current: ast.AST = node
+        while isinstance(current, ast.BinOp) and type(current.op) in _BIN_OPS:
+            chain.append(current)
+            current = current.left
+        value = _safe_eval(current, depth + 1)
+        for binop in reversed(chain):
+            right = _safe_eval(binop.right, depth + 1)
+            try:
+                _guard_expensive_binop(binop.op, value, right)
+            except _LimitExceeded as exc:
+                raise ValueError(f"表达式开销超限:{exc}") from exc
+            value = _BIN_OPS[type(binop.op)](value, right)
+        return value
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_safe_eval(node.operand, depth + 1))
     raise ValueError(f"不支持的表达式节点:{type(node).__name__}")

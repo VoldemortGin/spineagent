@@ -61,6 +61,11 @@
 - 各适配器按 vendor 状态码设 `retryable`:非瞬时 4xx(400 / 401 / 403 / 404 / 413 / 422 …)→
   `NonRetryableProviderError`(`retryable=False`);网络 / 超时 / 408 / 425 / 429 / 5xx → `ProviderError(retryable=True)`。
 - `MiddlewareAgent` 步序取号加锁,多线程共享时不重号。
+- usage 不再丢失(第二轮):`DeepResearchAgent` 的 `usage` 为全部检索 + 综合(此前只有综合);`FunctionTool` 函数里
+  嵌套 agent 的 usage 计入外层 `FunctionCallingAgent`(新增 `collect_usage` / `report_usage`,每份只计一次)。
+- `CalcTool`:`10.0**400` 之类溢出、语法错误(含括号过深)统一抛 `ValueError`(此前漏出 `OverflowError` /
+  `SyntaxError`);深度按真正的嵌套计,超过 100 项的连加 / 连乘不再被拒。`include_error_message=True` 时附上的异常
+  消息截断到 300 字符。
 - usage 不再丢失:`FunctionCallingAgent` 多轮累加;`ChainAgent` 累加各段 usage 并拼接 artifacts;
   `AgentTool` 经 `ToolResult` 透传子 agent 的 usage / artifacts,`ToolUsingAgent` 汇总。
 
@@ -89,7 +94,8 @@
   `spineagent.llm.failover_provider.FailoverDecision` / `default_failover_policy`、
   `FailoverProvider(failover_policy=...)` / `make_failover_provider(failover_policy=...)`;
   `spineagent.agent.agent.merge_usage`;`ToolResult.usage` / `ToolResult.artifacts`(可选字段)。
-- `Coordinator.run_parallel(timeout=..., task_timeout=..., clock=...)`、`AgentTimeoutError`。
+- `Coordinator.run_parallel(timeout=..., task_timeout=..., clock=...)`、`AgentTimeoutError`(不可重试:超时不终止线程)。
+- `spineagent.agent.agent.collect_usage` / `report_usage`。
 - `A2AAgentAdapter(name=...)`;conformance `TOOL_TRACE_INVARIANTS`(未知工具名不进 trace);
   `ToolExecutionHarness.run(trace=...)`。
 - `spineagent.agent.trust`:`TaskText` / `untrusted` / `compose` / `lines_with_trust`;
@@ -153,7 +159,11 @@
   HTTP 400 / 413 / 422 不再一律「不回退」——缺省会回退到下一家(余额 / 配额类还会冷却出错的那一家);401 / 403 /
   404 的 `retryable` 由 True 改为 False(仍会回退,并冷却出错的那一家)。只有 `BadRequestProviderError`(code
   `provider.bad_request`)不回退;依赖「400 直接上抛」的调用方改抛 / 改判它,或注入 `failover_policy`。
-- `FunctionCallingAgent` 的 `usage` 由「末轮」改为「各轮累加」。
+- `FunctionCallingAgent` 的 `usage` 由「末轮」改为「各轮累加」,并含工具函数里嵌套 agent 的 usage;
+  `DeepResearchAgent` 的 `usage` 含检索阶段。
+- `AgentTimeoutError.retryable` 为 `False`:`run_parallel` 超时不终止线程,原任务可能仍在后台运行,重试会并发出重复
+  副作用。
+- `CalcTool` 的语法错误 / 数值溢出改抛 `ValueError`(此前 `SyntaxError` / `OverflowError`)。
 - 本包 agent 的 `AgentResult.output` 从 plain `str` 变为 `TaskText`(str 子类,相等 / 拼接 / 序列化不受影响);依赖
   「把 A 的产出当指令喂给 B 的 `SyntaxToolPolicy`」的调用方需显式 `SyntaxToolPolicy(parse_untrusted=True)`。
   `type(output) is str` 之类的精确类型判断会变为 False。

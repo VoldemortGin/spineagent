@@ -35,7 +35,8 @@ def test_prev_on_first_step_substitutes_empty_string():
 
 def test_first_step_prev_alone_lets_tool_error_bubble():
     # 文档化契约:首步纯 $prev -> 空串,工具无法处理时其异常照常上抛(错误处理不在本增量范围)。
-    with pytest.raises(SyntaxError):
+    # CalcTool 的语法错误统一为文档承诺的 ValueError(此前漏出 SyntaxError)。
+    with pytest.raises(ValueError):
         _calc_agent().step("calc: $prev")
 
 

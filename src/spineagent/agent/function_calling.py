@@ -26,7 +26,7 @@ from corespine.errors import CorespineError
 from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
-from spineagent.agent.agent import AgentResult, merge_usage
+from spineagent.agent.agent import AgentResult, collect_usage, merge_usage, report_usage
 from spineagent.agent.approval import (
     ApprovalError,
     ApprovalPending,
@@ -102,6 +102,7 @@ class FunctionCallingAgent:
             tool_calls = message.tool_calls or ()
             if not tool_calls:
                 _emit_finish(trace, self._name, index, message.content or "")
+                report_usage(total_usage)
                 # 模型的最终文本是数据(源头打标,ADR 0003)。
                 return AgentResult(self._name, untrusted(message.content or ""), usage=total_usage)
             # 把这一轮的 assistant(带 tool_calls)按 OpenAI 形状追加进对话历史。
@@ -136,7 +137,10 @@ class FunctionCallingAgent:
                 elif failure is not None or tool is None or validated is None:
                     output = failure or ""
                 else:
-                    output = self._execute(tool, validated, slots[i])
+                    # 工具函数里嵌套的 agent 花掉的 token 一并计入本 agent 的 usage。
+                    with collect_usage() as nested:
+                        output = self._execute(tool, validated, slots[i])
+                    total_usage = merge_usage(total_usage, *nested)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 # trace 只记本地注册表里存在的工具名;模型编造的名字记成固定占位。
                 traced_tool = tool.name if tool is not None else UNKNOWN_TOOL
@@ -145,6 +149,7 @@ class FunctionCallingAgent:
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)
+        report_usage(total_usage)
         return AgentResult(self._name, untrusted(_NO_OUTPUT), usage=total_usage)
 
     def tool_inventory(self) -> frozenset[str] | None:
@@ -219,11 +224,20 @@ def _approval_text(exc: ApprovalError) -> str:
     return f"error: approval required [code={exc.code} request_id={exc.context.get('request_id')}]"
 
 
+# include_error_message=True 时附上的异常消息最大字符数(超出截断)。
+_MAX_ERROR_MESSAGE_CHARS = 300
+
+
 def _tool_error_text(exc: Exception, *, include_message: bool) -> str:
-    """工具失败的喂回文本:稳定错误码 + 异常类型名;仅显式开启时才附异常消息原文。"""
+    """工具失败的喂回文本:稳定错误码 + 异常类型名;仅显式开启时才附异常消息原文(截断到有限长度)。"""
     code = exc.code if isinstance(exc, CorespineError) else TOOL_EXECUTION_FAILED
     text = f"error: tool failed [code={code} type={type(exc).__name__}]"
-    return f"{text}: {exc}" if include_message else text
+    if not include_message:
+        return text
+    message = str(exc)
+    if len(message) > _MAX_ERROR_MESSAGE_CHARS:
+        message = f"{message[:_MAX_ERROR_MESSAGE_CHARS]}…(+{len(message) - _MAX_ERROR_MESSAGE_CHARS} 字符)"
+    return f"{text}: {message}"
 
 
 def _usage_dict(usage: Any) -> dict[str, int] | None:

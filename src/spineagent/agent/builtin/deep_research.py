@@ -20,7 +20,14 @@ from collections.abc import Callable, Iterable
 from corespine.llm.provider import LLMProvider, MockProvider
 from corespine.observability.trace import TraceSink
 
-from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
+from spineagent.agent.agent import (
+    AgentResult,
+    FunctionAgent,
+    LlmAgent,
+    collect_usage,
+    merge_usage,
+    report_usage,
+)
 from spineagent.agent.approval import ApprovalError
 from spineagent.agent.function_calling import FunctionCallingAgent
 from spineagent.agent.trust import compose, untrusted
@@ -75,6 +82,15 @@ class DeepResearchAgent:
         return frozenset(tool.name for tool in self._tools)
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
+        # usage = 全部检索 + 综合(各检索 / 综合 agent 上报进本步的收集器,并行线程同样可见)。
+        with collect_usage() as collected:
+            output = self._research(task, trace)
+        usage = merge_usage(*collected)
+        report_usage(usage)
+        # provenance 重盖为本 agent(对外它是产出者;子 agent 名是内部细节,与 ChainAgent / AgentTool 同理)。
+        return AgentResult(agent=self._name, output=untrusted(output), usage=usage)
+
+    def _research(self, task: str, trace: TraceSink | None) -> str:
         # 1) 分解:子查询列表(封顶 max_subqueries;planner 返空则回落整条任务)。
         subqueries = (self._planner(task) or [task])[: self._max_subqueries]
 
@@ -113,8 +129,7 @@ class DeepResearchAgent:
         final = synthesizer.step(synthesis_prompt, trace=trace)
 
         _emit(trace, self._name, len(subqueries), len(findings), final.output)
-        # provenance 重盖为本 agent(对外它是产出者;子 agent 名是内部细节,与 ChainAgent / AgentTool 同理)。
-        return AgentResult(agent=self._name, output=untrusted(final.output), usage=final.usage)
+        return final.output
 
 
 def _bind_query(

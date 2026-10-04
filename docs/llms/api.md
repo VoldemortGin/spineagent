@@ -62,7 +62,9 @@
   的步里时,因审批挂起而在同一作用域重跑会复用已执行调用的记录结果(步内记账),不重放副作用。
 - 工具失败:工具函数抛的 `Exception`(审批错误除外)归一成 tool 消息
   `error: tool failed [code=<code> type=<异常类型名>]` 喂回模型(`code` 为 CorespineError 的 code,否则
-  `tool.execution_failed`);`include_error_message=True` 才附异常消息原文;`fail_fast=True` 恢复冒泡。
+  `tool.execution_failed`);`include_error_message=True` 才附异常消息原文(截断到 300 字符);`fail_fast=True` 恢复冒泡。
+- `usage` 含工具函数里嵌套 agent 花掉的 token(经 `spineagent.agent.agent.collect_usage` / `report_usage`:直接调模型的
+  `LlmAgent` / `FunctionCallingAgent` 与 `DeepResearchAgent` 把各自总数上报给最近的外层收集器,每份只计一次)。
   `KeyboardInterrupt` / `SystemExit` 与 `ApprovalError` 不吞。
 - 未知工具名:回 `error: unknown tool ...` 给模型;trace 的 `tool` 字段记固定占位 `"<unknown>"`。
 - 重名工具构造即抛 `ValueError`。
@@ -125,7 +127,9 @@
 ### `class CalcTool`
 `CalcTool()`,`name = "calc"`。`run(arg) -> ToolResult`:安全求值算术表达式(白名单 `+ - * / % **`
 与一元 `+ -`,整数结果去掉 `.0`);非算术节点抛 `ValueError`,绝不 eval 任意代码。有界:表达式 ≤ 4096
-字符、嵌套深度 ≤ 100、幂指数绝对值 ≤ 10000、幂 / 乘法结果 ≤ 8192 位,越界立即抛 `ValueError`。
+字符、**真正的**嵌套深度 ≤ 100(同一层的左结合连加 / 连乘不计深度,`1+1+…+1` 不受项数限制)、幂指数绝对值
+≤ 10000、幂 / 乘法结果 ≤ 8192 位。越界、语法错误、数值溢出(如 `10.0**400`)一律抛 `ValueError`;除零照常
+抛 `ZeroDivisionError`。
 
 ### `index_tools_by_name`(`spineagent.tools.tool`)
 `index_tools_by_name(tools: Iterable[T]) -> dict[str, T]` — 按名建索引(保插入序),重名抛 `ValueError`。
@@ -162,7 +166,8 @@
   线程池并发跑同一任务,结果仍按 agent 输入顺序返回(`max_workers` 默认 = agent 数)。每个分支在调用方
   `contextvars` 上下文的副本里跑(审批作用域随之生效;带 / 不带超时两条路径都是)。`timeout`(整批,自调用起)/ `task_timeout`
   (单任务,自该任务开始跑起)缺省不限;到点未返回的任务以 `AgentTimeoutError`(code
-  `orchestration.timeout`)归一的 `AgentResult.error` 返回,不挂住整批(挂死线程无法强杀,仍在后台)。
+  `orchestration.timeout`,**不可重试** `retryable=False`)归一的 `AgentResult.error` 返回,不挂住整批。
+  **超时不终止线程**:挂死线程无法强杀,仍在后台跑、可能继续产生副作用——别据此直接重试同一任务。
 - `bind_context(fn) -> Callable`(模块级,顶层亦导出):在调用时刻复制当前 `contextvars` 上下文并绑到 `fn` 上,
   交给自建线程 / 线程池执行时 `fn` 在这份副本里跑(`pool.submit(bind_context(agent.step), task)`)。线程池缺省
   **不**传播上下文:不包这一层,`ApprovalMiddleware` 的动态作用域到不了自建线程里的执行点。安全场景仍首选
@@ -444,7 +449,8 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 ## deep research
 
 - `DeepResearchAgent(name="deep_research", *, provider=None, tools=(), planner=None, max_subqueries=5, retriever_system="", synthesis_system="")`:
-  planner 分解 → `Coordinator.run_parallel` 并行检索(`FunctionCallingAgent`)→ `LlmAgent` 综合。审批挂起 / 拒绝
+  planner 分解 → `Coordinator.run_parallel` 并行检索(`FunctionCallingAgent`)→ `LlmAgent` 综合。`usage` 为全部检索 +
+  综合的累加。审批挂起 / 拒绝
   不会被吞成失败发现,而是原样上抛。重名工具构造即抛 `ValueError`。`default_planner(task) -> list[str]`。
 
 ---

@@ -55,10 +55,15 @@ class _ContextBound[R]:
 
 
 class AgentTimeoutError(CorespineError):
-    """并行编排里某个 agent 超过总超时 / 单任务超时仍未返回(可重试:挂死常是瞬时的)。"""
+    """并行编排里某个 agent 超过总超时 / 单任务超时仍未返回。
+
+    【不可重试】超时【不终止】线程:Python 线程无法被强杀,超时的任务仍在后台跑,直到它自己返回。
+    调用方据此重试,会与仍在运行的原任务并发、造成重复副作用。需要重试的调用方应先确认原任务已结束,
+    或让 agent 自己支持协作式取消。
+    """
 
     code = "orchestration.timeout"
-    retryable = True
+    retryable = False
 
 
 class Coordinator:
@@ -94,8 +99,9 @@ class Coordinator:
         timeout:整批总超时(秒,从调用起算);task_timeout:单任务超时(秒,从该任务真正开始跑起算)。
         二者缺省 None = 不限(与旧行为完全一致)。超时的任务不再卡住整批:无论 resilient 与否,都以
         error.code = "orchestration.timeout" 的 AgentResult 返回;已完成的照常返回。clock 可注入
-        (默认 time.monotonic)以便离线确定性测试。注:Python 线程无法被强杀,挂死的 agent 仍在后台
-        线程里占着,直到它自己返回。
+        (默认 time.monotonic)以便离线确定性测试。注:【超时不终止线程】——Python 线程无法被强杀,挂死的
+        agent 仍在后台线程里占着、可能继续产生副作用,直到它自己返回;故超时结果不可重试
+        (error.retryable = False)。
         """
         start = time.perf_counter()
         workers = max_workers or max(1, len(self._agents))
