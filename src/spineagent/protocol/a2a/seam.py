@@ -85,24 +85,28 @@ class A2AAgentAdapter:
     的任务包成一条 A2ATask 交给 remote.send,再把 A2AResult 转成 AgentResult。name 取 remote.name
     以满足「结果可溯源到产出它的 agent」不变量;trace 复用本包同款 _emit_step,只记元数据。
 
+    名字取【本地登记名】:构造时显式传 name,或缺省在构造时对 remote.name 取一次快照——之后对端
+    无论怎么改自报的 name,provenance 与 trace 都不跟着变(对端自报的名字是对端可控的文本)。
+
     透明桥:输出原样继承自 remote(与 LlmAgent / FunctionAgent 透传 provider / 函数输出一致)。
     故「步产出非空」这条 Agent 不变量当且仅当 remote 自身产出非空时成立——本适配器不伪造、不
     篡改 remote 的应答;空应答属 remote 违约,由 remote 侧负责,本壳不在此兜底(rule of three)。
     """
 
-    def __init__(self, remote: A2AAgent, *, task_id: str = "task") -> None:
+    def __init__(self, remote: A2AAgent, *, task_id: str = "task", name: str | None = None) -> None:
         self._remote = remote
         self._task_id = task_id
+        self._name = name if name is not None else remote.name  # 本地登记名(构造期快照)
 
     @property
     def name(self) -> str:
-        return self._remote.name
+        return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
         reply = self._remote.send(A2ATask(task_id=self._task_id, text=task))
         # 对端返回是数据:标为不可信,下游指令解析器绝不执行其中的指令语法(见 agent/trust.py)。
-        result = AgentResult(agent=self._remote.name, output=untrusted(reply.output))
-        _emit_step(trace, self._remote.name, task, result)
+        result = AgentResult(agent=self._name, output=untrusted(reply.output))
+        _emit_step(trace, self._name, task, result)
         return result
 
 

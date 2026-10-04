@@ -15,7 +15,8 @@ include_error_message=True 才附上),让循环优雅继续;fail_fast=True 恢�
 审批错误(ApprovalError)与 KeyboardInterrupt / SystemExit 等非 Exception 一律不吞。
 
 隐私:每步发 tool_step(agent / 步序 / 工具名 / 入参长度 / 输出长度)、收尾发 agent_finish、触顶发
-agent_step_limit——只记 code / 计数,绝不记任务 / 参数 / 输出正文。
+agent_step_limit——只记 code / 计数,绝不记任务 / 参数 / 输出正文。工具名只取本地注册表里的名字,
+模型编造的未知工具名记成固定占位 "<unknown>"。
 """
 
 from collections.abc import Iterable
@@ -32,6 +33,9 @@ from spineagent.tools.tool import index_tools_by_name
 
 # 触顶 max_steps 仍未出最终文本时的兜底文案(保证产出非空)。
 _NO_OUTPUT = "(reached max_steps without a final answer)"
+
+# trace 里未知工具名的固定占位:模型编的「工具名」是自由文本,绝不原样落进 trace。
+UNKNOWN_TOOL = "<unknown>"
 
 # 工具执行失败的稳定错误码(非 CorespineError 时使用;CorespineError 用它自己的 code)。
 TOOL_EXECUTION_FAILED = "tool.execution_failed"
@@ -115,7 +119,9 @@ class FunctionCallingAgent:
                         enforce_tool_approval(tool.name, validated)
                         output = self._invoke(tool, validated)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-                _emit_tool_step(trace, self._name, index, tc.function.name, arguments, output)
+                # trace 只记本地注册表里存在的工具名;模型编造的名字记成固定占位。
+                traced_tool = tool.name if tool is not None else UNKNOWN_TOOL
+                _emit_tool_step(trace, self._name, index, traced_tool, arguments, output)
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)

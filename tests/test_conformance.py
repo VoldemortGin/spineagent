@@ -50,6 +50,7 @@ from spineagent.conformance import (
     SKILL_INVARIANTS,
     STREAMING_INVARIANTS,
     TOOL_INVARIANTS,
+    TOOL_TRACE_INVARIANTS,
     ScriptedToolCallProvider,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider
@@ -192,9 +193,9 @@ class _Harness:
     def __init__(self, build) -> None:
         self._build = build
 
-    def run(self, calls, tools, *, gate, gated_tools=()):
+    def run(self, calls, tools, *, gate, gated_tools=(), trace=None):
         agent, task = self._build(calls, tools, _approval(gate, gated_tools))
-        agent.step(task)
+        agent.step(task, trace=trace)
 
 
 def _h_function_calling(calls, tools, mws):
@@ -248,7 +249,7 @@ def _h_deep_research(calls, tools, mws):
 class _StaticWrapperForeignThreadHarness:
     """审批经 require_approval 绑在工具本身上,agent 在一条【裸线程】里跑(无 contextvar 传播)。"""
 
-    def run(self, calls, tools, *, gate, gated_tools=()):
+    def run(self, calls, tools, *, gate, gated_tools=(), trace=None):
         wrapped = [
             require_approval(t, gate) if gate is not None and t.name in gated_tools else t
             for t in _function_tools(tools)
@@ -259,7 +260,7 @@ class _StaticWrapperForeignThreadHarness:
 
         def target() -> None:
             try:
-                agent.step("go")
+                agent.step("go", trace=trace)
             except BaseException as exc:  # noqa: BLE001 — 线程里捕获后在主线程重抛
                 errors.append(exc)
 
@@ -270,21 +271,22 @@ class _StaticWrapperForeignThreadHarness:
             raise errors[0]
 
 
+_TOOL_EXECUTION_HARNESSES = {
+    "function_calling": lambda: _Harness(_h_function_calling),
+    "tool_using": lambda: _Harness(_h_tool_using),
+    "middleware_dynamic_tool_before": lambda: _Harness(_h_dynamic_tool_before),
+    "middleware_dynamic_tool_after": lambda: _Harness(_h_dynamic_tool_after_removes),
+    "nested_middleware": lambda: _Harness(_h_nested_middleware),
+    "agent_tool_nested": lambda: _Harness(_h_agent_tool),
+    "chain": lambda: _Harness(_h_chain),
+    "run_parallel": lambda: _Harness(_h_parallel),
+    "deep_research": lambda: _Harness(_h_deep_research),
+    "static_wrapper_foreign_thread": _StaticWrapperForeignThreadHarness,
+}
 APPROVAL_ENFORCEMENT_SUITE = ConformanceSuite(
-    {
-        "function_calling": lambda: _Harness(_h_function_calling),
-        "tool_using": lambda: _Harness(_h_tool_using),
-        "middleware_dynamic_tool_before": lambda: _Harness(_h_dynamic_tool_before),
-        "middleware_dynamic_tool_after": lambda: _Harness(_h_dynamic_tool_after_removes),
-        "nested_middleware": lambda: _Harness(_h_nested_middleware),
-        "agent_tool_nested": lambda: _Harness(_h_agent_tool),
-        "chain": lambda: _Harness(_h_chain),
-        "run_parallel": lambda: _Harness(_h_parallel),
-        "deep_research": lambda: _Harness(_h_deep_research),
-        "static_wrapper_foreign_thread": _StaticWrapperForeignThreadHarness,
-    },
-    APPROVAL_ENFORCEMENT_INVARIANTS,
+    _TOOL_EXECUTION_HARNESSES, APPROVAL_ENFORCEMENT_INVARIANTS
 )
+TOOL_TRACE_SUITE = ConformanceSuite(_TOOL_EXECUTION_HARNESSES, TOOL_TRACE_INVARIANTS)
 
 # ArtifactSink conformance:进程内默认 + 组合 corespine MemoryBlobStore 的 BlobArtifactSink。
 ARTIFACT_SUITE = ConformanceSuite(
@@ -564,6 +566,12 @@ def test_approval_conformance(case):
 @pytest.mark.parametrize(**APPROVAL_ENFORCEMENT_SUITE.parametrize_kwargs())
 def test_approval_enforcement_conformance(case):
     """每个会执行工具的 agent 实现 / 组合 × 每条审批执行闸不变量 各跑一格(10 × 5 = 50 格全绿)。"""
+    case()
+
+
+@pytest.mark.parametrize(**TOOL_TRACE_SUITE.parametrize_kwargs())
+def test_tool_trace_conformance(case):
+    """每个会执行工具的 agent 实现 / 组合 × 工具 trace 隐私不变量(10 × 1 = 10 格全绿)。"""
     case()
 
 

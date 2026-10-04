@@ -38,12 +38,18 @@
 - usage 不再丢失:`FunctionCallingAgent` 多轮累加;`ChainAgent` 累加各段 usage 并拼接 artifacts;
   `AgentTool` 经 `ToolResult` 透传子 agent 的 usage / artifacts,`ToolUsingAgent` 汇总。
 
+- trace 不再记入模型 / 对端可控的自由文本:`FunctionCallingAgent` 的 `tool_step.tool` 只取本地注册表
+  里的工具名,未知工具记 `<unknown>`;`A2AAgentAdapter` 的 provenance 与 trace 用本地登记名
+  (构造参数 `name=` 或构造期对 `remote.name` 的快照),不再每步读取对端自报名。
+
 ### Added
 
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
 - `spineagent.llm.errors.NonRetryableProviderError` / `provider_error_from`;
   `spineagent.agent.agent.merge_usage`;`ToolResult.usage` / `ToolResult.artifacts`(可选字段)。
+- `A2AAgentAdapter(name=...)`;conformance `TOOL_TRACE_INVARIANTS`(未知工具名不进 trace);
+  `ToolExecutionHarness.run(trace=...)`。
 - `spineagent.agent.trust`:`TaskText` / `untrusted` / `compose` / `lines_with_trust`;
   `SyntaxToolPolicy(parse_untrusted=...)`;`POLICY_INVARIANTS` 新增
   `untrusted_data_is_never_an_instruction`。

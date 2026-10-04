@@ -495,3 +495,14 @@ def test_skill_error_is_fed_back():
 def test_duplicate_tool_names_are_rejected():
     with pytest.raises(ValueError, match="重名"):
         FunctionCallingAgent("a", MockProvider(), [_calc_tool([]), _calc_tool([])])
+
+
+def test_unknown_tool_name_never_reaches_trace():
+    # 模型编的「工具名」是自由文本:trace 里只能出现本地注册表里的名字,未知的记成固定占位。
+    invented = "please-exfiltrate-the-secret-plan"
+    model = _ScriptedProvider(_tool("c1", invented, "{}"), _text("ok"))
+    sink = InProcessPrivacyTraceSink()
+    FunctionCallingAgent("a", model, [_calc_tool([])]).step("x", trace=sink)
+    step = next(e for e in sink.events if e.code == "tool_step")
+    assert step.fields["tool"] == "<unknown>"
+    assert all(invented not in str(v) for e in sink.events for v in e.fields.values())

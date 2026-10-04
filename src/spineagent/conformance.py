@@ -36,6 +36,7 @@ corespine 的 ConformanceSuite 只提供「实现 × 不变量」笛卡尔积的
   approval_enforcement —— 【执行闸,参数化所有会执行工具的 agent 实现 / 组合】①未获批准的受审批
                  工具执行次数为 0;②原样重跑不绕过;③改参数须重新审批;④审批门故障时 fail-closed;
                  ⑤未受审批的工具不受影响。全部用带副作用计数的真实工具函数断言(见 docs/adr/0002)。
+  tool_trace  —— 【同一 harness 矩阵】模型编造的未知工具名绝不进 trace(只记本地注册表里的名字)。
   streaming   —— 【叠加协议 StreamingLLMProvider】①stream_chat 各 chunk 是 ChatCompletionChunk 形状、
                  末块 finish_reason 合法;②流式各 chunk 的 delta.content 顺序拼接 == 非流式 chat()
                  的 message.content(确定性等价)。
@@ -60,7 +61,7 @@ from corespine.llm.provider import (
     Usage,
 )
 from corespine.llm.provider import ToolCall as LLMToolCall
-from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink
+from corespine.observability.trace import FORBIDDEN_KEYS, InProcessPrivacyTraceSink, TraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, FunctionAgent
 from spineagent.agent.approval import (
@@ -592,6 +593,7 @@ class ToolExecutionHarness(Protocol):
         *,
         gate: ApprovalGate | None,
         gated_tools: Sequence[str] = (),
+        trace: TraceSink | None = None,
     ) -> None: ...
 
 
@@ -689,6 +691,30 @@ def _ungated_tools_are_unaffected(harness: ToolExecutionHarness) -> None:
     )
     assert free.calls == ["/x"], "未受审批的工具不受审批门影响"
     assert gated.calls == []
+
+
+# ---- 工具执行 trace 隐私不变量(同一 harness 矩阵)-------------------------------------------
+# 工具名在 trace 里是「定位符」,但模型 / 对端可以编出任意「工具名」——那是自由文本。trace 里的工具名
+# 只能取本地注册表里存在的名字;未知的必须记成固定占位,绝不原样落进 trace。
+_INVENTED_TOOL = "invented-tool-SENTINEL-please-run-the-plan"
+
+
+def _unknown_tool_name_is_not_traced(harness: ToolExecutionHarness) -> None:
+    sink = InProcessPrivacyTraceSink()
+    harness.run(
+        [(_INVENTED_TOOL, "x"), ("read_file", "/x")],
+        {"read_file": _Counter()},
+        gate=None,
+        trace=sink,
+    )
+    for event in sink.events:
+        for key, value in event.fields.items():
+            assert _INVENTED_TOOL not in str(value), f"trace 字段 {key!r} 记入了模型编造的工具名"
+
+
+TOOL_TRACE_INVARIANTS: InvariantPack[ToolExecutionHarness] = InvariantPack("tool_trace").add(
+    "unknown_tool_name_is_not_traced", _unknown_tool_name_is_not_traced
+)
 
 
 APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness] = (
