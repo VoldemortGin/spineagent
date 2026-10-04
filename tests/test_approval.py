@@ -308,6 +308,7 @@ def test_approval_binds_to_arguments_not_just_tool_name():
 def test_gate_exception_fails_closed():
     class Broken:
         name = "broken"
+        requires_scope = False  # 声明不需要作用域:本测试要的是「门故障 fail-closed」
 
         def review(self, request):
             raise RuntimeError("审批后端挂了")
@@ -325,6 +326,7 @@ def test_gate_exception_fails_closed():
 def test_gate_returning_non_decision_fails_closed():
     class Sloppy:
         name = "sloppy"
+        requires_scope = False  # 声明不需要作用域:本测试要的是「返回非 Decision fail-closed」
 
         def review(self, request):
             return "yes"  # 不是 Decision:绝不当作放行

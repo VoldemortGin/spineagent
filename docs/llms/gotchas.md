@@ -123,7 +123,9 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
 - request id 由「工具名 + 规范化参数 + 作用域」派生:**参数一变就要重新审批**,换一个作用域(会话 / 用户)也是。
 - **批准缺省一次性**:一次批准只放行一次匹配调用,执行时核销;要放行多次用 `resolve(..., uses=N)`,
   `uses=None` 是旧的「有效期内不限次」模式(有重放风险,慎用)。
-- **作用域必须显式**:会产生待审请求的门(`ManualApprovalGate` 等可核销的门)要求调用方提供作用域——
+- **作用域必须显式**:会产生待审请求的门要求调用方提供作用域。门**声明**自己要不要(`requires_scope`:`AutoApprovalGate`
+  为 `False`、`ManualApprovalGate` 为 `True`);**第三方门未声明时按「需要」处理**(fail-closed),缺作用域即报配置错误且
+  **不调用**它的 `review`——若该门不会产生待审请求,请在门上声明 `requires_scope = False`。提供作用域的方式——
   `ApprovalMiddleware(scope=...)` / `require_approval(scope=...)` / 外层 `with approval_scope(...)`;都没有时在任何工具
   执行前抛 `ApprovalConfigError`(库不生成隐式作用域)。`AutoApprovalGate` 这类同步门不需要。作用域是不透明字符串,
   **必须在共享同一个门的所有调用方之间唯一**(建议 `f"{tenant_id}:{session_id}"`)——同作用域 + 同工具 + 同参数就是

@@ -68,11 +68,17 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      叠加共享同一请求)。**库不生成隐式作用域**:第二轮的「缺省每次 step 新建一个」让「挂起 → 批准 → 原样重跑」
      三次得到三个 id、永远执行不了,收件箱里堆着批不掉的请求;「`require_approval` 按包装实例生成」让模块级共享的
      工具对所有用户是同一个作用域。现在:
-     - **会产生待审请求的门**(可核销的 `ConsumableApprovalGate`,如 `ManualApprovalGate`)没有显式作用域时抛
-       `ApprovalConfigError`——`ApprovalMiddleware` 在 `before_step`(内层 agent 运行之前),`require_approval` 在
-       调用时(执行之前;构造时还不知道调用方会不会在外层设作用域);不实现 `consume` 的第三方门若在没有作用域时
-       返回 PENDING,同样抛 `ApprovalConfigError`。信息原文:「这个审批门会产生待审请求(需要人工决议 / 可核销),
-       必须显式提供作用域:请传入 scope=<会话或用户的唯一标识>……」(含原因与唯一性要求)。
+     - **会产生待审请求的门**没有显式作用域时抛 `ApprovalConfigError`——`ApprovalMiddleware` 在 `before_step`(内层
+       agent 运行之前),`require_approval` 在调用时(执行之前;构造时还不知道调用方会不会在外层设作用域)。
+       **由门声明,不靠探测**(第四轮修订):`ApprovalGate` 有可选属性 `requires_scope: bool`——`AutoApprovalGate` 声明
+       `False`、`ManualApprovalGate` 声明 `True`;第三方门**未声明按「需要作用域」处理**(fail-closed),缺作用域即抛错、
+       **不调用**它的 `review`,只有显式 `requires_scope = False` 才免作用域。此前的做法是先 `review` 一次看它是否返回
+       PENDING:复审复现这会在第三方收件箱里登记一条**无作用域**的请求,审批人批准后所有不带作用域的调用方都能共用
+       (常驻、共用)。属性不放进 Protocol 成员(`runtime_checkable` 会把没声明的老门挡在 `isinstance` 之外),以
+       `getattr(gate, "requires_scope", True) is not False` 读取,非 bool 值同样按需要。声明了 `False` 却返回 PENDING
+       的门(声明不实)在没有作用域时仍抛 `ApprovalConfigError`。信息原文:「这个审批门需要作用域(它会产生待审请求,或没有声明
+       requires_scope),必须显式提供作用域:请传入 scope=<会话或用户的唯一标识>……若该门不会产生待审请求……请在门上声明
+       requires_scope = False」(含原因与唯一性要求)。
      - **同步门**(`AutoApprovalGate` 等立即给出决定、永不挂起的门)不需要作用域,行为不变。
      - **唯一性由调用方保证**:作用域是不透明字符串,库无法保证唯一——它必须在共享同一个门的所有调用方之间唯一
        (建议 租户 id + 会话 id)。在这个前提下,「同作用域 + 同工具 + 同参数」就是同一个请求、共用同一个批准,这是
@@ -251,3 +257,4 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
   的建议。
 - 2026-10-04(复审第四轮):配额解耦——全表上限缺省 16384 并与每作用域上限独立;已决议的记录不占待审配额,被拒绝的
   记录进有界 / 较短 TTL 的去重结构(决策 4「请求生命周期」)。
+- 2026-10-04(复审第四轮):作用域要求改由门声明(`requires_scope`),不再 `review` 探测第三方门(决策 4「作用域」)。

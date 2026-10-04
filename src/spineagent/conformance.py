@@ -660,6 +660,9 @@ class _ExplodingGate:
     """review 必抛异常的审批门(模拟外部审批系统故障)。"""
 
     name = "exploding"
+    requires_scope = (
+        False  # 门故障要在没有作用域时也被测到(fail-closed 应早于作用域要求之外的任何放行)
+    )
 
     def review(self, request: ApprovalRequest) -> Decision:
         raise RuntimeError("approval backend down")

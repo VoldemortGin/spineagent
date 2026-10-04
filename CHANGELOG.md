@@ -159,6 +159,11 @@
 - **会产生待审请求的门必须有显式作用域**:`ManualApprovalGate`(及其它实现 `consume` 的门)配
   `ApprovalMiddleware` / `require_approval` 时,没有 `scope=` 也没有外层 `approval_scope(...)` 即抛
   `ApprovalConfigError`(此前不需要作用域)。恢复须在同一作用域里重跑。
+- **审批门改为由门声明是否需要作用域**(`ApprovalGate.requires_scope`,可选属性):`AutoApprovalGate` 声明
+  `False`、`ManualApprovalGate` 声明 `True`;**未声明的第三方门按「需要作用域」处理**——没有作用域就抛
+  `ApprovalConfigError`、且**不调用**它的 `review`(此前先 `review` 一次看是否返回 `PENDING`,那会在第三方收件箱里
+  登记一条无作用域的请求,批准后所有不带作用域的调用方都能共用)。对「未声明的第三方同步门」是行为变化:若该门不会产生
+  待审请求,在门上声明 `requires_scope = False`(报错信息里有同样提示)。
 - `ManualApprovalGate.resolve` 对未登记 / 已过期的 id 抛 `UnknownApprovalRequest`(此前可预先批准);请求表满时
   `review` 抛 `ApprovalGateError`(fail-closed)。`gated_tools` 含通配符、或与已注册工具仅大小写 / 分隔符不同时抛
   `ApprovalConfigError`(此前静默放行)。

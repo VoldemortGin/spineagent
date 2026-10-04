@@ -382,9 +382,11 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False, scope="", sensitive_args=()) -> ApprovalRequest`:
   `bind_values=True` 时把完整规范化参数的 sha256 折进 `id`(参数一变即新请求);`scope` 折进 `id`;`sensitive_args`
   声明 preview 里要打码的参数路径(点号穿过 dict,如 `"password"`、`"body.to_token"`;显示为 `***(sha256:<前缀>)`)。
-- `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(纯查询,幂等)。
+- `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(纯查询,幂等);可选属性 `requires_scope: bool`
+  (门**声明**需不需要作用域:会产生待审请求的门 `True`,立即决定、永不挂起的门 `False`;**未声明按需要**,缺作用域抛
+  `ApprovalConfigError` 且不调用 `review`;非 bool 值同样按需要)。
   `ConsumableApprovalGate`(Protocol):额外 `consume(request) -> bool`,执行闸在**执行前**核销一次放行额度(工具随后
-  抛异常,这次批准也已用掉)。可核销的门会产生需要人工决议的待审请求,**必须有显式作用域**。
+  抛异常,这次批准也已用掉)。会产生待审请求的门(含未声明 `requires_scope` 的第三方门)**必须有显式作用域**。
 - `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,
   永不 pending;不可核销(常驻策略放行);不需要作用域。
 - `ManualApprovalGate(*, token_store=None, max_requests=16384, max_pending_per_scope=64, request_ttl=3600.0, max_decided=4096, decided_ttl=600.0, now_fn=time.monotonic)`:

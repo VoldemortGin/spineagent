@@ -314,6 +314,12 @@ class ApprovalGate(Protocol):
 
     契约(由 conformance 钉死):review 返回 Decision;对同一 request 幂等(重复 review 恒同决议,
     除非其间发生了 resolve)。实现自身不发 trace——请求只带定位摘要,payload 正文无从泄漏。
+
+    可选属性 requires_scope: bool(门【声明】自己需不需要作用域;不在 Protocol 成员里,以免 isinstance 把没声明的
+    老门挡在外面):会产生待审请求的门(要人工决议 / 转发给外部审批系统)声明 True,立即给出决定、永不挂起的门
+    声明 False。【未声明按需要处理(fail-closed)】:没有作用域就报 ApprovalConfigError,且【不调用】它的 review——
+    库不再先 review 一次看它是否返回 PENDING(那会在第三方收件箱里登记一条无作用域的请求,批准后所有不带作用域的
+    调用方都能共用)。
     """
 
     name: str
@@ -438,6 +444,7 @@ class AutoApprovalGate:
     """
 
     name = "auto"
+    requires_scope = False  # 立即给出决定、永不挂起:不需要作用域
 
     def __init__(
         self,
@@ -509,6 +516,7 @@ class ManualApprovalGate:
     """
 
     name = "manual"
+    requires_scope = True  # 会产生待审请求:必须有显式作用域
 
     def __init__(
         self,
@@ -805,17 +813,21 @@ def current_approval_scope() -> str | None:
 
 # 会产生待审请求的门没有显式作用域时的配置错误(信息原文写进文档,调用方据它定位)。
 _SCOPE_REQUIRED = (
-    "这个审批门会产生待审请求(需要人工决议 / 可核销),必须显式提供作用域:请传入 "
+    "这个审批门需要作用域(它会产生待审请求,或没有声明 requires_scope),必须显式提供作用域:请传入 "
     "scope=<会话或用户的唯一标识>(ApprovalMiddleware(scope=...) / require_approval(scope=...),"
     "或在外层 with approval_scope(...))。原因:作用域折进 request id、决定批准归谁;库不再隐式生成作用域"
     "——隐式作用域要么让批准后的重跑永远对不上原请求,要么让共享同一个门的调用方共用批准。"
     "作用域须在共享同一个门的所有调用方之间唯一(建议 租户 id + 会话 id)。"
+    "若该门不会产生待审请求(立即给出决定、永不返回 PENDING),请在门上声明 requires_scope = False。"
 )
 
 
 def _requires_scope(gate: ApprovalGate) -> bool:
-    """可核销的门(如 ManualApprovalGate)会产生需要人工决议的待审请求:必须有显式作用域。"""
-    return isinstance(gate, ConsumableApprovalGate)
+    """门声明需要作用域吗?只认显式的 requires_scope = False 为「不需要」;未声明 / 非 bool 一律按需要(fail-closed)。
+
+    绝不为了探测而调用门的 review(那会在第三方收件箱里登记一条无作用域的请求)。
+    """
+    return getattr(gate, "requires_scope", True) is not False
 
 
 @dataclass(frozen=True)
@@ -894,7 +906,7 @@ class _ApprovalGuard:
             if decision is Decision.APPROVED:
                 decision = Decision.PENDING
         if decision is Decision.PENDING and not request.scope:
-            # 不实现 consume 的第三方门也可能挂起:没有作用域的待审请求无法被正确恢复 / 归属。
+            # 声明了 requires_scope = False 却返回了 PENDING(声明不实):没有作用域的待审请求无法被恢复 / 归属。
             raise ApprovalConfigError(_SCOPE_REQUIRED)
         if consume or decision is not Decision.APPROVED:
             # 每次调用恰好一条 mw_approval:预检放行时不记(紧接着的执行闸会记),预检拦下时由预检记。
