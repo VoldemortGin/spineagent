@@ -18,15 +18,23 @@ resilient 后,单个 agent 的异常被捕获、归一为家族统一错误 dict
 """
 
 import contextvars
+import math
 import time
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
-from corespine.errors import error_to_dict
+from corespine.errors import CorespineError, error_to_dict
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import Agent, AgentResult
 from spineagent.agent.trust import untrusted
+
+
+class AgentTimeoutError(CorespineError):
+    """并行编排里某个 agent 超过总超时 / 单任务超时仍未返回(可重试:挂死常是瞬时的)。"""
+
+    code = "orchestration.timeout"
+    retryable = True
 
 
 class Coordinator:
@@ -48,23 +56,116 @@ class Coordinator:
         return results
 
     def run_parallel(
-        self, task: str, *, max_workers: int | None = None, resilient: bool = False
+        self,
+        task: str,
+        *,
+        max_workers: int | None = None,
+        resilient: bool = False,
+        timeout: float | None = None,
+        task_timeout: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> list[AgentResult]:
-        """同一任务用线程池并发跑;结果仍按 agent 输入顺序返回(map 保序)。"""
+        """同一任务用线程池并发跑;结果仍按 agent 输入顺序返回(map 保序)。
+
+        timeout:整批总超时(秒,从调用起算);task_timeout:单任务超时(秒,从该任务真正开始跑起算)。
+        二者缺省 None = 不限(与旧行为完全一致)。超时的任务不再卡住整批:无论 resilient 与否,都以
+        error.code = "orchestration.timeout" 的 AgentResult 返回;已完成的照常返回。clock 可注入
+        (默认 time.monotonic)以便离线确定性测试。注:Python 线程无法被强杀,挂死的 agent 仍在后台
+        线程里占着,直到它自己返回。
+        """
         start = time.perf_counter()
         workers = max_workers or max(1, len(self._agents))
         # 每个分支在调用方上下文的一份副本里跑:contextvar 承载的审批作用域等随之进入工作线程,
         # 并行编排下执行闸照样生效(线程池默认不传播上下文)。
         contexts = [contextvars.copy_context() for _ in self._agents]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(
-                pool.map(
-                    lambda pair: pair[0].run(self._run_one, pair[1], task, resilient),
-                    zip(contexts, self._agents, strict=True),
+        if timeout is None and task_timeout is None:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(
+                    pool.map(
+                        lambda pair: pair[0].run(self._run_one, pair[1], task, resilient),
+                        zip(contexts, self._agents, strict=True),
+                    )
                 )
+        else:
+            results = self._run_parallel_bounded(
+                task, workers, contexts, resilient, timeout, task_timeout, clock
             )
         self._emit("parallel", start, results)
         return results
+
+    def _run_parallel_bounded(
+        self,
+        task: str,
+        workers: int,
+        contexts: list[contextvars.Context],
+        resilient: bool,
+        timeout: float | None,
+        task_timeout: float | None,
+        clock: Callable[[], float],
+    ) -> list[AgentResult]:
+        """带总超时 / 单任务超时的并行跑:到点仍未完成的任务以类型化超时结果返回,绝不挂住整批。"""
+        began = clock()
+        total_deadline = math.inf if timeout is None else began + timeout
+        started: dict[int, float] = {}  # 任务序 -> 真正开始跑的时刻(单任务超时由此起算)
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures: list[Future[AgentResult]] = [
+                pool.submit(
+                    ctx.run, self._run_tracked, index, started, clock, agent, task, resilient
+                )
+                for index, (ctx, agent) in enumerate(zip(contexts, self._agents, strict=True))
+            ]
+            timed_out: set[int] = set()
+            pending = set(range(len(futures)))
+            while pending:
+                now = clock()
+                for index in list(pending):
+                    task_deadline = (
+                        started[index] + task_timeout
+                        if task_timeout is not None and index in started
+                        else math.inf
+                    )
+                    if futures[index].done():
+                        pending.discard(index)
+                    elif now >= min(total_deadline, task_deadline):
+                        timed_out.add(index)
+                        pending.discard(index)
+                if not pending:
+                    break
+                horizon = min(
+                    [total_deadline]
+                    + [
+                        started[i] + task_timeout
+                        for i in pending
+                        if task_timeout is not None and i in started
+                    ]
+                )
+                # 未开始的任务没有单任务 deadline;无总超时时以短间隔轮询它们何时开始。
+                wait_for = 0.05 if math.isinf(horizon) else max(0.0, horizon - now)
+                wait([futures[i] for i in pending], timeout=wait_for, return_when=FIRST_COMPLETED)
+            results: list[AgentResult] = []
+            for index, (agent, future) in enumerate(zip(self._agents, futures, strict=True)):
+                if index in timed_out:
+                    future.cancel()
+                    results.append(_timeout_result(agent, timeout, task_timeout))
+                else:
+                    results.append(future.result())  # 非 resilient 下的异常照常冒泡
+            return results
+        finally:
+            # 不等挂死的线程:取消尚未开始的任务后立即返回。
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _run_tracked(
+        self,
+        index: int,
+        started: dict[int, float],
+        clock: Callable[[], float],
+        agent: Agent,
+        task: str,
+        resilient: bool,
+    ) -> AgentResult:
+        started[index] = clock()
+        return self._run_one(agent, task, resilient)
 
     def run_pipeline(self, task: str, *, resilient: bool = False) -> list[AgentResult]:
         """链式:上一个 agent 的输出作下一个 agent 的输入,保序收集每段结果。
@@ -104,3 +205,9 @@ class Coordinator:
             failures=sum(1 for r in results if r.error is not None),
             took_ms=round((time.perf_counter() - start) * 1000, 3),
         )
+
+
+def _timeout_result(agent: Agent, timeout: float | None, task_timeout: float | None) -> AgentResult:
+    """超时任务的类型化结果(只带 code / 预算,不带任何正文)。"""
+    exc = AgentTimeoutError("agent 超时未返回", timeout=timeout, task_timeout=task_timeout)
+    return AgentResult(agent=agent.name, output="", error=error_to_dict(exc))

@@ -100,7 +100,7 @@ from spineagent.llm.provider import (
     load_openai_sdk,
 )
 from spineagent.orchestration.chain import ChainAgent
-from spineagent.orchestration.coordinator import Coordinator
+from spineagent.orchestration.coordinator import AgentTimeoutError, Coordinator
 from spineagent.protocol.a2a.seam import (
     A2AAgent,
     A2AAgentAdapter,
@@ -229,6 +229,7 @@ __all__ = [
     "function_tool",
     # orchestration
     "Coordinator",
+    "AgentTimeoutError",
     "ChainAgent",
     # llm provider 适配器(挂在 corespine LLMProvider 缝后面;输出统一 OpenAI ChatCompletion)
     "AnthropicProvider",

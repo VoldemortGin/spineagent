@@ -42,12 +42,16 @@
   里的工具名,未知工具记 `<unknown>`;`A2AAgentAdapter` 的 provenance 与 trace 用本地登记名
   (构造参数 `name=` 或构造期对 `remote.name` 的快照),不再每步读取对端自报名。
 
+- `Coordinator.run_parallel` 可设 `timeout`(整批)/ `task_timeout`(单任务):挂死的 agent 不再卡住
+  整批,超时的任务以 `error.code = "orchestration.timeout"` 的结果返回(缺省不限,与旧行为一致)。
+
 ### Added
 
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
 - `spineagent.llm.errors.NonRetryableProviderError` / `provider_error_from`;
   `spineagent.agent.agent.merge_usage`;`ToolResult.usage` / `ToolResult.artifacts`(可选字段)。
+- `Coordinator.run_parallel(timeout=..., task_timeout=..., clock=...)`、`AgentTimeoutError`。
 - `A2AAgentAdapter(name=...)`;conformance `TOOL_TRACE_INVARIANTS`(未知工具名不进 trace);
   `ToolExecutionHarness.run(trace=...)`。
 - `spineagent.agent.trust`:`TaskText` / `untrusted` / `compose` / `lines_with_trust`;

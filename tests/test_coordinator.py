@@ -5,7 +5,7 @@ import threading
 import pytest
 from corespine.observability.trace import InProcessPrivacyTraceSink
 
-from spineagent.agent.agent import FunctionAgent
+from spineagent.agent.agent import AgentResult, FunctionAgent
 from spineagent.orchestration.coordinator import Coordinator
 
 
@@ -183,3 +183,48 @@ def test_empty_agents_sequential_and_parallel_return_empty():
     # 空 agent 列表:顺序 / 并行都返回空列表(与流水线空一致,无 agent 可跑)。
     assert Coordinator([]).run_sequential("go") == []
     assert Coordinator([]).run_parallel("go") == []
+
+
+# ---- run_parallel 超时:挂死的 agent 不再卡住整批 ------------------------------------------
+
+
+class _Hang:
+    """阻塞到被放行为止的 agent(模拟挂死)。"""
+
+    def __init__(self, name: str, release: threading.Event) -> None:
+        self.name = name
+        self._release = release
+
+    def step(self, task, *, trace=None):
+        self._release.wait(30)
+        return AgentResult(agent=self.name, output="late")
+
+
+def test_run_parallel_total_timeout_returns_typed_results_for_hung_agents():
+    release = threading.Event()
+    try:
+        coord = Coordinator([FunctionAgent("fast", lambda t: f"ok:{t}"), _Hang("hung", release)])
+        results = coord.run_parallel("go", timeout=0.3)
+    finally:
+        release.set()
+    assert [r.agent for r in results] == ["fast", "hung"]  # 保序
+    assert results[0].ok and results[0].output == "ok:go"
+    assert results[1].error is not None and results[1].error["code"] == "orchestration.timeout"
+
+
+def test_run_parallel_task_timeout_uses_injected_clock():
+    # 时钟可注入:假时钟每读一次前进 10 秒,单任务预算 1 秒 -> 挂死的任务确定性地判超时。
+    release = threading.Event()
+    ticks = iter(range(0, 10_000, 10))
+    try:
+        coord = Coordinator([_Hang("a", release), _Hang("b", release)])
+        results = coord.run_parallel("go", task_timeout=1.0, clock=lambda: float(next(ticks)))
+    finally:
+        release.set()
+    assert [r.error["code"] for r in results] == ["orchestration.timeout"] * 2
+
+
+def test_run_parallel_without_timeouts_is_unchanged():
+    coord = Coordinator([FunctionAgent("a", lambda t: "1"), FunctionAgent("b", lambda t: "2")])
+    assert [r.output for r in coord.run_parallel("go")] == ["1", "2"]
+    assert [r.output for r in coord.run_parallel("go", timeout=5.0)] == ["1", "2"]
