@@ -10,11 +10,17 @@
   真实调用工具前按「真实工具名 + 规范化参数」向审批门 review;未批准不执行。中间件组合顺序、嵌套
   agent、`AgentTool`、`ChainAgent`、`Coordinator.run_parallel`、`DeepResearchAgent` 下均生效;
   审批门故障时 fail-closed。
+- `InProcessSandbox`:消除热路径上被 beartype claw 每次调用重新装饰的嵌套函数(大 env 求值从秒级
+  降到毫秒级);`timeout` 现在真正生效(按节点检查的协作式 deadline,超时判 `limit_exceeded`)。
+- `CalcTool`:表达式长度 ≤ 4096、嵌套深度 ≤ 100,幂 / 乘法结果位数复用 sandbox 的昂贵二元运算
+  守卫;越界立即抛 `ValueError`。
 
 ### Added
 
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
+- `InProcessSandbox(clock=...)`:可注入时钟(默认 `time.monotonic`)。
+- conformance:`SANDBOX_INVARIANTS` 新增 `timeout_takes_effect`。
 - conformance:`APPROVAL_ENFORCEMENT_INVARIANTS` + `ToolExecutionHarness` 协议 +
   `ScriptedToolCallProvider`(离线脚本化 tool_calls 的 provider)。
 
@@ -32,3 +38,6 @@
 - 依赖「`ApprovalMiddleware` 在内层 agent 运行前、按 `ctx.tools` 抛 `ApprovalRejected` /
   `ApprovalPending`」的调用方:现在只有在受审批工具**真正被调用**时才抛;内层 agent 不调用该工具
   就不会抛。ManualApprovalGate 上旧的按「工具集」派生的 request id 不再出现,待审请求改为按调用派生。
+- `InProcessSandbox.run(timeout=...)` / `Limits.timeout_seconds` 从「只记录」变为强制:求值超过
+  timeout(缺省 `DEFAULT_LIMITS` 为 5 秒)判失败。
+- `CalcTool` 拒绝超过上述上限的表达式(此前会长时间计算或抛 `RecursionError`)。

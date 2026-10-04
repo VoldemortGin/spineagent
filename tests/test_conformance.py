@@ -539,7 +539,7 @@ def test_policy_conformance(case):
 
 @pytest.mark.parametrize(**SANDBOX_SUITE.parametrize_kwargs())
 def test_sandbox_conformance(case):
-    """每个 Sandbox 实现(离线默认 in_process)× 每条 sandbox 不变量 各跑一格(1 × 5 = 5 格全绿)。"""
+    """每个 Sandbox 实现(离线默认 in_process)× 每条 sandbox 不变量 各跑一格(1 × 6 = 6 格全绿)。"""
     case()
 
 

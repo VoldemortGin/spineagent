@@ -1,5 +1,7 @@
 """tool 合约:echo / calc 派发 + 结果带 provenance + 算术求值安全 + 缝注册表。"""
 
+import threading
+
 import pytest
 
 from spineagent.tools.tool import CalcTool, EchoTool, Tool, ToolResult, tool_registry
@@ -75,3 +77,53 @@ def test_calc_tool_rejects_string_literal_constant():
     # 非数字常量(字符串字面量)被拒(只认数字常量)。
     with pytest.raises(ValueError):
         CalcTool().run("'abc'")
+
+
+# ---- CalcTool DoS 上限:幂 / 位移 / 乘法位数 / 长度 / 嵌套深度一律立即受控报错 -----------------
+
+
+def _run_guarded(expr: str) -> BaseException | None:
+    """在守护线程里跑 CalcTool;5 秒没返回即判挂死(只作防挂死兜底,断言靠异常类型)。"""
+    outcome: list[BaseException | None] = []
+
+    def target() -> None:
+        try:
+            CalcTool().run(expr)
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 — 记录后在主线程断言
+            outcome.append(exc)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(5)
+    assert outcome, f"CalcTool 对 {expr[:30]!r} 未在受控时间内返回"
+    return outcome[0]
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "9**9**9",
+        "2**(2**30)",
+        "1<<10**9",
+        "(9**999)*(9**999)*(9**999)*(9**999)",
+        "1+" * 5000 + "1",
+        "-(" * 150 + "1" + ")" * 150,
+        "-" * 500 + "1",
+    ],
+)
+def test_calc_tool_bounds_expensive_expressions(expr):
+    exc = _run_guarded(expr)
+    assert isinstance(exc, ValueError), f"应受控地抛 ValueError,实得 {exc!r}"
+
+
+def test_calc_tool_deep_bare_parentheses_fail_fast():
+    # 纯括号不产生 AST 节点:150 层照常得 1;超过解析器上限则立即抛语法错(受控,不挂死)。
+    assert CalcTool().run("(" * 150 + "1" + ")" * 150).output == "1"
+    exc = _run_guarded("(" * 300 + "1" + ")" * 300)
+    assert isinstance(exc, (SyntaxError, ValueError))
+
+
+def test_calc_tool_still_handles_reasonable_powers():
+    assert CalcTool().run("2**100").output == str(2**100)
+    assert CalcTool().run("(1+2)*(3+4)").output == "21"

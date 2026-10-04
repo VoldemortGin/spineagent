@@ -17,6 +17,8 @@ from typing import Protocol, runtime_checkable
 
 from corespine.seam.registry import Registry
 
+from spineagent.sandbox.seam import _guard_expensive_binop, _LimitExceeded
+
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -64,26 +66,50 @@ _UNARY_OPS: dict[type[ast.unaryop], Callable[[float], float]] = {
 }
 
 
+# 表达式长度 / 嵌套深度上限:任务文本或上游输出可达本工具,超长 / 深嵌套表达式会让解析与递归求值
+# 失控(RecursionError / 秒级耗时)。幂 / 乘法结果位数复用 sandbox 的昂贵二元运算守卫。
+_MAX_CALC_CHARS = 4_096
+_MAX_CALC_DEPTH = 100
+
+
 class CalcTool:
-    """玩具工具:安全求值一个算术表达式(只认数字与 +-*/%**,绝不 eval 任意代码)。"""
+    """玩具工具:安全求值一个算术表达式(只认数字与 +-*/%**,绝不 eval 任意代码)。
+
+    有界:表达式长度 ≤ 4096 字符、嵌套深度 ≤ 100;幂指数 / 幂与乘法结果位数等先于真实运算按
+    sandbox 同一守卫检查(_guard_expensive_binop)。越界一律立即抛 ValueError(受控错误)。
+    """
 
     name = "calc"
 
     def run(self, arg: str) -> ToolResult:
-        value = _safe_eval(ast.parse(arg, mode="eval").body)
+        if len(arg) > _MAX_CALC_CHARS:
+            raise ValueError(f"表达式长度超过 {_MAX_CALC_CHARS} 字符")
+        try:
+            tree = ast.parse(arg, mode="eval")
+        except (RecursionError, MemoryError) as exc:
+            raise ValueError(f"表达式过深,无法解析({type(exc).__name__})") from exc
+        value = _safe_eval(tree.body, 0)
         # 整数值去掉多余的 .0,输出更干净。
         text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
         return ToolResult(tool=self.name, output=text)
 
 
-def _safe_eval(node: ast.AST) -> float:
+def _safe_eval(node: ast.AST, depth: int) -> float:
     """递归求值一棵【白名单】算术 AST;遇到任何非算术节点即拒绝(不触碰任意代码执行)。"""
+    if depth > _MAX_CALC_DEPTH:
+        raise ValueError(f"表达式嵌套深度超过 {_MAX_CALC_DEPTH}")
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+        left = _safe_eval(node.left, depth + 1)
+        right = _safe_eval(node.right, depth + 1)
+        try:
+            _guard_expensive_binop(node.op, left, right)
+        except _LimitExceeded as exc:
+            raise ValueError(f"表达式开销超限:{exc}") from exc
+        return _BIN_OPS[type(node.op)](left, right)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return _UNARY_OPS[type(node.op)](_safe_eval(node.operand))
+        return _UNARY_OPS[type(node.op)](_safe_eval(node.operand, depth + 1))
     raise ValueError(f"不支持的表达式节点:{type(node).__name__}")
 
 

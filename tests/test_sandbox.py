@@ -4,6 +4,7 @@ conformance 里已把「无网络出口 / 上限生效 / 结果带 provenance」
 这里补 InProcessSandbox 专属的行为断言(白名单语义、各失败原因码、env 绑定、real 后端桩)。
 """
 
+import sys
 from collections.abc import Iterator, Mapping
 
 import pytest
@@ -182,7 +183,7 @@ def test_bounded_repetition_and_power_still_work():
 
 
 def test_timeout_folds_into_limits_without_crashing():
-    # in-process 无法抢占同步求值,timeout 仅折叠 / 记录,不该让正常求值失败。
+    # 宽松的 timeout 折叠进 limits 做协作式 deadline,不该让正常求值失败。
     result = InProcessSandbox().run("1 + 1", timeout=1.0)
     assert result.ok and result.output == "2"
 
@@ -207,3 +208,96 @@ def test_container_backend_errors_without_extra():
     # 未装 [sandbox] extra -> 友好 ImportError;装了但未接入 -> SeamError。二者皆非默认路径。
     with pytest.raises((ImportError, SeamError)):
         sandboxes.make("container")
+
+
+# ---- 热路径 DoS 回归:按「运行期装饰次数」与「操作计数」断言,不靠墙钟 ------------------------
+
+
+def _count_runtime_beartype_decorations(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """给每个已加载 spineagent 模块的 claw 装饰器挂计数:运行期每装饰一次嵌套函数就 +1。"""
+    pytest.importorskip("beartype")
+    counter = {"n": 0}
+    for name, module in list(sys.modules.items()):
+        decorate = getattr(module, "__beartype__", None)
+        if not name.startswith("spineagent") or decorate is None:
+            continue
+
+        def counting(*args, _decorate=decorate, **kwargs):
+            counter["n"] += 1
+            return _decorate(*args, **kwargs)
+
+        monkeypatch.setattr(module, "__beartype__", counting)
+    return counter
+
+
+def test_render_cost_check_does_not_redecorate_per_call(monkeypatch):
+    # 修复前:_bounded_render_cost 的嵌套 charge 每次调用都被 beartype claw 重新装饰(约 1.5ms/次),
+    # 2000 元素的 env 即触发上万次装饰。现在热路径上运行期装饰次数必须为 0。
+    counter = _count_runtime_beartype_decorations(monkeypatch)
+    result = InProcessSandbox().run("sorted(x)", env={"x": list(range(2000))})
+    assert result.ok
+    assert counter["n"] == 0
+    assert result.usage.ops == 2  # Call + 实参 Name:节点预算与元素数无关
+
+
+def test_tool_loops_do_not_redecorate_per_call(monkeypatch):
+    from spineagent.agent.function_calling import FunctionCallingAgent
+    from spineagent.agent.policy import SyntaxToolPolicy
+    from spineagent.agent.tool_using import ToolUsingAgent
+    from spineagent.conformance import ScriptedToolCallProvider
+    from spineagent.tools.function_tool import function_tool
+    from spineagent.tools.tool import CalcTool
+
+    @function_tool
+    def double(value: str) -> str:
+        return value * 2
+
+    fc = FunctionCallingAgent(
+        "fc", ScriptedToolCallProvider([("double", {"value": "a"})] * 5), [double]
+    )
+    tu = ToolUsingAgent("tu", SyntaxToolPolicy(), [CalcTool()])
+    counter = _count_runtime_beartype_decorations(monkeypatch)
+    fc.step("go")
+    tu.step("calc: 1+1\ncalc: $prev * 3")
+    InProcessSandbox().run("sum([1, 2, 3])", env={"x": {"k": [1, 2]}})
+    assert counter["n"] == 0
+
+
+# ---- 协作式超时:按节点检查 deadline,时钟可注入 ---------------------------------------------
+
+
+class _StepClock:
+    """每读一次前进 step 秒的假时钟(离线确定性)。"""
+
+    def __init__(self, step: float) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        self.now += self.step
+        return self.now
+
+
+def test_timeout_is_enforced_cooperatively():
+    clock = _StepClock(0.01)
+    code = "[" + ",".join("1" for _ in range(100)) + "]"
+    result = InProcessSandbox(clock=clock).run(code, timeout=0.05)
+    assert not result.ok
+    assert result.error == "limit_exceeded"
+    assert result.usage.ops < 101  # 超时后立即停止求值,不再走完全部节点
+
+
+def test_generous_timeout_does_not_interfere():
+    result = InProcessSandbox(clock=_StepClock(0.001)).run("1 + 2", timeout=10.0)
+    assert result.ok and result.output == "3"
+
+
+def test_zero_timeout_never_succeeds():
+    result = InProcessSandbox().run("1 + 1", timeout=0.0)
+    assert not result.ok and result.error == "limit_exceeded"
+
+
+def test_no_timeout_means_no_deadline():
+    clock = _StepClock(1000.0)
+    limits = Limits(timeout_seconds=None, max_output_chars=100, max_ops=100)
+    assert InProcessSandbox(clock=clock).run("1 + 2", limits=limits).ok

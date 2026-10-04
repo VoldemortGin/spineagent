@@ -48,8 +48,9 @@ class ResourceUsage:
 class Limits:
     """一次沙箱执行的资源上限。None 表示该维度不限(退回后端默认)。
 
-    - timeout_seconds:墙钟超时。InProcessSandbox 无法抢占同步求值,故仅【尽力/记录】(见模块
-      docstring),真正的抢占式超时是 subprocess / container 后端的职责;
+    - timeout_seconds:墙钟超时。InProcessSandbox 做【协作式】deadline:每求值一个 AST 节点检查一次
+      (时钟可注入),超时即判 limit_exceeded;单个白名单内建调用内部不可抢占(其规模已被值上限约束)。
+      真正的抢占式超时是 subprocess / container 后端的职责;
     - max_output_chars:产出字符上限,超出即判失败(任何后端都能事后度量,故这是最中立的上限);
     - max_ops:InProcessSandbox 求值的 AST 节点数上限(确定性 CPU 代理),超出即判失败。
     """
@@ -198,6 +199,18 @@ def _sequence_repeat_operands(
     return None, None
 
 
+def _charge(cost: int, remaining: int) -> int:
+    """渲染成本记账:超出剩余预算即判超限。
+
+    刻意放在模块级而非 _bounded_render_cost 的嵌套函数:beartype claw 会在【每次定义】嵌套函数时
+    重新装饰它(约 1.5 ms / 次),而 _bounded_render_cost 按容器元素递归调用,嵌套定义会把一个
+    2000 元素的 env 放大成上万次装饰(秒级 DoS)。
+    """
+    if cost > remaining:
+        raise _LimitExceeded(f"值的渲染成本超过 {_MAX_VALUE_CHARS}")
+    return cost
+
+
 def _bounded_render_cost(
     value: Any,
     remaining: int = _MAX_VALUE_CHARS,
@@ -205,36 +218,30 @@ def _bounded_render_cost(
 ) -> int:
     """保守估算 ``str(value)`` 物化成本，并递归拒绝非 JSON-like / 循环巨值。"""
     stack = stack if stack is not None else set()
-
-    def charge(cost: int) -> int:
-        if cost > remaining:
-            raise _LimitExceeded(f"值的渲染成本超过 {_MAX_VALUE_CHARS}")
-        return cost
-
     value_type = type(value)
     if value is None or value_type is bool:
-        return charge(5)
+        return _charge(5, remaining)
     if value_type is int:
         if value.bit_length() > _MAX_INT_BITS:
             raise _LimitExceeded(f"整数位数超过 {_MAX_INT_BITS}")
-        return charge((value.bit_length() * 3) // 10 + 3)
+        return _charge((value.bit_length() * 3) // 10 + 3, remaining)
     if value_type is float:
         if not math.isfinite(value):
             raise _LimitExceeded("不允许非有限浮点值")
-        return charge(32)
+        return _charge(32, remaining)
     if value_type is complex:
         if not (math.isfinite(value.real) and math.isfinite(value.imag)):
             raise _LimitExceeded("不允许非有限复数值")
-        return charge(70)
+        return _charge(70, remaining)
     if value_type is str:
-        return charge(len(value) + 2)
+        return _charge(len(value) + 2, remaining)
     if value_type is bytes:
-        return charge(len(value) * 4 + 3)
+        return _charge(len(value) * 4 + 3, remaining)
     if value_type is slice:
         total = 8
         for part in (value.start, value.stop, value.step):
             total += _bounded_render_cost(part, remaining - total, stack)
-        return charge(total)
+        return _charge(total, remaining)
     if value_type not in {list, tuple, set, frozenset, dict}:
         raise _Disallowed("只允许 JSON-like 标量/容器值，不允许自定义对象")
     if len(value) > _MAX_COLLECTION_ITEMS:
@@ -254,10 +261,43 @@ def _bounded_render_cost(
                 total += _bounded_render_cost(child, remaining - total, stack) + 2
             else:
                 total += _bounded_render_cost(item, remaining - total, stack) + 2
-            charge(total)
-        return charge(total)
+            _charge(total, remaining)
+        return _charge(total, remaining)
     finally:
         stack.remove(identity)
+
+
+def _guard_expensive_binop(op: ast.operator, left: Any, right: Any) -> None:
+    """在物化结果前拒绝可预测的巨型幂、重复与拼接(包内共享:CalcTool 复用同一守卫)。"""
+    if isinstance(op, ast.Pow) and isinstance(right, int) and not isinstance(right, bool):
+        if abs(right) > _MAX_POWER_EXPONENT:
+            raise _LimitExceeded(f"幂指数绝对值超过 {_MAX_POWER_EXPONENT}")
+        if right >= 0 and isinstance(left, int) and not isinstance(left, bool):
+            predicted_bits = max(1, left.bit_length()) * right
+            if predicted_bits > _MAX_INT_BITS:
+                raise _LimitExceeded(f"幂运算结果位数超过 {_MAX_INT_BITS}")
+
+    if isinstance(op, ast.Mult):
+        sequence, count = _sequence_repeat_operands(left, right)
+        if sequence is not None and count is not None:
+            limit = (
+                _MAX_VALUE_CHARS if isinstance(sequence, (str, bytes)) else _MAX_COLLECTION_ITEMS
+            )
+            if count > 0 and len(sequence) > limit // count:
+                raise _LimitExceeded(f"序列重复结果大小超过 {limit}")
+        if _plain_int(left) and _plain_int(right):
+            if left.bit_length() + right.bit_length() > _MAX_INT_BITS + 1:
+                raise _LimitExceeded(f"整数乘法结果位数超过 {_MAX_INT_BITS}")
+
+    if isinstance(op, ast.Add) and type(left) is type(right):
+        if isinstance(left, (str, bytes)) and len(left) + len(right) > _MAX_VALUE_CHARS:
+            raise _LimitExceeded(f"文本拼接结果长度超过 {_MAX_VALUE_CHARS}")
+        if isinstance(left, (list, tuple)) and len(left) + len(right) > _MAX_COLLECTION_ITEMS:
+            raise _LimitExceeded(f"容器拼接结果元素数超过 {_MAX_COLLECTION_ITEMS}")
+
+    # Python 的字符串 % 格式支持超大宽度（如 "%1000000000s"），少量 AST 即可分配巨量内存。
+    if isinstance(op, ast.Mod) and isinstance(left, (str, bytes)):
+        raise _Disallowed("不允许字符串 % 格式化")
 
 
 class _Evaluator:
@@ -268,15 +308,27 @@ class _Evaluator:
     / 非白名单 Name(挡 open / __import__)一律拒绝——【构造即保证】无网络出口、无文件系统逃逸。
     """
 
-    def __init__(self, env: dict[str, object], max_ops: int | None) -> None:
+    def __init__(
+        self,
+        env: dict[str, object],
+        max_ops: int | None,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._env = env
         self._max_ops = max_ops
+        self._deadline = deadline
+        self._clock = clock
         self.ops = 0
 
     def eval(self, node: ast.AST) -> Any:
         self.ops += 1
         if self._max_ops is not None and self.ops > self._max_ops:
             raise _LimitExceeded(f"求值节点数超过 max_ops={self._max_ops}")
+        # 协作式 deadline:每个节点查一次时钟(一次单调时钟读取,开销远小于节点求值本身)。
+        if self._deadline is not None and self._clock() >= self._deadline:
+            raise _LimitExceeded("求值超过 timeout(协作式 deadline)")
         handler = _HANDLERS.get(type(node))
         if handler is None:
             raise _Disallowed(f"不允许的表达式节点:{type(node).__name__}")
@@ -305,43 +357,8 @@ class _Evaluator:
             raise _Disallowed(f"不允许的二元运算符:{type(node.op).__name__}")
         left = self.eval(node.left)
         right = self.eval(node.right)
-        self._guard_expensive_binop(node.op, left, right)
+        _guard_expensive_binop(node.op, left, right)
         return op(left, right)
-
-    @staticmethod
-    def _guard_expensive_binop(op: ast.operator, left: Any, right: Any) -> None:
-        """在物化结果前拒绝可预测的巨型幂、重复与拼接。"""
-        if isinstance(op, ast.Pow) and isinstance(right, int) and not isinstance(right, bool):
-            if abs(right) > _MAX_POWER_EXPONENT:
-                raise _LimitExceeded(f"幂指数绝对值超过 {_MAX_POWER_EXPONENT}")
-            if right >= 0 and isinstance(left, int) and not isinstance(left, bool):
-                predicted_bits = max(1, left.bit_length()) * right
-                if predicted_bits > _MAX_INT_BITS:
-                    raise _LimitExceeded(f"幂运算结果位数超过 {_MAX_INT_BITS}")
-
-        if isinstance(op, ast.Mult):
-            sequence, count = _sequence_repeat_operands(left, right)
-            if sequence is not None and count is not None:
-                limit = (
-                    _MAX_VALUE_CHARS
-                    if isinstance(sequence, (str, bytes))
-                    else _MAX_COLLECTION_ITEMS
-                )
-                if count > 0 and len(sequence) > limit // count:
-                    raise _LimitExceeded(f"序列重复结果大小超过 {limit}")
-            if _plain_int(left) and _plain_int(right):
-                if left.bit_length() + right.bit_length() > _MAX_INT_BITS + 1:
-                    raise _LimitExceeded(f"整数乘法结果位数超过 {_MAX_INT_BITS}")
-
-        if isinstance(op, ast.Add) and type(left) is type(right):
-            if isinstance(left, (str, bytes)) and len(left) + len(right) > _MAX_VALUE_CHARS:
-                raise _LimitExceeded(f"文本拼接结果长度超过 {_MAX_VALUE_CHARS}")
-            if isinstance(left, (list, tuple)) and len(left) + len(right) > _MAX_COLLECTION_ITEMS:
-                raise _LimitExceeded(f"容器拼接结果元素数超过 {_MAX_COLLECTION_ITEMS}")
-
-        # Python 的字符串 % 格式支持超大宽度（如 "%1000000000s"），少量 AST 即可分配巨量内存。
-        if isinstance(op, ast.Mod) and isinstance(left, (str, bytes)):
-            raise _Disallowed("不允许字符串 % 格式化")
 
     def _unaryop(self, node: ast.UnaryOp) -> Any:
         op = _UNARY_OPS.get(type(node.op))
@@ -469,11 +486,15 @@ class InProcessSandbox:
 
     隔离由 AST 白名单【构造即保证】:拒绝 Import / Attribute / 任意 Call / 非白名单 Name,故代码
     无从 import socket / open 文件 / 反射逃逸。资源上限:max_ops 限求值节点数(确定性 CPU 代理)、
-    max_output_chars 限产出。失败(语法错 / 被拒 / 触限 / 求值异常)一律【容住】为非 0 SandboxResult
-    (带失败原因码),绝不以 Python 异常冒泡。
+    max_output_chars 限产出、timeout_seconds 做协作式 deadline(clock 可注入,默认 time.monotonic,
+    便于离线确定性测试)。失败(语法错 / 被拒 / 触限 / 超时 / 求值异常)一律【容住】为非 0
+    SandboxResult(带失败原因码),绝不以 Python 异常冒泡。
     """
 
     name = "in_process"
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
 
     def run(
         self,
@@ -499,7 +520,8 @@ class InProcessSandbox:
             return self._fail("disallowed", str(exc), evaluator, started)
         except _LimitExceeded as exc:
             return self._fail("limit_exceeded", str(exc), evaluator, started)
-        evaluator = _Evaluator(namespace, eff.max_ops)
+        deadline = None if eff.timeout_seconds is None else self._clock() + eff.timeout_seconds
+        evaluator = _Evaluator(namespace, eff.max_ops, deadline=deadline, clock=self._clock)
         if len(code) > _MAX_CODE_CHARS:
             return self._fail(
                 "limit_exceeded",

@@ -181,24 +181,33 @@ class AnthropicProvider:
         except Exception as exc:  # noqa: BLE001 — SDK 网络/API 异常归一到 ProviderError
             raise ProviderError(f"Anthropic 流式调用失败:{exc}") from exc
 
-        def _chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> ChatCompletionChunk:
-            return ChatCompletionChunk(
-                choices=(ChunkChoice(index=0, delta=delta, finish_reason=finish_reason),),
-                model=self._model,
-            )
-
         for event in stream:
             etype = getattr(event, "type", None)
             if etype == "message_start":
-                yield _chunk(ChoiceDelta(role="assistant"))
+                yield _anthropic_chunk(self._model, ChoiceDelta(role="assistant"))
             elif etype == "content_block_delta":
                 delta: Any = getattr(event, "delta", None)
                 if getattr(delta, "type", None) == "text_delta":
-                    yield _chunk(ChoiceDelta(content=delta.text))
+                    yield _anthropic_chunk(self._model, ChoiceDelta(content=delta.text))
             elif etype == "message_delta":
                 stop = getattr(getattr(event, "delta", None), "stop_reason", None)
                 if stop is not None:
-                    yield _chunk(ChoiceDelta(), finish_reason=_ANTHROPIC_FINISH.get(stop, "stop"))
+                    yield _anthropic_chunk(
+                        self._model, ChoiceDelta(), _ANTHROPIC_FINISH.get(stop, "stop")
+                    )
+
+
+def _anthropic_chunk(
+    model: str, delta: ChoiceDelta, finish_reason: str | None = None
+) -> ChatCompletionChunk:
+    """把一段增量包成单 choice 的 ChatCompletionChunk。
+
+    放模块级而非 stream_chat 的嵌套函数:beartype claw 会在每次定义嵌套函数时重新装饰它。
+    """
+    return ChatCompletionChunk(
+        choices=(ChunkChoice(index=0, delta=delta, finish_reason=finish_reason),),
+        model=model,
+    )
 
 
 class OpenAICompatProvider:
