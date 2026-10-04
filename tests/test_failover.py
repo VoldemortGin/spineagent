@@ -620,3 +620,19 @@ def test_stream_one_malformed_request_costs_at_most_two_billed_calls():
     with pytest.raises(BadRequestProviderError):
         list(fp.stream_chat(_MSGS))
     assert [p.calls for p in pool] == [1, 1, 0]
+
+
+def test_stream_ambiguous_4xx_then_a_different_failure_stops_after_one_more_provider():
+    class _StreamRaises(_Raises):
+        def stream_chat(self, messages, *, tools=None):
+            self.calls += 1
+            raise self.exc
+            yield  # pragma: no cover
+
+    failing = _StreamRaises(_nre(400, "unexpected field"))
+    down = _StreamRaises(ProviderError("overloaded", retryable=True, status=503))
+    spare = _StreamRaises(ProviderError("unused", retryable=True, status=503))
+    fp = StreamingFailoverProvider([failing, down, spare], now_fn=_FakeClock())
+    with pytest.raises(FailoverExhaustedError):
+        list(fp.stream_chat(_MSGS))
+    assert (failing.calls, down.calls, spare.calls) == (1, 1, 0)

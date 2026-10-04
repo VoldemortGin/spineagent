@@ -513,3 +513,10 @@ def test_review_r2_long_left_associative_chains_evaluate(terms):
     result = InProcessSandbox().run("+".join(["1"] * terms))
     assert result.ok and result.output == str(terms)
     assert InProcessSandbox().run("-".join(["1"] * terms)).output == str(2 - terms)
+
+
+def test_container_literal_itself_is_charged_even_when_elements_are_references():
+    # 元素是 env 里已有值的引用(不是新物化的内存),容器字面量自身的指针数组仍要计入内存预算。
+    code = "len([" + ",".join(["s"] * 2000) + "])"
+    result = InProcessSandbox().run(code, env={"s": "x"})
+    assert result.ok and result.usage.memory_bytes >= 2000 * 8
