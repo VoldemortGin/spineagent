@@ -893,7 +893,8 @@ def enforce_tool_approval(
 
     未配置审批时只读一次 contextvar 即返回(零行为变化);命中受审批工具时:approved 放行(可核销的
     门在此扣减一次额度),rejected 抛 ApprovalRejected、pending 抛 ApprovalPending、门故障抛
-    ApprovalGateError——调用方据此【不执行】该工具。target 传被执行的工具对象:若它自带
+    ApprovalGateError——调用方据此【不执行】该工具。核销发生在【执行之前】:工具随后抛异常,这次批准也已
+    用掉(要重试须重新批准)。target 传被执行的工具对象:若它自带
     require_approval 闸,同一个门交给工具自己审(避免同一调用被同一个门审两次、扣两次额度)。
     available 传本执行点已注册的工具名:受审批名与之仅大小写 / 分隔符不同时 fail-closed。
     自定义 agent 若自己执行工具,也应在调用前调它(或改用 require_approval)。

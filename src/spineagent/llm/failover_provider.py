@@ -23,8 +23,9 @@
   - 瞬时故障(网络 / 超时 / 408 / 425 / 429 / 5xx)-> 回退 + 冷却出错的这一家;
   - 与具体 provider 相关、对这一家持续失效的拒绝(401 / 402 / 403 / 404、余额 / 配额 / 计费 / 模型不存在)
     -> 不对同一家重试,回退到下一家,【只冷却出错的那一家】;
-  - 上下文超长、以及无法确定是否与 provider 相关的 4xx -> 回退(宁可多试一家,也不在可恢复时停摆),
-    但不冷却——同一条请求在全池都失败时不会把整个池子冷却掉;
+  - 上下文超长、以及无法确定是否与 provider 相关的 4xx -> 疑似请求本身有问题:不冷却,且【最多再试 1 家】;
+    再试的那家也以同类 4xx 拒绝 -> 判定请求有问题,抛 BadRequestProviderError(一条畸形请求最多 2 次计费
+    调用,而不是把整个池子打一遍);再试的那家以别的错误失败 -> 停止,抛聚合错误;
   - 显式的 `BadRequestProviderError`(确知请求畸形)-> 不回退、不冷却,直接上抛。
 在没有真实 SDK 可核实各家错误码的前提下,缺省规则是保守的;需要不同取舍的调用方注入自己的分类函数。
 
@@ -81,10 +82,12 @@ def _redact_credentials(text: str) -> str:
 
 @dataclass(frozen=True)
 class FailoverDecision:
-    """对一次下游失败的处置:fallback = 是否换下一家;cooldown = 是否冷却出错的这一家。"""
+    """对一次下游失败的处置:fallback = 是否换下一家;cooldown = 是否冷却出错的这一家;suspect_request =
+    这次失败疑似是请求本身的问题(之后最多再试 1 家,再遇到同类即判定请求有问题、停止回退)。"""
 
     fallback: bool
     cooldown: bool
+    suspect_request: bool = False
 
 
 # 与具体 provider 相关、对这一家持续失效的拒绝:换一家可能成功,且这一家短期内别再打。
@@ -104,8 +107,8 @@ def default_failover_policy(exc: BaseException) -> FailoverDecision:
         status = exc.context.get("status")
         if status in _PROVIDER_STATUS or _PROVIDER_HINT.search(str(exc)):
             return FailoverDecision(fallback=True, cooldown=True)
-        # 上下文超长 / 无法判定的 4xx:换一家试试,但不冷却(很可能是这条请求的问题)。
-        return FailoverDecision(fallback=True, cooldown=False)
+        # 上下文超长 / 无法判定的 4xx:很可能是这条请求的问题——不冷却,最多再试 1 家。
+        return FailoverDecision(fallback=True, cooldown=False, suspect_request=True)
     return FailoverDecision(fallback=True, cooldown=True)
 
 
@@ -173,9 +176,18 @@ class FailoverProvider:
             self._cursor = (idx + 1) % len(self._providers)
 
     def _on_failure(
-        self, idx: int, exc: BaseException, now: float, failures: dict[int, str]
-    ) -> None:
-        """某下游失败:按回退策略决定是否上抛 / 冷却它;可回退时记录(脱敏)原因。"""
+        self,
+        idx: int,
+        exc: BaseException,
+        now: float,
+        failures: dict[int, str],
+        suspected: bool,
+    ) -> bool:
+        """某下游失败:按回退策略决定上抛 / 冷却 / 记录(脱敏)原因;返回本次失败是否疑似请求本身的问题。
+
+        suspected 表示本次调用里此前已有一家以「疑似请求问题」失败:这次又是同类 -> 判定请求有问题,抛
+        BadRequestProviderError;否则由调用方停止回退(疑似之后最多再试 1 家)。
+        """
         decision = self._policy(exc)
         if not decision.fallback:
             raise exc
@@ -184,6 +196,12 @@ class FailoverProvider:
                 self._cooldown_until[idx] = now + self._cooldown_seconds
         label = type(self._providers[idx]).__name__
         failures[idx] = f"[{idx}] {label}: {_redact_credentials(str(exc))}"
+        if suspected and decision.suspect_request:
+            reasons = "; ".join(failures[i] for i in sorted(failures))
+            raise BadRequestProviderError(
+                f"两个下游以无法归因于 provider 的 4xx 拒绝了同一条请求,判定请求本身有问题,停止回退:{reasons}"
+            ) from exc
+        return decision.suspect_request
 
     def _exhausted(self, failures: dict[int, str]) -> FailoverExhaustedError:
         """把逐个下游的(已脱敏)失败原因拼成一条清晰的聚合错误。"""
@@ -202,11 +220,15 @@ class FailoverProvider:
         """
         now = self._now()
         failures: dict[int, str] = {}
+        suspected = False
         for idx in self._attempt_order(now):
             try:
                 result = self._providers[idx].chat(messages, tools=tools)
             except self._retryable_errors as exc:
-                self._on_failure(idx, exc, now, failures)
+                if suspected:
+                    self._on_failure(idx, exc, now, failures, suspected)
+                    break  # 疑似请求问题之后只再试 1 家
+                suspected = self._on_failure(idx, exc, now, failures, suspected)
                 continue
             self._on_success(idx)
             return result
@@ -232,6 +254,7 @@ class StreamingFailoverProvider(FailoverProvider):
         """
         now = self._now()
         failures: dict[int, str] = {}
+        suspected = False
         for idx in self._attempt_order(now):
             # 工厂只在【全下游都实现 StreamingLLMProvider】时才选本类,故此处 cast 是安全的诚实断言。
             provider = cast(StreamingLLMProvider, self._providers[idx])
@@ -242,7 +265,10 @@ class StreamingFailoverProvider(FailoverProvider):
                 self._on_success(idx)
                 return
             except self._retryable_errors as exc:
-                self._on_failure(idx, exc, now, failures)
+                if suspected:
+                    self._on_failure(idx, exc, now, failures, suspected)
+                    break  # 疑似请求问题之后只再试 1 家
+                suspected = self._on_failure(idx, exc, now, failures, suspected)
                 continue
             self._on_success(idx)
             yield first

@@ -438,15 +438,6 @@ def test_explicit_bad_request_neither_falls_over_nor_cools():
     assert fp._cooldown_until == [0.0, 0.0]
 
 
-def test_ambiguous_4xx_everywhere_exhausts_without_cooling_the_pool():
-    pool = [_Raises(_nre(400, "unexpected field")) for _ in range(3)]
-    fp = FailoverProvider(pool, now_fn=_FakeClock())
-    with pytest.raises(FailoverExhaustedError):
-        fp.chat(_MSGS)
-    assert [p.calls for p in pool] == [1, 1, 1]
-    assert fp._cooldown_until == [0.0, 0.0, 0.0], "无法判定的 4xx 不触发全池冷却"
-
-
 def test_failover_policy_is_injectable():
     from spineagent.llm.failover_provider import FailoverDecision
 
@@ -528,3 +519,104 @@ def test_adapter_400_credit_error_fails_over_to_a_healthy_provider_end_to_end():
     fp = FailoverProvider([broke, healthy], now_fn=_FakeClock())
     assert fp.chat(_MSGS).choices[0].message.content == "b"
     assert fp._cooldown_until[0] > 0 and fp._cooldown_until[1] == 0.0
+
+
+# ---- 第三轮修改 6:无法判定的 4xx 最多再试 1 家;两家同类 4xx 即判定请求有问题 ----------------------
+
+
+def test_review_r2_one_malformed_request_costs_at_most_two_billed_calls():
+    # 复审:无法判定的 4xx 会把整个池子打一遍(一条畸形请求 -> N 次计费请求)。
+    pool = [_Raises(_nre(400, "Invalid 'messages[1].role'")) for _ in range(4)]
+    fp = FailoverProvider(pool, now_fn=_FakeClock())
+    with pytest.raises(BadRequestProviderError) as ei:
+        fp.chat(_MSGS)
+    assert [p.calls for p in pool] == [1, 1, 0, 0]
+    assert ei.value.retryable is False
+    assert fp._cooldown_until == [0.0] * 4, "请求本身的问题不冷却任何一家"
+    with pytest.raises(BadRequestProviderError):
+        fp.chat(_MSGS)
+    assert sum(p.calls for p in pool) == 4  # 第二次调用同样最多 2 家
+
+
+def test_ambiguous_4xx_then_a_different_failure_stops_after_one_more_provider():
+    failing = _Raises(_nre(400, "unexpected field"))
+    down = _Raises(ProviderError("overloaded", retryable=True, status=503))
+    spare = _Recording("c")
+    fp = FailoverProvider([failing, down, spare], now_fn=_FakeClock())
+    with pytest.raises(FailoverExhaustedError):
+        fp.chat(_MSGS)
+    assert (failing.calls, down.calls, spare.calls) == (1, 1, 0)
+
+
+def test_provider_specific_rejections_still_walk_the_whole_pool():
+    pool = [_Raises(_nre(401, "invalid x-api-key")) for _ in range(3)] + [_Recording("d")]
+    fp = FailoverProvider(pool, now_fn=_FakeClock())
+    assert fp.chat(_MSGS).choices[0].message.content == "d"
+
+
+class _OpenAIStyleError(Exception):
+    """模拟 OpenAI SDK 的 APIStatusError:status_code + 错误体里稳定的 type / code / param 字段。"""
+
+    def __init__(self, status_code, *, type_=None, code=None, param=None) -> None:
+        super().__init__("Error code: 400")
+        self.status_code = status_code
+        self.type = type_
+        self.code = code
+        self.param = param
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            _OpenAIStyleError(
+                400, type_="invalid_request_error", code="invalid_value", param="messages[1].role"
+            ),
+            BadRequestProviderError,
+        ),
+        (
+            _OpenAIStyleError(422, type_="invalid_request_error", code=None, param="temperature"),
+            BadRequestProviderError,
+        ),
+        (
+            _OpenAIStyleError(
+                400,
+                type_="invalid_request_error",
+                code="context_length_exceeded",
+                param="messages",
+            ),
+            NonRetryableProviderError,
+        ),
+        (
+            _OpenAIStyleError(
+                400, type_="invalid_request_error", code="model_not_found", param="model"
+            ),
+            NonRetryableProviderError,
+        ),
+        (_OpenAIStyleError(400, type_="invalid_request_error"), NonRetryableProviderError),
+        (_OpenAIStyleError(400), NonRetryableProviderError),
+        (
+            _OpenAIStyleError(401, type_="invalid_request_error", param="x"),
+            NonRetryableProviderError,
+        ),
+    ],
+)
+def test_adapter_maps_only_clearly_identified_parameter_errors_to_bad_request(error, expected):
+    from spineagent.llm.errors import provider_error_from
+
+    mapped = provider_error_from("OpenAI 兼容端点调用失败", error)
+    assert type(mapped) is expected
+
+
+def test_stream_one_malformed_request_costs_at_most_two_billed_calls():
+    class _StreamRaises(_Raises):
+        def stream_chat(self, messages, *, tools=None):
+            self.calls += 1
+            raise self.exc
+            yield  # pragma: no cover
+
+    pool = [_StreamRaises(_nre(400, "unexpected field")) for _ in range(3)]
+    fp = StreamingFailoverProvider(pool, now_fn=_FakeClock())
+    with pytest.raises(BadRequestProviderError):
+        list(fp.stream_chat(_MSGS))
+    assert [p.calls for p in pool] == [1, 1, 0]

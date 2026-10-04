@@ -1201,3 +1201,26 @@ def test_review_r2_approval_trace_has_one_event_per_call():
         except ApprovalPending:
             pass
         assert sink.codes().count("mw_approval") == 1
+
+
+def test_approval_is_consumed_before_execution_even_if_the_tool_fails():
+    # 语义钉子(已写进文档):核销发生在执行之前——工具随后抛异常,这次批准也已用掉。
+    calls: list[str] = []
+
+    def flaky(path: str) -> str:
+        calls.append(path)
+        raise RuntimeError("transient")
+
+    gate = ManualApprovalGate()
+    tool = FunctionTool(
+        "delete_file",
+        "",
+        {"type": "object", "properties": {"path": {"type": "string"}}},
+        func=flaky,
+    )
+    agent = _guarded(_fc_calls_with(tool), gate)
+    gate.resolve(_pending_id(agent).context["request_id"], Decision.APPROVED)
+    assert agent.step("t").output == "finished"  # 工具失败被喂回模型
+    assert calls == ["/a"]
+    _pending_id(agent)  # 批准已用掉:重试须重新批准
+    assert calls == ["/a"]

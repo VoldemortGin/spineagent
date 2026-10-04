@@ -46,9 +46,25 @@ A2A 对端回复里带一行 `nuke: now`,pipeline 下游的 `ToolUsingAgent` 真
 - 可信 = 你的代码直接传给 `agent.step()` 的字符串字面量 / 你自己拼的 plain str。
 - 不可信 = 一切来自模型、工具、远端 agent、MCP server、附件、上游 agent 的文本。
 - 自己转手这些文本时,用 `untrusted()` 包住源头、用 `compose()` 拼接。对 `TaskText` 做普通 str 运算得到的
-  是 plain str,**标记会丢、会被重新当成指令**——实测会丢标记的有:`+` / `%` / `str.format` / f-string / `str.join` / `strip` / `replace` / `split` / 切片 / `upper` / `lower` / `str()` / `encode().decode()` / `string.Template` / JSON 往返;会保留的只有 `copy.copy` /
-  `pickle` 往返。经这些运算转手 agent 产出 / 工具结果后,再交给下一个 agent 前必须重新 `untrusted()`,或改用
-  `compose(指令前缀, 数据段)` 拼接。
+  是 plain str,**标记会丢、会被重新当成指令**。会丢标记的:
+  - str 运算:`+` / `%` / `str.format` / f-string / `str.join` / `strip` / `replace` / `split` / 切片 / `upper` /
+    `lower` / `str()` / `encode().decode()` / `string.Template`;
+  - 序列化 / 校验边界:JSON 往返(`json.dumps` / `json.loads`)、**pydantic 模型**(`str` 字段校验后是普通 str;
+    `model_dump` / `model_dump_json` / `model_validate` 同理)、FastAPI 等框架的请求 / 响应模型、数据库 / 缓存 /
+    消息队列往返、跨进程传递——凡是「出了本进程的 Python 对象再回来」的都当作已丢标记;
+  - 会保留的只有 `copy.copy` / `copy.deepcopy` / `pickle` 往返 / `dataclasses.asdict`(对象原样拷贝)。
+  经这些运算 / 边界转手 agent 产出、工具结果后,再交给下一个 agent 前**必须**重新 `untrusted()`,或用
+  `compose(指令前缀, 数据段)` 拼接。正确用法:
+
+  ```python
+  from spineagent.agent.trust import compose, untrusted
+
+  reply = Reply.model_validate({"text": upstream.step(task).output})  # pydantic:reply.text 已是普通 str
+  downstream.step(reply.text)                                          # 错:上游文本被当成指令
+  downstream.step(untrusted(reply.text))                               # 对:整段是数据
+  downstream.step(compose("summarize:\n", untrusted(reply.text)))     # 对:可信前缀 + 数据段
+  downstream.step(f"summarize:\n{upstream.step(task).output}")       # 错:f-string 丢了标记
+  ```
 - 本 ADR 只约束**指令语法解析**(离线 `SyntaxToolPolicy`)。真 LLM function-calling 下模型本身会
   读到数据里的「指令」——那是提示注入问题,由审批闸(ADR 0002)与工具最小授权兜底,不在本 ADR
   能力范围内。
