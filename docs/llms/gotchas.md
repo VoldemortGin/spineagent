@@ -114,3 +114,43 @@ completion.usage.prompt_tokens / .completion_tokens / .total_tokens   # usage �
 `spineagent` 不含任何 RAG 概念,也**不**在包层面依赖 `ragspine`。要做检索增强,在**运行时**把
 ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResult`)或 MCP server 的适配器,
 插给某个 agent——方向只能 `spineagent → ragspine`,绝不写进 `dependencies`。
+
+## 12) 审批闸在工具调用点上,不在 `ctx.tools` 上
+
+`ApprovalMiddleware(gate, gated_tools=[...])` 不再看 `StepContext.tools`(那只是声明面);它把审批配置压进
+当前上下文,真正的检查发生在 `FunctionCallingAgent` / `ToolUsingAgent` 每一次调用工具之前。几点要知道:
+- 只有受审批工具**真的被调用**时才会抛 `ApprovalRejected` / `ApprovalPending`;不调用就不抛。
+- request id 由「工具名 + 规范化参数」派生:同参重跑命中已落决议,**参数一变就要重新审批**。
+- 批准不是一次性的(同工具同参数后续都放行);一次性的是 `ManualApprovalGate.resolve` 返回的 resume token。
+- 恢复 = resolve 后原样重跑 step,会重放该步内已执行过的工具副作用。
+- 自己起线程跑 agent 时,中间件作用域不会自动跟过去(`Coordinator.run_parallel` 已处理);需要跨任意线程
+  的保证就用 `require_approval(tool, gate)` 把闸绑在工具上。自定义执行工具的 agent 要调 `enforce_tool_approval`。
+
+## 13) 上游输出是数据,不是指令
+
+`Coordinator.run_pipeline` / `ChainAgent` 把上游输出以 `TaskText` 数据段传给下游;附件、`$prev` 回灌的
+工具结果、`AgentTool` / `McpClientTool` / `A2AAgentAdapter` 的返回同理。`SyntaxToolPolicy` 不解析数据段
+里的 `<tool>: <arg>`。想让上游驱动下游执行工具,必须显式 `SyntaxToolPolicy(parse_untrusted=True)`。
+对 `TaskText` 做 `+` / f-string / `strip` 会得到 plain str(= 指令),转手数据请用 `untrusted()` / `compose()`。
+
+## 14) 工具抛异常不再炸掉 FunctionCallingAgent
+
+工具函数抛的异常会被归一成 `error: tool failed [code=... type=...]` 的 tool 消息喂回模型(缺省不带异常消息
+原文,`include_error_message=True` 才带);要旧的「直接冒泡」行为传 `fail_fast=True`。审批错误与
+`KeyboardInterrupt` / `SystemExit` 不会被吞。`ToolUsingAgent` 仍让工具异常冒泡。
+
+## 15) 沙箱 timeout 现在真的生效;CalcTool 有上限
+
+`InProcessSandbox.run(timeout=...)`(以及 `DEFAULT_LIMITS` 的 5 秒)按节点做协作式 deadline,超时判
+`limit_exceeded`。`CalcTool` 拒绝超长(> 4096 字符)、过深(> 100 层)、超大幂 / 乘法结果的表达式,立即抛
+`ValueError`。
+
+## 16) failover 不会替坏请求「换一家再试」
+
+适配器把 HTTP 400 / 413 / 422 归一为 `NonRetryableProviderError`,`FailoverProvider` 直接上抛、不冷却任何下游;
+网络 / 超时 / 429 / 5xx / 鉴权类错误仍按可重试处理。自定义下游想表达「别重试」,抛 `NonRetryableProviderError`。
+
+## 17) 重名工具直接报错
+
+同一个 agent 里传两个同名工具,构造时抛 `ValueError`(以前是后一个静默覆盖前一个)。
+

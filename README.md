@@ -24,18 +24,25 @@ observability / config 形状;**默认路径离线可跑、import-clean、零网
 | 模块 | 原语 |
 |---|---|
 | `agent/agent.py` | `Agent` 协议 + `LlmAgent`(走 corespine `LLMProvider`,离线用 `MockProvider`)/ `FunctionAgent`(纯函数节点);步级 trace 只记元数据 |
-| `llm/provider.py` 等 | 真实 LLM provider 适配器(挂在 corespine `LLMProvider` 缝后面;**对外统一 OpenAI chat-completions 形状**):`OpenAICompatProvider`(`openai` SDK + `base_url`,一个吃下 OpenAI/Azure/Together/Groq/DeepSeek/Mistral/xAI/Qwen/Moonshot/Ollama/vLLM/OpenRouter/LiteLLM… 全部 OpenAI 兼容端点)+ 非 OpenAI 原生适配器把 native 转成 OpenAI 形状:`AnthropicProvider`(默认 `claude-opus-4-8`)/ `CohereProvider` / `GeminiProvider` / `BedrockConverseProvider`。`llm_providers` Registry(mock/openai/anthropic/cohere/gemini/bedrock/**failover**)。各走可选 extra 延迟 import,离线默认仍是 `MockProvider`,各用原生 SDK 不 shim。**`FailoverProvider`**(组合式容错):包裹一组下游做轮询分摊 + 撞可重试错冷却 + 全冷却时强制跨 provider 回退,全失败抛脱敏聚合错(绝不含凭据);只回退可重试错、绝不吞逻辑错;仅全下游支持流式时才诚实声明流式 |
-| `agent/policy.py` | `ToolPolicy` 协议 + 离线确定性默认 `SyntaxToolPolicy`(按 `<tool>: <arg>` 语法 + 工具名集合确定性路由,**不假装 LLM 推理**)+ `tool_policies` Registry(`llm` 位留真实推理式接入) |
+| `llm/provider.py` 等 | 真实 LLM provider 适配器(挂在 corespine `LLMProvider` 缝后面;**对外统一 OpenAI chat-completions 形状**):`OpenAICompatProvider`(`openai` SDK + `base_url`,一个吃下 OpenAI/Azure/Together/Groq/DeepSeek/Mistral/xAI/Qwen/Moonshot/Ollama/vLLM/OpenRouter/LiteLLM… 全部 OpenAI 兼容端点)+ 非 OpenAI 原生适配器把 native 转成 OpenAI 形状:`AnthropicProvider`(默认 `claude-opus-4-8`)/ `CohereProvider` / `GeminiProvider` / `BedrockConverseProvider`。`llm_providers` Registry(mock/openai/anthropic/cohere/gemini/bedrock/**failover**)。各走可选 extra 延迟 import,离线默认仍是 `MockProvider`,各用原生 SDK 不 shim。**`FailoverProvider`**(组合式容错):包裹一组下游做轮询分摊 + 撞可重试错冷却 + 全冷却时强制跨 provider 回退,全失败抛脱敏聚合错(绝不含凭据);只回退可重试错、绝不吞逻辑错;适配器按状态码把 400 / 413 / 422 判为 `NonRetryableProviderError`,failover 对它不回退、不冷却;仅全下游支持流式时才诚实声明流式 |
+| `agent/policy.py` | `ToolPolicy` 协议 + 离线确定性默认 `SyntaxToolPolicy`(按 `<tool>: <arg>` 语法 + 工具名集合确定性路由,**不假装 LLM 推理**;**只解析调用方给的指令,不解析数据段**,见 `agent/trust.py`)+ `tool_policies` Registry(`llm` 位是**占位、尚未实现**,`make("llm")` 必抛 `SeamError`) |
+| `agent/trust.py` | 信任边界(ADR 0003):`TaskText`(带不可信数据区间的 str 子类)/ `untrusted` / `compose`。pipeline 上游输出、附件、工具结果、MCP / A2A 返回在源头标为数据,指令语法解析器不执行其中的 `<tool>: <arg>`;旧行为需 `SyntaxToolPolicy(parse_untrusted=True)` |
+| `agent/middleware.py` | `Middleware` 协议(`before_step` / `after_step`)+ `MiddlewareAgent` 洋葱链(`StepContext.cleanups` 无论成败都执行)+ 内置 `TokenUsage` / `Summary` / `DynamicTool` / `Attachment` + `middlewares` Registry |
+| `agent/approval.py` | 审批门 / Wait 缝(ADR 0001 / 0002):`ApprovalGate` 协议 + `AutoApprovalGate` / `ManualApprovalGate`(一次性 resume token)+ `ApprovalMiddleware`。审批是**工具调用点上的强制闸**:每次真实工具调用前按「工具名 + 规范化参数」review,未批准不执行、门故障 fail-closed;`require_approval(tool, gate)` 把闸绑进工具本身 |
+| `agent/artifact.py` | artifact 缝:`Artifact` / `ArtifactRef` + `ArtifactSink`(`InProcessArtifactSink` / `BlobArtifactSink`)+ `artifact_sinks` Registry;`AgentResult.artifacts` 挂交付物引用 |
+| `agent/builtin/deep_research.py` | `DeepResearchAgent`:planner 分解 + `Coordinator` 并行检索 + `LlmAgent` 综合的纯组合预置 agent |
+| `sandbox/seam.py` | Sandbox 缝:`InProcessSandbox`(受限白名单表达式求值器,节点预算 / 值上限 / 输出上限 / **协作式 timeout**,时钟可注入)+ `sandboxes` Registry。`subprocess` / `container` 槽是**占位、尚未实现**:`make("subprocess")` 必抛 `SeamError`;`make("container")` 缺 `[sandbox]` extra 时抛 `ImportError`,装了也必抛 `SeamError` |
+| `skills/` | Skill 缝:`SkillSpec` + `FixtureSkill`(脚本经 Sandbox 执行)+ `SkillBundle`(目录加载)+ `skill_as_function_tool`(桥成 `FunctionTool`)+ `skill_registry` |
 | `agent/tool_using.py` | `ToolUsingAgent`:**离线确定性**多步循环(`SyntaxToolPolicy` 按 `<tool>: <arg>` 语法路由),带 `max_steps` 守卫;实现 `Agent` 协议 |
-| `agent/function_calling.py` | `FunctionCallingAgent`:**真 LLM function-calling** 多步循环——把 `FunctionTool` schema 喂给 `chat(tools=)`,模型回 tool_calls → 执行 → 以 OpenAI tool 角色喂回 → 再 chat,直到出文本或触顶;底层换任意 provider 不改一行。实现 `Agent` 协议 |
+| `agent/function_calling.py` | `FunctionCallingAgent`:**真 LLM function-calling** 多步循环——把 `FunctionTool` schema 喂给 `chat(tools=)`,模型回 tool_calls → 执行 → 以 OpenAI tool 角色喂回 → 再 chat,直到出文本或触顶;底层换任意 provider 不改一行。工具异常归一成只含错误码与类型名的 tool 消息喂回(`fail_fast=True` 恢复冒泡);usage 逐轮累加。实现 `Agent` 协议 |
 | `tools/function_tool.py` | `FunctionTool`(带 JSON-schema、接 dict 参数的结构化工具)+ `@function_tool` 装饰器(从签名/注解/docstring 自动推 schema) |
 | `agent/as_tool.py` | `AgentTool`:把一个 `Agent` 桥成 `Tool`,让督导 agent 通过工具调用把子任务派给专精子 agent(**分层 / 督导式多 agent**,可层层嵌套) |
-| `tools/tool.py` | `Tool` 协议 + `EchoTool` / `CalcTool`(安全算术求值);结果带 provenance。`tool_registry`:spec 选工具 + **entry-point 第三方工具自动发现**(group `corespine.tool`)。**运行时可把 ragspine RAG 插为一个 Tool**(见下) |
-| `orchestration/coordinator.py` | `Coordinator`:把多个 agent **顺序 / 并行 / 流水线**(output→input 链式)跑、保序收集 `AgentResult`;**弹性容错**(`resilient=True`)把单 agent 异常归一为家族错误 dict 塞进 `AgentResult.error`、一个坏 agent 不炸整批 |
+| `tools/tool.py` | `Tool` 协议 + `EchoTool` / `CalcTool`(安全算术求值,表达式长度 / 嵌套深度 / 幂与乘法位数有上限);结果带 provenance。`tool_registry`:spec 选工具 + **entry-point 第三方工具自动发现**(group `corespine.tool`)。**运行时可把 ragspine RAG 插为一个 Tool**(见下) |
+| `orchestration/coordinator.py` | `Coordinator`:把多个 agent **顺序 / 并行 / 流水线**(output→input 链式)跑、保序收集 `AgentResult`;**弹性容错**(`resilient=True`)把单 agent 异常归一为家族错误 dict 塞进 `AgentResult.error`、一个坏 agent 不炸整批;`run_parallel` 可选 `timeout` / `task_timeout`,挂死的 agent 以 `orchestration.timeout` 结果返回 |
 | `orchestration/chain.py` | `ChainAgent`:把一串 agent 串成**单个 `Agent`**(流水线即一等可组合单元),可再进 `Coordinator` / 被 `AgentTool` 当工具 / 套 chain |
-| `protocol/mcp/seam.py` | `McpClient` / `McpServer` 协议 + `OfflineMcpStub`(进程内回环)+ **`McpClientTool`(把 MCP 工具桥成 `Tool`)** + 真实 SDK 经 `[mcp]` extra 延迟 import |
-| `protocol/a2a/seam.py` | `A2AAgent` 协议 + `OfflineA2AStub`(进程内回环)+ **`A2AAgentAdapter`(把 A2A agent 桥成 `Agent`)** + 真实 `a2a-sdk` 经 `[a2a]` extra 延迟 import |
-| `conformance.py` | 本包绑定的不变量:`AGENT_INVARIANTS`(步产出 / provenance / 隐私 trace)、`TOOL_INVARIANTS`(结果 provenance)、`POLICY_INVARIANTS`(决策形状 / 不幻觉工具 / 可终止 / 纯函数) |
+| `protocol/mcp/seam.py` | `McpClient` / `McpServer` 协议 + `OfflineMcpStub`(进程内回环)+ **`McpClientTool`(把 MCP 工具桥成 `Tool`)**。`mcp_clients["real"]` 是**占位、尚未实现**:缺 `[mcp]` extra 抛 `ImportError`,装了 extra 也必抛 `SeamError`——装 extra 并不能直接用 |
+| `protocol/a2a/seam.py` | `A2AAgent` 协议 + `OfflineA2AStub`(进程内回环)+ **`A2AAgentAdapter`(把 A2A agent 桥成 `Agent`)**。`a2a_agents["real"]` 是**占位、尚未实现**:缺 `[a2a]` extra 抛 `ImportError`,装了 extra 也必抛 `SeamError` |
+| `conformance.py` | 本包绑定的不变量:`AGENT_INVARIANTS`(步产出 / provenance / 隐私 trace)、`TOOL_INVARIANTS`(结果 provenance)、`POLICY_INVARIANTS`(决策形状 / 不幻觉工具 / 可终止 / 纯函数 / 数据不当指令)、`LLM_INVARIANTS` / `STREAMING_INVARIANTS`(OpenAI 形状 / 流式拼接等价)、`SANDBOX_INVARIANTS`(含超时生效)、`SKILL_INVARIANTS`、`MIDDLEWARE_INVARIANTS`、`ARTIFACT_INVARIANTS`、`APPROVAL_INVARIANTS`、`APPROVAL_ENFORCEMENT_INVARIANTS`(未批准执行 0 次 / 重跑不绕过 / 改参重审 / 门故障 fail-closed,参数化所有工具执行形态)、`TOOL_TRACE_INVARIANTS`(未知工具名不进 trace) |
 
 ## 运行时组合 ragspine(ADR 0001 D4b)
 
@@ -124,6 +131,13 @@ agent.step("敏感任务", trace=sink)               # 只记 agent 名 / 长度
 pip install "spineagent[openai]"      # OpenAI 及一切「OpenAI 兼容」端点
 pip install "spineagent[anthropic]"   # 或 [cohere] / [gemini] / [bedrock]
 ```
+
+> **如实说明:`[mcp]` / `[a2a]` / `[sandbox]` 三个 extra 目前只装上第三方 SDK,对应的真实后端是
+> 占位、尚未实现。** `mcp_clients.make("real")`、`a2a_agents.make("real")`、`sandboxes.make("container")`
+> 在装了 extra 后仍必抛 `SeamError`;`sandboxes.make("subprocess")` 与 `tool_policies.make("llm")`
+> 无论装什么都必抛 `SeamError`。离线默认(`OfflineMcpStub` / `OfflineA2AStub` / `InProcessSandbox` /
+> `SyntaxToolPolicy`)是目前唯一可用的实现;真实客户端需使用者按官方 SDK 自行接入并注册进对应
+> Registry。LLM 的 `[openai]` / `[anthropic]` / `[cohere]` / `[gemini]` / `[bedrock]` 是真实实现。
 
 ```python
 from spineagent import OpenAICompatProvider, AnthropicProvider, GeminiProvider, LlmAgent

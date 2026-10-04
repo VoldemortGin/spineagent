@@ -1,7 +1,7 @@
 # spineagent CI —— push + PR 上跑 格式 + lint + 类型检查 + 测试,Python 多版本矩阵。
 #
 # spineagent 依赖兄弟薄核 corespine,corespine 已发布到 PyPI(pyproject dependencies 写
-# corespine>=0.1.1),故 CI 直接从 PyPI 解析安装 —— 无需再并排签出 corespine 复刻本地家族布局。
+# corespine>=0.2.0),故 CI 直接从 PyPI 解析安装 —— 无需再并排签出 corespine 复刻本地家族布局。
 #
 # 本地开发仍可经 pyproject 的 [tool.uv.sources] path source 把 corespine 指向 ../corespine 做
 # 可编辑联调(`make install` 即走此路径);CI 用 `uv pip install --no-sources` 忽略该 path source、

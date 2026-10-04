@@ -16,12 +16,14 @@
 ## agent
 
 ### `class AgentResult`
-`AgentResult(agent: str, output: str, usage: dict[str, int] | None = None, error: dict[str, object] | None = None)`
+`AgentResult(agent: str, output: str, usage: dict[str, int] | None = None, error: dict[str, object] | None = None, artifacts: tuple[ArtifactRef, ...] = ())`
 - frozen dataclass。一次 agent 步的结果。`agent` = provenance(产出它的 agent 名)。
 - 属性 `ok -> bool`:`self.error is None`。
 - 契约:成功路径 `error is None`;`error` 仅由编排层弹性模式(`Coordinator(..., resilient=True)`)
   捕获 `step` 异常时填充,值是 `corespine.errors.error_to_dict(exc)` 的归一 dict(含 `code` /
-  `retryable` / `message` / `context`)。
+  `retryable` / `message` / `context`)。`run_parallel` 超时的任务也以 `error.code == "orchestration.timeout"` 返回。
+- `artifacts`:本步产出的交付物引用(见 artifact 缝);`ChainAgent` / `AgentTool` + `ToolUsingAgent` 会透传汇总。
+- `merge_usage(*usages) -> dict[str, int] | None`(`spineagent.agent.agent`):逐键累加 usage,全 None 返回 None。
 
 ### `class Agent` (Protocol, runtime_checkable)
 - 属性 `name: str`;方法 `step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult`。
@@ -41,16 +43,25 @@
 `ToolUsingAgent(name: str, policy: ToolPolicy, tools: Iterable[Tool], *, max_steps: int = 8)`
 - `step(task, *, trace=None) -> AgentResult`:在**一次** step() 内循环——`policy.decide(...)` 决定
   `ToolCall`(按名取 Tool 执行、观测追加进 history)或 `Finish`(返回最终答案)。
-- `$prev`:工具参数里的字面量 `$prev` 在执行前替换为上一步观测输出(首步无上一步则替换为空串)。
+- `$prev`:工具参数里的字面量 `$prev` 在执行前替换为上一步观测输出(首步无上一步则替换为空串);
+  拼进来的观测是**数据**(`TaskText` 不可信段),经 `AgentTool` 传给子 agent 时不会被当指令解析。
+- 审批:每次真实调用工具前调 `enforce_tool_approval(工具名, {"arg": 实参})`(见 approval 缝)。
+- 重名工具构造即抛 `ValueError`;工具结果的 `usage` / `artifacts` 汇总进返回的 `AgentResult`。
 - `max_steps` = **最多调用多少次工具**(收尾不占预算);触顶强制收尾,绝不死循环。
 - 实现 `Agent` 协议,可直接进 `Coordinator` / `ChainAgent` / 被 `AgentTool` 包成工具。
 
 ### `class FunctionCallingAgent`
-`FunctionCallingAgent(name: str, model: LLMProvider, tools: Iterable[FunctionTool], *, system: str = "", max_steps: int = 8)`
+`FunctionCallingAgent(name: str, model: LLMProvider, tools: Iterable[FunctionTool], *, system: str = "", max_steps: int = 8, fail_fast: bool = False, include_error_message: bool = False)`
 - `step(task, *, trace=None) -> AgentResult`:**真 LLM** 原生 function-calling 多步循环——把每个
   `FunctionTool.schema()` 喂给 `model.chat(messages, tools=...)`;模型回 `tool_calls` 则逐个
-  `tool.invoke(json.loads(arguments))`、以 OpenAI `tool` 角色消息喂回、再 chat;无 tool_calls 则
-  出文本收尾。触顶 `max_steps` 兜底非空。
+  `parse_arguments` 校验 → `enforce_tool_approval` 审批 → `invoke`、以 OpenAI `tool` 角色消息喂回、
+  再 chat;无 tool_calls 则出文本收尾。触顶 `max_steps` 兜底非空。`usage` 为各轮累加。
+- 工具失败:工具函数抛的 `Exception`(审批错误除外)归一成 tool 消息
+  `error: tool failed [code=<code> type=<异常类型名>]` 喂回模型(`code` 为 CorespineError 的 code,否则
+  `tool.execution_failed`);`include_error_message=True` 才附异常消息原文;`fail_fast=True` 恢复冒泡。
+  `KeyboardInterrupt` / `SystemExit` 与 `ApprovalError` 不吞。
+- 未知工具名:回 `error: unknown tool ...` 给模型;trace 的 `tool` 字段记固定占位 `"<unknown>"`。
+- 重名工具构造即抛 `ValueError`。
 - 离线 `MockProvider` 不回 tool_calls → 直接出文本(诚实:离线不假装会 function-calling)。要真正
   跑工具循环,需注入会回 `tool_calls` 的 provider(真实后端,或测试用脚本化 fake)。
 
@@ -58,8 +69,8 @@
 `AgentTool(agent: Agent, *, name: str | None = None)`
 - 实现 `Tool` 协议。`name` 默认取 `agent.name`。
 - `run(arg: str) -> ToolResult`:对子 agent 跑一步,把 `output` 包成带 provenance 的 `ToolResult`。
-- 用于分层 / 督导式多 agent(可层层嵌套)。最薄桥:只搬运文本,子 agent 的 usage / error 不透传;
-  子 agent 抛异常照常上抛(错误处理归编排层 / 调用方)。
+- 用于分层 / 督导式多 agent(可层层嵌套)。子 agent 的 `usage` / `artifacts` 随 `ToolResult` 透传;
+  `output` 标为数据(`TaskText`)。子 agent 抛异常照常上抛(错误处理归编排层 / 调用方)。
 
 ---
 
@@ -82,9 +93,11 @@
 `Observation(tool: str, arg: str, output: str)` — frozen dataclass。一步执行的观测,喂回循环。
 
 ### `class SyntaxToolPolicy`
-`SyntaxToolPolicy()` — 离线确定性默认实现。`decide(...)` 按任务文本里 `<tool>: <arg>` 显式语法 +
-工具名集合确定性路由:游标 = `len(history)`,第 cursor 条工具指令尚存则 `ToolCall(该行工具名, 该行参数)`,
-指令耗尽则 `Finish`(把非指令正文行 + 最后一步观测拼成非空答案)。**不**假装 LLM 推理。
+`SyntaxToolPolicy(*, parse_untrusted: bool = False)` — 离线确定性默认实现。`decide(...)` 按任务文本里
+`<tool>: <arg>` 显式语法 + 工具名集合确定性路由:游标 = `len(history)`,第 cursor 条工具指令尚存则
+`ToolCall(该行工具名, 该行参数)`,指令耗尽则 `Finish`(把非指令正文行 + 最后一步观测拼成非空答案)。
+**不**假装 LLM 推理。**只解析可信行**:含任何不可信字符(`TaskText` 数据段)的行按正文处理;
+`parse_untrusted=True` 恢复旧的「整段都解析」行为(仅当上游确实可信)。
 
 ### `tool_policies`
 `Registry[ToolPolicy]`(seam 名 `tool_policy`)。
@@ -97,7 +110,7 @@
 ## tools
 
 ### `class ToolResult`
-`ToolResult(tool: str, output: str)` — frozen dataclass。`tool` = provenance(产出它的工具名)。
+`ToolResult(tool: str, output: str, usage: dict[str, int] | None = None, artifacts: tuple[ArtifactRef, ...] = ())` — frozen dataclass。`tool` = provenance(产出它的工具名);`usage` / `artifacts` 供 `AgentTool` 透传。
 
 ### `class Tool` (Protocol, runtime_checkable)
 - 属性 `name: str`;方法 `run(self, arg: str) -> ToolResult`。
@@ -107,7 +120,11 @@
 
 ### `class CalcTool`
 `CalcTool()`,`name = "calc"`。`run(arg) -> ToolResult`:安全求值算术表达式(白名单 `+ - * / % **`
-与一元 `+ -`,整数结果去掉 `.0`);非算术节点抛 `ValueError`,绝不 eval 任意代码。
+与一元 `+ -`,整数结果去掉 `.0`);非算术节点抛 `ValueError`,绝不 eval 任意代码。有界:表达式 ≤ 4096
+字符、嵌套深度 ≤ 100、幂指数绝对值 ≤ 10000、幂 / 乘法结果 ≤ 8192 位,越界立即抛 `ValueError`。
+
+### `index_tools_by_name`(`spineagent.tools.tool`)
+`index_tools_by_name(tools: Iterable[T]) -> dict[str, T]` — 按名建索引(保插入序),重名抛 `ValueError`。
 
 ### `tool_registry`
 `Registry[Tool]`(seam 名 `tool`)。
@@ -137,10 +154,14 @@
 `Coordinator(agents: Iterable[Agent], *, trace: TraceSink | None = None)`
 - 属性 `agents -> list[Agent]`(副本)。
 - `run_sequential(task: str, *, resilient: bool = False) -> list[AgentResult]`:逐个跑同一任务,保序。
-- `run_parallel(task: str, *, max_workers: int | None = None, resilient: bool = False) -> list[AgentResult]`:
-  线程池并发跑同一任务,结果仍按 agent 输入顺序返回(`max_workers` 默认 = agent 数)。
+- `run_parallel(task: str, *, max_workers: int | None = None, resilient: bool = False, timeout: float | None = None, task_timeout: float | None = None, clock: Callable[[], float] = time.monotonic) -> list[AgentResult]`:
+  线程池并发跑同一任务,结果仍按 agent 输入顺序返回(`max_workers` 默认 = agent 数)。每个分支在调用方
+  `contextvars` 上下文的副本里跑(审批作用域随之生效)。`timeout`(整批,自调用起)/ `task_timeout`
+  (单任务,自该任务开始跑起)缺省不限;到点未返回的任务以 `AgentTimeoutError`(code
+  `orchestration.timeout`)归一的 `AgentResult.error` 返回,不挂住整批(挂死线程无法强杀,仍在后台)。
 - `run_pipeline(task: str, *, resilient: bool = False) -> list[AgentResult]`:链式——上一个 agent 的
-  `output` 作下一个的输入,保序收集每段。
+  `output` 以**数据**身份(`untrusted(...)`)作下一个的输入,保序收集每段;下游指令解析器不执行其中的
+  指令语法(ADR 0003)。
 - 弹性容错 `resilient=True`:单 agent 异常归一为 `error_to_dict(exc)` 塞进该步 `AgentResult.error`,
   批次继续(顺序 / 并行跑完其余;流水线在失败处停止)。`resilient=False`(默认)= fail-fast,异常冒泡。
 - 编排级 trace 只记 `mode` / `agent_count` / `failures` / `took_ms`,绝不记正文。
@@ -150,6 +171,7 @@
 - 实现 `Agent` 协议。`step(task, *, trace=None) -> AgentResult`:复用 `Coordinator(...).run_pipeline(task)`
   把任务逐段传递,返回末端 agent 输出(provenance = chain 名;空链退化为恒等透传)。失败 fail-fast 冒泡。
 - 让流水线成为一等可组合单元:可进 `Coordinator` / 当 `AgentTool` 工具 / 套进另一个 chain。
+- 返回的 `usage` 为各段累加,`artifacts` 为各段按序拼接。
 
 ---
 
@@ -173,11 +195,12 @@
 `McpClientTool(name: str, client: McpClient, *, arg_key: str = "input", result_key: str = "result")`
 - 实现 `Tool` 协议。`run(arg: str) -> ToolResult`:把单串 `arg` 包成 `{arg_key: arg}` 调
   `client.call_tool(name, ...)`,取结果 dict 的 `result_key` 转字符串,带 provenance(`tool = name`)。
-- 最薄阻抗匹配:只做 str 单参 + 单键结果映射。
+- 最薄阻抗匹配:只做 str 单参 + 单键结果映射。结果缺 `result_key`(或不是 dict)抛
+  `McpProtocolError`(code `mcp.invalid_result`);`output` 标为数据(`TaskText`)。
 
 ### `mcp_clients`
 `Registry[McpClient]`(seam 名 `mcp_client`)。`make(spec, **kw)` / `names()`。
-- 已注册:`"offline"`(→ `OfflineMcpStub`)、`"real"`(走 `[mcp]` extra 延迟 import 后抛 `SeamError`,待接入)。
+- 已注册:`"offline"`(→ `OfflineMcpStub`)、`"real"`(**占位、尚未实现**:缺 `[mcp]` extra 抛 `ImportError`,装了 extra 也必抛 `SeamError`)。
 
 ### `load_mcp_sdk() -> Any`
 延迟 import 真实 MCP SDK(import 名 `mcp`);未装 `[mcp]` extra 时给「pip install spineagent[mcp]」友好报错。
@@ -201,13 +224,14 @@
 - `name`、`card()`(`{"name","transport":"offline-loopback","skills":["echo"]}`)、`send(task) -> A2AResult`。
 
 ### `class A2AAgentAdapter`
-`A2AAgentAdapter(remote: A2AAgent, *, task_id: str = "task")`
-- 实现 `Agent` 协议。`name` 取 `remote.name`。`step(task, *, trace=None) -> AgentResult`:把 `task`
-  包成 `A2ATask` 交给 `remote.send`,把 `A2AResult` 转成 `AgentResult`。透明桥:输出原样继承自 remote。
+`A2AAgentAdapter(remote: A2AAgent, *, task_id: str = "task", name: str | None = None)`
+- 实现 `Agent` 协议。`name` = 构造参数 `name`,缺省为构造时对 `remote.name` 的一次快照(之后对端改名
+  不影响 provenance / trace)。`step(task, *, trace=None) -> AgentResult`:把 `task` 包成 `A2ATask` 交给
+  `remote.send`,把 `A2AResult` 转成 `AgentResult`;输出文本原样继承自 remote,但标为数据(`TaskText`)。
 
 ### `a2a_agents`
 `Registry[A2AAgent]`(seam 名 `a2a_agent`)。`make(spec, **kw)` / `names()`。
-- 已注册:`"offline"`(→ `OfflineA2AStub`)、`"real"`(走 `[a2a]` extra 延迟 import 后抛 `SeamError`,待接入)。
+- 已注册:`"offline"`(→ `OfflineA2AStub`)、`"real"`(**占位、尚未实现**:缺 `[a2a]` extra 抛 `ImportError`,装了 extra 也必抛 `SeamError`)。
 
 ### `load_a2a_sdk() -> Any`
 延迟 import 真实 A2A SDK(`a2a-sdk`,import 名 `a2a`);未装 `[a2a]` extra 给友好报错。
@@ -252,6 +276,14 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - 组合式容错 provider:包裹一组下游,做 (a) 轮询分摊 + (b) 撞可重试错后冷却窗口内跳过 +
   (c) 全冷却时强制按序回退,全失败抛 `FailoverExhaustedError`(聚合各下游原因,经凭据脱敏,绝不含 key)。
 - 只 catch `retryable_errors`(默认 `ProviderError`);逻辑错(KeyError/ValueError…)照常上抛,不被吞。
+  `NonRetryableProviderError`(坏请求)**不回退、不冷却**,直接上抛。游标 / 冷却表加锁,可跨线程共享。
+- 不在顶层导出:`from spineagent.llm.failover_provider import FailoverProvider, make_failover_provider`。
+
+### `ProviderError` / `NonRetryableProviderError` / `provider_error_from`
+- `ProviderError` 来自 corespine(顶层再导出)。各适配器经 `spineagent.llm.errors.provider_error_from(message, exc)`
+  归一 vendor 异常:HTTP 400 / 413 / 422 → `NonRetryableProviderError`(code `provider.bad_request`,
+  `retryable=False`);其余(网络 / 超时 / 408 / 429 / 5xx / 401 / 403 / 404 / 取不到状态码)→
+  `ProviderError(retryable=True)`。状态码进 `context["status"]`。
 - `make_failover_provider(providers, **kw) -> FailoverProvider`:诚实选类——【全下游都实现
   `StreamingLLMProvider`】才返回带 `stream_chat` 的 `StreamingFailoverProvider`,混编则返回不带
   `stream_chat` 的基类(`isinstance(p, StreamingLLMProvider)` 如实报 False)。`now_fn` 可注入以确定性测试冷却。
@@ -268,6 +300,108 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 
 ---
 
+## 信任边界:指令 / 数据分通道(`spineagent.agent.trust`,ADR 0003)
+
+- `class TaskText(str)`:`TaskText(text: str, spans: tuple[tuple[int, int], ...] = ())`。str 子类,额外携带
+  `untrusted_spans`(不可信字符区间)。对只认 str 的代码完全透明。
+- `untrusted(text: str) -> TaskText`:把整段标为数据。`compose(*parts: str) -> str`:按序拼接并保留各段区间
+  (全可信退回 plain str)。`lines_with_trust(text) -> list[tuple[str, bool]]`:按行给出是否完全可信。
+- 规则:plain str = 调用方直接给的**指令**;pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
+  `McpClientTool` / `A2AAgentAdapter` 的返回、`SummaryMiddleware` 的摘要都是**数据**。对 `TaskText` 做普通
+  str 运算(`+` / f-string / `strip` / 切片)得到 plain str,标记会丢——转手数据时用 `untrusted` / `compose`。
+
+---
+
+## middleware 缝
+
+### `class Middleware` (Protocol, runtime_checkable)
+`before_step(self, ctx: StepContext) -> None`(就地改写 ctx);`after_step(self, ctx, result) -> AgentResult`(须保留 provenance)。
+
+### `class StepContext`
+`StepContext(agent: str, task: str, trace: TraceSink | None = None, step: int = 0, tools: list[str] = [], attachments: list[str] = [], extras: dict[str, Any] = {}, cleanups: list[Callable[[], None]] = [])`
+- `tools` 只是**声明面**(给协作 middleware 用),不是执行闸。`cleanups`:before_step 登记的收尾回调,
+  `MiddlewareAgent` 在本步结束时无论成败逆序执行。
+
+### `class MiddlewareAgent`
+`MiddlewareAgent(name: str, agent: Agent, middlewares: Iterable[Middleware])`
+- 洋葱链:before 正序 → 内层 `agent.step(ctx.task, trace=ctx.trace)` → after 逆序 → provenance 重盖为本名。
+  步序取号加锁(线程安全)。
+
+### 内置 middleware
+- `TokenUsageMiddleware(tokenizer: Callable[[str], int] | None = None)`:记 token 计数(`.totals`)。
+- `SummaryMiddleware(provider: LLMProvider | None = None, *, max_chars: int = 2000)`:task 超长时换成摘要(摘要标为数据)。
+- `DynamicToolMiddleware(tools_by_step: Mapping[int, Sequence[str]] | None = None, *, default: Sequence[str] = ())`:按步写 `ctx.tools`。
+- `AttachmentMiddleware(attachments: Mapping[str, str] | None = None)`:附件以数据段前置进 task。
+- `middlewares`:`Registry[Middleware]`,已注册 `token_usage` / `summary` / `dynamic_tool` / `attachment` / `approval`。
+
+---
+
+## approval 缝(审批门 / Wait,ADR 0001 / 0002)
+
+- `Decision`(StrEnum):`APPROVED` / `REJECTED` / `PENDING`。
+- `ApprovalRequest(code: str, id: str, tool: str, arg_fingerprint: str = "", arg_count: int = 0)`:只带定位摘要,绝不含参数值。
+- `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False) -> ApprovalRequest`:
+  `bind_values=True` 时把规范化参数值的 sha256 折进 `id`(参数一变即新请求);执行闸用的就是它。
+- `ApprovalGate`(Protocol):`name: str`;`review(request) -> Decision`(幂等)。
+- `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,永不 pending。
+- `ManualApprovalGate(*, token_store=None)`:`review` 登记待审;`resolve(request_id, decision) -> str` 落决议并返回一次性
+  resume token;`redeem(token) -> ResumeTicket`(重放抛 `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`。
+- `ResumeTokenStore` / `InMemoryResumeTokenStore` / `ResumeTicket(request_id, decision)`。
+- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call")`:before_step 把审批配置压进当前上下文的审批作用域
+  (`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 + 规范化参数」review。缺省 `gated_tools` 空 = 零行为变化。
+- `enforce_tool_approval(tool: str, arguments: Mapping[str, object]) -> None`:执行点在调用工具前调它;
+  approved 返回,rejected 抛 `ApprovalRejected`,pending 抛 `ApprovalPending`(`context["request_id"]`),门抛异常或返回
+  非 `Decision` 抛 `ApprovalGateError`(fail-closed)。未配置审批时只读一次 contextvar。
+- `require_approval(tool: FunctionTool | Tool, gate, *, code="tool_call") -> FunctionTool | Tool`:把闸绑进工具本身,
+  不依赖上下文(裸线程 / 第三方 agent 也绕不过)。
+- 错误:`ApprovalError`(基类)/ `ApprovalRejected`(`approval.rejected`,不可重试)/ `ApprovalPending`
+  (`approval.pending`,可重试)/ `ApprovalGateError`(`approval.gate_error`)/ `ApprovalConflict` / `InvalidResumeToken`。
+- 批准语义:决议绑定在内容派生的 request id 上并被记住(同工具 + 同参数的调用都放行);**不是**一次性消费。
+  恢复 = resolve 后原样重跑 step(会重放该步内已执行工具的副作用)。
+- `approval_gates` / `make_approval_gate(spec, **kw)`:内置 `auto` / `manual`。
+
+---
+
+## artifact 缝
+
+- `Artifact(name: str, data: bytes, mime: str = "application/octet-stream", producer: str = "")`;`Artifact.from_text(name, text, *, mime="text/plain", producer="")`。
+- `ArtifactRef(key, sink, name, mime, producer, size)`:轻量引用,挂在 `AgentResult.artifacts`。
+- `ArtifactSink`(Protocol):`name`、`store(artifact) -> ArtifactRef`、`fetch(ref) -> Artifact`。
+- `InProcessArtifactSink()`、`BlobArtifactSink(store: BlobStore, *, name="blob")`、`artifact_sinks` Registry。
+
+---
+
+## sandbox 缝
+
+- `Limits(timeout_seconds: float | None = None, max_output_chars: int | None = None, max_ops: int | None = None)`;
+  `DEFAULT_LIMITS = Limits(5.0, 64_000, 100_000)`。
+- `SandboxResult(sandbox, output, returncode=0, usage=ResourceUsage(), error=None)`,`ok` = `returncode == 0`;
+  `error` 为 `disallowed` / `limit_exceeded` / `syntax` / `error`。`ResourceUsage(ops, output_chars, wall_seconds)`。
+- `InProcessSandbox(*, clock: Callable[[], float] = time.monotonic)`;`run(code, *, timeout=None, limits=None, env=None) -> SandboxResult`:
+  受限白名单表达式求值器(无 Import / Attribute / 任意调用),节点预算、值大小上限、输出上限;`timeout`
+  为**协作式 deadline**(每个节点查一次时钟,超时判 `limit_exceeded`;单个白名单内建调用内部不可抢占)。
+- `sandboxes` Registry:`in_process`;`subprocess` / `container` 是**占位、尚未实现**(`subprocess` 必抛
+  `SeamError`;`container` 缺 `[sandbox]` extra 抛 `ImportError`,装了也必抛 `SeamError`)。`load_container_sdk()`。
+
+---
+
+## skills 缝
+
+- `SkillSpec(name, description, inputs: dict)`;`Skill`(Protocol):`spec`、`describe() -> dict`、`invoke(args) -> SkillResult`。
+- `FixtureSkill(spec, script, *, sandbox=None)`:脚本经 Sandbox 执行,失败抛 `SkillError(skill, reason, detail)`。
+- `SkillBundle.load(path, *, sandbox=None) -> Skill`:目录(manifest.toml + 脚本)加载器;`skill_registry`;`skill_as_function_tool(skill) -> FunctionTool`
+  (在 `FunctionCallingAgent` 里,`SkillError` 会按工具失败路径喂回模型)。
+
+---
+
+## deep research
+
+- `DeepResearchAgent(name="deep_research", *, provider=None, tools=(), planner=None, max_subqueries=5, retriever_system="", synthesis_system="")`:
+  planner 分解 → `Coordinator.run_parallel` 并行检索(`FunctionCallingAgent`)→ `LlmAgent` 综合。审批挂起 / 拒绝
+  不会被吞成失败发现,而是原样上抛。重名工具构造即抛 `ValueError`。`default_planner(task) -> list[str]`。
+
+---
+
 ## conformance(本包绑定的不变量)
 
 供 `corespine.ConformanceSuite(implementations, pack)` 消费;`pack` 即下列 `InvariantPack`。
@@ -276,7 +410,21 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   `result_carries_agent_provenance`、`step_traces_are_privacy_safe`。
 - `TOOL_INVARIANTS: InvariantPack[Tool]`(名 `tool_call`):`result_carries_tool_provenance`、`run_returns_output`。
 - `POLICY_INVARIANTS: InvariantPack[ToolPolicy]`(名 `tool_policy`):`action_is_a_known_variant`、
-  `never_calls_an_unavailable_tool`、`empty_tools_yields_nonempty_finish`、`decide_is_pure`。
+  `never_calls_an_unavailable_tool`、`empty_tools_yields_nonempty_finish`、`decide_is_pure`、
+  `untrusted_data_is_never_an_instruction`。
+- `LLM_INVARIANTS` / `STREAMING_INVARIANTS`:OpenAI 形状 / finish_reason 取值域 / usage 非负 /
+  tool_call 往返;流式各块形状 + 流式拼接 == 非流式。
+- `SANDBOX_INVARIANTS`:provenance / 产出非空 / 记账非负 / 上限生效 / 无网络出口 / `timeout_takes_effect`。
+- `SKILL_INVARIANTS`、`MIDDLEWARE_INVARIANTS`、`ARTIFACT_INVARIANTS`、`APPROVAL_INVARIANTS`。
+- `APPROVAL_ENFORCEMENT_INVARIANTS: InvariantPack[ToolExecutionHarness]`(名 `approval_enforcement`):
+  `unapproved_gated_tool_never_executes`、`rerun_does_not_bypass`、`changed_arguments_require_reapproval`、
+  `gate_failure_blocks_execution`、`ungated_tools_are_unaffected`——全部用带副作用计数的真实工具函数断言。
+- `TOOL_TRACE_INVARIANTS: InvariantPack[ToolExecutionHarness]`(名 `tool_trace`):`unknown_tool_name_is_not_traced`。
+- `ToolExecutionHarness`(Protocol):`run(calls, tools, *, gate, gated_tools=(), trace=None) -> None`,把一串
+  `(工具名, 参数值)` 交给某个会执行工具的 agent 真实跑一次;`ScriptedToolCallProvider(calls, *, final="done", usage=None)`:
+  离线脚本化 provider,按对话中 assistant 条数回放 tool_calls(无状态、可重放、线程安全),供 harness 驱动
+  `FunctionCallingAgent`。二者在 `spineagent.conformance`。
 
 ### `__version__`
-`spineagent.__version__ -> str`(当前 `"0.2.0"`)。
+`spineagent.__version__ -> str`:取自已安装包的元数据(`importlib.metadata.version("spineagent")`),
+随发行版变化;以 `pyproject.toml` 的 `version` 为准(编写本文时为 `"0.3.1"`)。

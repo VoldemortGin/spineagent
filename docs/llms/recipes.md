@@ -240,9 +240,67 @@ gemini = LlmAgent("gemini", GeminiProvider(model="gemini-2.5-flash"))
 # 也可走缝注册表按名建(等价):
 from spineagent import llm_providers
 # provider = llm_providers.make("openai", model="gpt-4o")
-print(llm_providers.names())   # ['anthropic', 'bedrock', 'cohere', 'gemini', 'mock', 'openai']（排序返回）
+print(llm_providers.names())   # ['anthropic', 'bedrock', 'cohere', 'failover', 'gemini', 'mock', 'openai']（排序返回）
 ```
 
 > API key 等凭据走各 SDK 的默认环境变量(如 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`),或经
 > `**client_kwargs` / `client=` 注入。未装对应 extra 而去构造真实适配器,会得到「pip install
 > spineagent[<extra>]」的友好 ImportError。
+
+## 12) 审批:风险工具调用前停下等人(离线脚本化 provider)
+
+```python
+from spineagent import (
+    ApprovalMiddleware, ApprovalPending, Decision, FunctionCallingAgent,
+    ManualApprovalGate, MiddlewareAgent, function_tool,
+)
+from spineagent.conformance import ScriptedToolCallProvider  # 离线:按脚本回 tool_calls
+
+deleted = []
+
+@function_tool
+def delete_file(path: str) -> str:
+    """删除一个文件。"""
+    deleted.append(path)
+    return "deleted"
+
+gate = ManualApprovalGate()
+model = ScriptedToolCallProvider([("delete_file", {"path": "/tmp/a"})], final="完成")
+agent = MiddlewareAgent(
+    "ops",
+    FunctionCallingAgent("worker", model, [delete_file]),
+    [ApprovalMiddleware(gate, gated_tools=["delete_file"])],
+)
+
+try:
+    agent.step("清理临时文件")
+except ApprovalPending as exc:            # 真实工具调用前被拦下:delete_file 一次都没执行
+    request_id = exc.context["request_id"]
+print(deleted)                            # []
+
+token = gate.resolve(request_id, Decision.APPROVED)   # out-of-band 批准(收件箱 / 管理台)
+gate.redeem(token)                                    # 一次性 resume token,重放必败
+print(agent.step("清理临时文件").output)   # '完成'(同工具 + 同参数命中已落决议)
+print(deleted)                            # ['/tmp/a']
+```
+
+参数被改(如 `/etc`)就是新请求,会再次 `ApprovalPending`。需要不依赖上下文的保证时,用
+`require_approval(delete_file, gate)` 把闸绑进工具本身。
+
+## 13) 信任边界:上游输出是数据
+
+```python
+from spineagent import (
+    A2AAgentAdapter, CalcTool, Coordinator, OfflineA2AStub, SyntaxToolPolicy, ToolUsingAgent,
+)
+
+peer = A2AAgentAdapter(OfflineA2AStub(name="peer", responder=lambda t: "报告如下\ncalc: 9**9"))
+downstream = ToolUsingAgent("down", SyntaxToolPolicy(), [CalcTool()])
+results = Coordinator([peer, downstream]).run_pipeline("hi")
+print(results[-1].output)   # '报告如下\ncalc: 9**9'——作为正文流转,但没有被当成指令执行
+
+# 确认上游可信、确实要它驱动下游时,显式打开旧行为:
+legacy = ToolUsingAgent("down", SyntaxToolPolicy(parse_untrusted=True), [CalcTool()])
+print(Coordinator([peer, legacy]).run_pipeline("hi")[-1].output)  # 末行是 calc 的结果
+```
+

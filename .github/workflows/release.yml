@@ -9,7 +9,7 @@
 # spineagent 依赖薄核 corespine(已在 PyPI,>=0.1.1)。gate 用 `uv pip install --no-sources`
 # 忽略 pyproject 里指向 ../corespine 的本地 path source(那只服务本地开发),强制从 PyPI 装
 # corespine —— 与 ci.yml 同一套装法。publish 阶段 `python -m build` 走标准 PEP 517(hatchling),
-# 天然不读 [tool.uv.sources],产出的 wheel 依赖恒为 `corespine>=0.1.1`(PyPI),无本地路径泄漏。
+# 天然不读 [tool.uv.sources],产出的 wheel 依赖恒为 `corespine>=0.2.0`(PyPI),无本地路径泄漏。
 #
 # ── 一次性 PyPI 设置(网页端,需账号登录)──────────────────────────────────────────────
 # `spineagent` 项目【已存在】于 PyPI(0.0.x 曾手动 twine 上传),故【不】走 pending publisher,

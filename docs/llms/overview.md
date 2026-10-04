@@ -73,8 +73,29 @@ agent 在一步里可调用的能力:有 `name`,`run(arg: str) -> ToolResult`(�
 - A2A:`A2AAgent` 协议 + `OfflineA2AStub`(进程内回环)+ `a2a_agents` Registry(`offline` / `real`)。
   真实 `a2a-sdk`(import 名 `a2a`)走 `[a2a]` extra。
 
-两条缝的 `real` 槽默认抛 `SeamError`(「缝槽存在但真实实现未接入」),由装了 extra 的使用者按官方
-SDK 接入——本包只提供缝 + 离线 stub。
+两条缝的 `real` 槽是**占位、尚未实现**:缺 extra 抛 `ImportError`,装了 extra 也必抛 `SeamError`
+(「缝槽存在但真实实现未接入」),由使用者按官方 SDK 自行接入——本包只提供缝 + 离线 stub。
+
+### middleware / approval / sandbox / skills / artifact / deep research
+
+- **middleware**:`MiddlewareAgent(name, agent, middlewares)` 洋葱式包住任意 Agent(before 正序、after
+  逆序),内置 `TokenUsage` / `Summary` / `DynamicTool` / `Attachment`;`StepContext.cleanups` 无论成败都执行。
+- **approval(审批门 / Wait)**:`ApprovalGate`(`AutoApprovalGate` 策略表 / `ManualApprovalGate` 人工挂起 +
+  一次性 resume token)。审批是**工具调用点上的强制闸**(ADR 0002):`ApprovalMiddleware` 把审批配置压进
+  当前上下文,`FunctionCallingAgent` / `ToolUsingAgent` 在**每一次**真实调用工具前按「工具名 + 规范化参数」
+  review;未批准不执行,门故障 fail-closed;`require_approval(tool, gate)` 把闸直接绑进工具本身。
+- **sandbox**:`InProcessSandbox` 受限白名单表达式求值器(节点预算、值上限、输出上限、协作式 timeout);
+  `subprocess` / `container` 是占位、尚未实现。
+- **skills**:manifest + 受限脚本的能力包,脚本经 Sandbox 执行,可桥成 `FunctionTool`。
+- **artifact**:`ArtifactSink` 存交付物,`AgentResult.artifacts` 挂引用。
+- **DeepResearchAgent**:分解 → 并行检索 → 综合的纯组合预置 agent。
+
+### 信任边界:指令 vs 数据(ADR 0003)
+
+只有调用方直接给 `agent.step()` 的 task 文本是**指令**。pipeline 上游输出、附件、工具结果、MCP / A2A
+对端返回都是**数据**:在源头被标为 `TaskText` 不可信段,`SyntaxToolPolicy` 绝不把其中的 `<tool>: <arg>`
+当工具调用执行(需要旧行为显式 `SyntaxToolPolicy(parse_untrusted=True)`)。真 LLM 读到数据里的「指令」
+属于提示注入,由审批闸与工具最小授权兜底。
 
 ### LLM 适配器(对外统一 OpenAI ChatCompletion 形状)
 
@@ -98,14 +119,20 @@ SDK 接入——本包只提供缝 + 离线 stub。
 所有 `step` / 编排方法可选接收一个 `corespine` 的 `TraceSink`。实现只往里记**元数据**(agent 名、
 步序、计数、长度、耗时),**绝不**记任务 / 参数 / 输出正文。`corespine.InProcessPrivacyTraceSink`
 「构造即保证」:若试图写入受限字段(`content` / `text` / `answer` / `value`…,见 `FORBIDDEN_KEYS`),
-`emit` 当场抛 `TraceError`。本包再用 conformance「按值」补一道防线。
+`emit` 当场抛 `TraceError`。本包再用 conformance「按值」补一道防线。trace 里的工具名 / agent 名只取
+本地注册 / 登记的名字:模型编造的未知工具名记 `<unknown>`,A2A 对端自报名不进 trace。
 
 ## conformance(机制借 corespine,保证由本包绑定)
 
 `corespine.ConformanceSuite` 提供「实现 × 不变量」笛卡尔积的**机制**;具体不变量由本包绑定并导出:
 - `AGENT_INVARIANTS` — 步必产出非空、结果可溯源到 agent、步级 trace 隐私安全。
 - `TOOL_INVARIANTS` — 工具结果可溯源、调用必产出非空。
-- `POLICY_INVARIANTS` — 决策是 ToolCall/Finish 之一、不幻觉不存在的工具、空工具集必收尾且非空、`decide` 是纯函数。
+- `POLICY_INVARIANTS` — 决策是 ToolCall/Finish 之一、不幻觉不存在的工具、空工具集必收尾且非空、`decide` 是纯函数、数据段绝不变成工具调用。
+- `LLM_INVARIANTS` / `STREAMING_INVARIANTS` / `SANDBOX_INVARIANTS`(含超时生效)/ `SKILL_INVARIANTS` /
+  `MIDDLEWARE_INVARIANTS` / `ARTIFACT_INVARIANTS` / `APPROVAL_INVARIANTS`。
+- `APPROVAL_ENFORCEMENT_INVARIANTS` — 参数化所有会执行工具的 agent 形态:未批准执行 0 次、重跑不绕过、
+  改参数须重新审批、门故障 fail-closed、未受审批工具不受影响。
+- `TOOL_TRACE_INVARIANTS` — 模型编造的未知工具名绝不进 trace。
 
 任何号称 Agent / Tool / ToolPolicy 的(含第三方)实现,都可丢进对应不变量包跑 conformance——没过直接红,而非埋雷。
 

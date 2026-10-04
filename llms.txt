@@ -19,7 +19,8 @@
 - `docs/llms/overview.md` — 是什么、解决什么、核心概念(Agent / Tool / 编排 / 协议缝 / LLM 适配器)、与 corespine 的关系
 - `docs/llms/api.md` — 完整公开 API:每个导出的真实签名 + 契约 + 一句话,按 agent / tool / orchestration / protocol / llm 分节
 - `docs/llms/recipes.md` — 可运行最小示例(离线优先,用 `MockProvider`):建并跑 agent、工具循环、顺序/并行/流水线编排、装真实 LLM 后端怎么接
-- `docs/llms/gotchas.md` — 陷阱:provider 输出是 OpenAI ChatCompletion 形状、真实后端要装对应 extra、离线默认 MockProvider、`SeamError` 表示缝未接入
+- `docs/llms/gotchas.md` — 陷阱:provider 输出是 OpenAI ChatCompletion 形状、真实后端要装对应 extra、离线默认 MockProvider、`SeamError` 表示缝未接入、审批闸在工具调用点上、上游输出是数据不是指令、工具异常喂回模型、沙箱 timeout / CalcTool 上限、failover 不重试坏请求
+- `CHANGELOG.md` / `docs/adr/` — 行为变化与设计决议(ADR 0002 审批执行闸、ADR 0003 指令 / 数据分通道)
 - `docs/spine-family.md` — Spine 家族成员、分层、依赖方向与实际依赖形式(非本包 API,跨仓关系用)
 
 ## 心智模型(一句话)
@@ -28,7 +29,11 @@
 - **Tool**:`run(arg: str) -> ToolResult`。`EchoTool` / `CalcTool` + `@function_tool`(给真 function-calling 用的带 schema 工具)。
 - **编排**:`Coordinator`(顺序 / 并行 / 流水线 + 弹性容错)、`ChainAgent`(把一串 agent 串成单个 Agent)。
 - **跨缝桥接三角**:`AgentTool`(Agent→Tool,督导式多 agent)、`McpClientTool`(MCP 工具→Tool)、`A2AAgentAdapter`(A2A agent→Agent)。
-- **协议缝**:MCP(`OfflineMcpStub`)、A2A(`OfflineA2AStub`),离线进程内回环默认,真实 SDK 经 `[mcp]` / `[a2a]` extra。
+- **协议缝**:MCP(`OfflineMcpStub`)、A2A(`OfflineA2AStub`),离线进程内回环默认;`real` 槽是**占位、尚未实现**(装了 `[mcp]` / `[a2a]` extra 也必抛 `SeamError`)。
+- **middleware**:`MiddlewareAgent` 洋葱链包住任意 Agent,内置 TokenUsage / Summary / DynamicTool / Attachment。
+- **审批门(approval)**:`AutoApprovalGate` / `ManualApprovalGate` + `ApprovalMiddleware`;审批是**工具调用点上的强制闸**——每次真实工具调用前按「工具名 + 参数」review,未批准不执行、门故障 fail-closed;`require_approval(tool, gate)` 把闸绑进工具。
+- **信任边界**:只有调用方直接给的 task 是指令;上游输出 / 附件 / 工具结果 / MCP·A2A 返回是数据(`TaskText`),`SyntaxToolPolicy` 不执行其中的 `<tool>: <arg>`。
+- **sandbox / skills / artifact / deep research**:`InProcessSandbox`(受限表达式求值,协作式 timeout;`subprocess` / `container` 为占位)、`FixtureSkill` / `SkillBundle`、`ArtifactSink`、`DeepResearchAgent`。
 - **LLM 适配器**:挂在 corespine `LLMProvider` 缝后面,**输出统一 OpenAI ChatCompletion 形状**。离线默认 `corespine.MockProvider`;真实后端 `OpenAICompatProvider` / `AnthropicProvider` / `CohereProvider` / `GeminiProvider` / `BedrockConverseProvider`,各走 `[openai]` / `[anthropic]` / `[cohere]` / `[gemini]` / `[bedrock]` extra(`[all]` 装齐)。
 
 ## 30 秒 hello-world(离线,零网络)

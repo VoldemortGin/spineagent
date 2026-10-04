@@ -44,8 +44,9 @@ src/spineagent/
   agent/artifact.py         artifact 缝:Artifact(字节/文本 + mime + name + producer provenance)+ ArtifactSink 协议(store/fetch)+ 离线默认(InProcessArtifactSink / 组合 corespine BlobStore 的 BlobArtifactSink)+ artifact_sinks Registry;AgentResult.artifacts 挂交付物引用
   agent/builtin/deep_research.py  DeepResearchAgent:纯组合(planner 分解 + Coordinator 并行检索 + LlmAgent 综合)装配的预置深研 agent,实现 Agent 协议;离线默认 MockProvider + 空 tools,真实效果靠注入 provider/tools
   agent/middleware.py       Middleware 缝:协议(before_step / after_step)+ MiddlewareAgent 有序洋葱链包裹任意 Agent(组合完仍是 Agent)+ 离线内置四件套(TokenUsage / Summary / DynamicTool / Attachment)+ middlewares Registry;trace 只记计数,零正文泄漏
-  agent/approval.py         审批门 / Wait 缝(对标 n8n Send-and-Wait 概念):ApprovalGate 协议(review(ApprovalRequest)→ Decision 三态 approved/rejected/pending)+ ApprovalRequest(只带 code/确定性 id/工具名/参数 schema 指纹+计数,绝不含参数正文)+ 离线默认 AutoApprovalGate(工具名 glob allow/deny 策略表,永不 pending)/ ManualApprovalGate(进程内挂起:review 登记待审、resolve 落决议+铸一次性 resume token、redeem 消费重放必败)+ 可插拔一次性 ResumeTokenStore(默认 InMemoryResumeTokenStore,只存 sha256 哈希)+ make_approval_gate/approval_gates Registry;ApprovalMiddleware 插进 middleware 链:approved 放行、rejected 抛 ApprovalRejected 断路、pending 抛 ApprovalPending 挂起(编排层经 error_to_dict 归一进 AgentResult.error;resolve 后重跑 step 恢复,复用决议幂等,零新增循环机制),默认 gated_tools 空=零行为变化(opt-in);决议幂等,trace 只记 code/计数/决议
-  sandbox/seam.py           Sandbox 缝:协议(run(code, *, timeout, limits) -> SandboxResult)+ 离线确定性默认 InProcessSandbox(受限白名单 AST 求值器,构造即保证无网络出口 / 无文件系统逃逸,ops / output 上限)+ sandboxes Registry;真实硬隔离后端 subprocess / container 走 [sandbox] extra 延迟 import
+  agent/approval.py         审批门 / Wait 缝(对标 n8n Send-and-Wait 概念):ApprovalGate 协议(review(ApprovalRequest)→ Decision 三态 approved/rejected/pending)+ ApprovalRequest(只带 code/确定性 id/工具名/参数 schema 指纹+计数,绝不含参数正文)+ 离线默认 AutoApprovalGate(工具名 glob allow/deny 策略表,永不 pending)/ ManualApprovalGate(进程内挂起:review 登记待审、resolve 落决议+铸一次性 resume token、redeem 消费重放必败)+ 可插拔一次性 ResumeTokenStore(默认 InMemoryResumeTokenStore,只存 sha256 哈希)+ make_approval_gate/approval_gates Registry;审批是【工具调用点上的强制闸】(ADR 0002):ApprovalMiddleware 把审批配置压进 contextvar 作用域,FunctionCallingAgent / ToolUsingAgent 每次真实调用工具前调 enforce_tool_approval(工具名, 参数)——approved 执行、rejected 抛 ApprovalRejected、pending 抛 ApprovalPending、门故障抛 ApprovalGateError(fail-closed);request id 由工具名 + 规范化参数派生、不依赖步序;require_approval 把闸绑进工具本身;默认 gated_tools 空=零行为变化;trace 只记 code/计数/决议
+  agent/trust.py            信任边界(ADR 0003):TaskText(带不可信区间的 str 子类)/ untrusted / compose;pipeline 上游输出、附件、工具结果、MCP / A2A 返回在源头标为数据,SyntaxToolPolicy 只解析可信行(parse_untrusted=True 恢复旧行为)
+  sandbox/seam.py           Sandbox 缝:协议(run(code, *, timeout, limits) -> SandboxResult)+ 离线确定性默认 InProcessSandbox(受限白名单 AST 求值器,构造即保证无网络出口 / 无文件系统逃逸,ops / output 上限 + 协作式 timeout,时钟可注入)+ sandboxes Registry;subprocess / container 槽是占位、尚未实现(必抛 SeamError;container 缺 [sandbox] extra 时先抛 ImportError)
   skills/skill.py           Skill 缝:SkillSpec(manifest)+ 协议(describe() 确定性 schema / invoke(args) 带 provenance)+ 离线默认 FixtureSkill(脚本经 Sandbox 隔离执行)+ skill_registry Registry
   skills/bundle.py          SkillBundle:manifest.toml + 脚本文件的目录加载器(tomllib)
   skills/as_tool.py         skill_as_function_tool:把 Skill 桥成 FunctionTool,直接进 FunctionCallingAgent
@@ -53,9 +54,9 @@ src/spineagent/
   tools/function_tool.py    FunctionTool(带 JSON-schema、接 dict 参数,给真 function-calling 用)+ @function_tool 装饰器(从签名自动推 schema)
   orchestration/coordinator.py  Coordinator:顺序 / 并行 / 流水线(output→input)跑多 agent、保序收集;弹性容错 resilient 把异常归一为 AgentResult.error,坏 agent 不炸整批
   orchestration/chain.py        ChainAgent:把一串 agent 串成单个 Agent(流水线即一等可组合单元:可进 Coordinator / 当工具 / 套 chain)
-  protocol/mcp/seam.py      McpClient / McpServer 协议 + OfflineMcpStub(离线回环)+ McpClientTool(MCP 工具→Tool)+ 延迟真实 SDK
-  protocol/a2a/seam.py      A2AAgent 协议 + OfflineA2AStub(离线回环)+ A2AAgentAdapter(A2A→Agent)+ 延迟真实 SDK
-  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / STREAMING / SANDBOX / SKILL / MIDDLEWARE / ARTIFACT / APPROVAL_INVARIANTS)
+  protocol/mcp/seam.py      McpClient / McpServer 协议 + OfflineMcpStub(离线回环)+ McpClientTool(MCP 工具→Tool)+ mcp_clients["real"] 占位、尚未实现(装了 [mcp] 也必抛 SeamError)
+  protocol/a2a/seam.py      A2AAgent 协议 + OfflineA2AStub(离线回环)+ A2AAgentAdapter(A2A→Agent,名字取本地登记名)+ a2a_agents["real"] 占位、尚未实现(装了 [a2a] 也必抛 SeamError)
+  conformance.py            本包绑定的不变量包(AGENT / TOOL / POLICY / LLM / STREAMING / SANDBOX / SKILL / MIDDLEWARE / ARTIFACT / APPROVAL / APPROVAL_ENFORCEMENT / TOOL_TRACE_INVARIANTS)+ ToolExecutionHarness 协议 + 离线 ScriptedToolCallProvider
 ```
 
 ## 跑(始终从包根)

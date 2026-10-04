@@ -60,9 +60,18 @@
 - `FunctionCallingAgent(fail_fast=..., include_error_message=...)`、`McpProtocolError`、
   `spineagent.tools.tool.index_tools_by_name`。
 - `InProcessSandbox(clock=...)`:可注入时钟(默认 `time.monotonic`)。
-- conformance:`SANDBOX_INVARIANTS` 新增 `timeout_takes_effect`。
+- conformance:`SANDBOX_INVARIANTS` 新增 `timeout_takes_effect`;`APPROVAL_ENFORCEMENT_INVARIANTS` /
+  `TOOL_TRACE_INVARIANTS` 从顶层 `spineagent` 导出。
 - conformance:`APPROVAL_ENFORCEMENT_INVARIANTS` + `ToolExecutionHarness` 协议 +
   `ScriptedToolCallProvider`(离线脚本化 tool_calls 的 provider)。
+
+### Documentation
+
+- `docs/llms/`(随 wheel 分发)补齐 sandbox / middleware / artifact / approval / deep research / 信任边界
+  与本次行为变化;`api.md` 不再写死过期版本号;README 模块表与 conformance 行补全。
+- README / `llms.txt` / `docs/llms/` / `CLAUDE.md` 如实标注 `[mcp]` / `[a2a]` / `[sandbox]` 对应的真实后端、
+  `tool_policies["llm"]`、`sandboxes["subprocess"]` 为占位、尚未实现(必抛 `SeamError`)。
+- `ci.yml` / `release.yml` / `deploy/README.md` 的 corespine 下限与 `pyproject.toml` 对齐(`>=0.2.0`)。
 
 ### Changed
 

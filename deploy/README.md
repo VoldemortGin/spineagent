@@ -65,7 +65,7 @@ docker compose -f deploy/compose.yaml up --build
 `spineagent/` 里看不到兄弟目录 `corespine/`,故把 context 抬到家族根,镜像才能同时 `COPY` 进
 两个包。
 
-> 注:`corespine` 现已发布到 PyPI(`>=0.1.1`),故此处「源码可编辑装 corespine」是**设计选择**
+> 注:`corespine` 现已发布到 PyPI(`>=0.2.0`,以 `pyproject.toml` 为准),故此处「源码可编辑装 corespine」是**设计选择**
 > (monorepo 单 checkout 可复现)而非必需 —— 亦可改为从 PyPI 装 `corespine`、把 context 收回
 > 包根 `spineagent/`。当前镜像保留源码构建以对齐本地开发布局。
 

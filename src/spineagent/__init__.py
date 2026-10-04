@@ -78,6 +78,7 @@ from spineagent.agent.tool_using import ToolUsingAgent
 from spineagent.agent.trust import TaskText, compose, untrusted
 from spineagent.conformance import (
     AGENT_INVARIANTS,
+    APPROVAL_ENFORCEMENT_INVARIANTS,
     APPROVAL_INVARIANTS,
     ARTIFACT_INVARIANTS,
     LLM_INVARIANTS,
@@ -87,6 +88,7 @@ from spineagent.conformance import (
     SKILL_INVARIANTS,
     STREAMING_INVARIANTS,
     TOOL_INVARIANTS,
+    TOOL_TRACE_INVARIANTS,
 )
 from spineagent.llm.bedrock_provider import BedrockConverseProvider, load_boto3_sdk
 from spineagent.llm.cohere_provider import CohereProvider, load_cohere_sdk
@@ -289,6 +291,8 @@ __all__ = [
     "MIDDLEWARE_INVARIANTS",
     "ARTIFACT_INVARIANTS",
     "APPROVAL_INVARIANTS",
+    "APPROVAL_ENFORCEMENT_INVARIANTS",
+    "TOOL_TRACE_INVARIANTS",
     "STREAMING_INVARIANTS",
     "__version__",
 ]
