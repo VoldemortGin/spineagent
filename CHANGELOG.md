@@ -36,6 +36,10 @@
 - 指令 / 数据分通道(ADR 0003):pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
   `McpClientTool` / `A2AAgentAdapter` 的返回都标为数据(`TaskText`),`SyntaxToolPolicy` 不再把其中的
   `<tool>: <arg>` 当指令执行。
+- agent 的产出在**源头**就是数据(ADR 0003 修订):`LlmAgent` / `FunctionAgent` / `ToolUsingAgent` /
+  `FunctionCallingAgent` / `ChainAgent` / `MiddlewareAgent` / `DeepResearchAgent` 的 `AgentResult.output` 为整段
+  不可信的 `TaskText`(str 子类),调用方直接把它传给下一个 agent 时不再被当指令执行;`DeepResearchAgent` 拼综合
+  prompt 时保留各条发现的标记。
 
 ### Fixed
 
@@ -150,5 +154,8 @@
   404 的 `retryable` 由 True 改为 False(仍会回退,并冷却出错的那一家)。只有 `BadRequestProviderError`(code
   `provider.bad_request`)不回退;依赖「400 直接上抛」的调用方改抛 / 改判它,或注入 `failover_policy`。
 - `FunctionCallingAgent` 的 `usage` 由「末轮」改为「各轮累加」。
+- 本包 agent 的 `AgentResult.output` 从 plain `str` 变为 `TaskText`(str 子类,相等 / 拼接 / 序列化不受影响);依赖
+  「把 A 的产出当指令喂给 B 的 `SyntaxToolPolicy`」的调用方需显式 `SyntaxToolPolicy(parse_untrusted=True)`。
+  `type(output) is str` 之类的精确类型判断会变为 False。
 - `SyntaxToolPolicy` 缺省不再解析被标为数据的文本:依赖「pipeline 上游输出驱动下游执行工具」的
   调用方需显式 `SyntaxToolPolicy(parse_untrusted=True)`;`SummaryMiddleware` 的摘要也属数据。

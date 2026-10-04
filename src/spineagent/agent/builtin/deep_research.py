@@ -23,6 +23,7 @@ from corespine.observability.trace import TraceSink
 from spineagent.agent.agent import AgentResult, FunctionAgent, LlmAgent
 from spineagent.agent.approval import ApprovalError
 from spineagent.agent.function_calling import FunctionCallingAgent
+from spineagent.agent.trust import compose, untrusted
 from spineagent.orchestration.coordinator import Coordinator
 from spineagent.tools.function_tool import FunctionTool
 from spineagent.tools.tool import index_tools_by_name
@@ -96,8 +97,16 @@ class DeepResearchAgent:
             raise approval_errors[min(approval_errors)]
 
         # 3) 综合:把并行发现拼成 prompt,走 provider 产出最终答案。
-        digest = "\n\n".join(f"[发现 {i + 1}] {f.output}" for i, f in enumerate(findings))
-        synthesis_prompt = f"原始研究问题:{task}\n\n基于以下并行检索到的发现,综合成一份连贯、无编造的回答:\n\n{digest}"
+        # 各条发现是检索 agent 的产出 = 数据:用 compose 拼接以保留不可信标记(ADR 0003)。
+        parts: list[str] = []
+        for i, f in enumerate(findings):
+            parts.extend(("\n\n" if i else "", f"[发现 {i + 1}] ", untrusted(f.output)))
+        synthesis_prompt = compose(
+            "原始研究问题:",
+            task,
+            "\n\n基于以下并行检索到的发现,综合成一份连贯、无编造的回答:\n\n",
+            *parts,
+        )
         synthesizer = LlmAgent(
             f"{self._name}.synthesize", self._provider, system=self._synthesis_system
         )
@@ -105,7 +114,7 @@ class DeepResearchAgent:
 
         _emit(trace, self._name, len(subqueries), len(findings), final.output)
         # provenance 重盖为本 agent(对外它是产出者;子 agent 名是内部细节,与 ChainAgent / AgentTool 同理)。
-        return AgentResult(agent=self._name, output=final.output, usage=final.usage)
+        return AgentResult(agent=self._name, output=untrusted(final.output), usage=final.usage)
 
 
 def _bind_query(

@@ -143,7 +143,9 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
 `Coordinator.run_pipeline` / `ChainAgent` 把上游输出以 `TaskText` 数据段传给下游;附件、`$prev` 回灌的
 工具结果、`AgentTool` / `McpClientTool` / `A2AAgentAdapter` 的返回同理。`SyntaxToolPolicy` 不解析数据段
 里的 `<tool>: <arg>`。想让上游驱动下游执行工具,必须显式 `SyntaxToolPolicy(parse_untrusted=True)`。
-对 `TaskText` 做 `+` / f-string / `strip` 会得到 plain str(= 指令),转手数据请用 `untrusted()` / `compose()`。
+agent 的产出(`AgentResult.output`)在产出时就是数据:`down.step(up.step(t).output)` 不会执行上游文本里的指令。
+对 `TaskText` 做 `+` / `%` / `format` / f-string / `join` / `strip` / `replace` / `split` / 切片 / `str()` / JSON 往返
+都会得到 plain str(= 指令),转手数据请用 `untrusted()` / `compose()`。
 
 ## 14) 工具抛异常不再炸掉 FunctionCallingAgent
 

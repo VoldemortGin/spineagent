@@ -92,8 +92,9 @@ class MiddlewareAgent:
         # 整步在调用方上下文的一份副本里跑:middleware 压进 contextvar 的作用域(审批 / 记账)结构上
         # 只活在本步里——即使某个收尾回调失败,也绝不会泄漏给同一线程里之后的请求(长驻线程池)。
         result = contextvars.copy_context().run(self._run, ctx)
-        # 重盖 provenance:对外产出者是本组合 agent(子 agent 名是内部细节)。
-        return replace(result, agent=self._name)
+        # 重盖 provenance:对外产出者是本组合 agent(子 agent 名是内部细节);产出是数据(after_step
+        # 可能改写过它,故在出口统一打标)。
+        return replace(result, agent=self._name, output=untrusted(result.output))
 
     def _run(self, ctx: StepContext) -> AgentResult:
         try:

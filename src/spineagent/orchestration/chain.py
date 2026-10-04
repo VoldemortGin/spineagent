@@ -17,6 +17,7 @@ from collections.abc import Iterable
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import Agent, AgentResult, merge_usage
+from spineagent.agent.trust import untrusted
 from spineagent.orchestration.coordinator import Coordinator
 from spineagent.tools.tool import reachable_tool_names
 
@@ -36,7 +37,7 @@ class ChainAgent:
         # 复用 Coordinator 流水线;内部不透 trace,失败在此冒泡(fail-fast)。
         results = Coordinator(self._agents).run_pipeline(task)
         # 末端 agent 的输出即 chain 的产出;空链(无 agent)退化为恒等透传。
-        output = results[-1].output if results else task
+        output = untrusted(results[-1].output if results else task)  # chain 的产出是数据
         _emit_chain_step(trace, self._name, len(results), output)
         # 组合层透传:各段 usage 累加、artifacts 按段序拼接(不丢子 agent 的元数据)。
         return AgentResult(

@@ -6,6 +6,9 @@
   - LlmAgent —— 用一个 corespine LLMProvider 跑单步(离线用 MockProvider,确定性、可复现);
   - FunctionAgent —— 把一个纯函数 (task->text) 包成 Agent(无需 LLM,做测试/编排的轻量节点)。
 
+信任边界(ADR 0003):agent 的产出在【产出时】就标为数据(TaskText,str 子类,兼容):调用方把它直接
+传给下一个 agent 时,指令语法解析器不会把其中的 `<tool>: <arg>` 当指令执行。
+
 隐私约定:step 可选接收一个 corespine TraceSink,实现只允许往里记【元数据】(agent 名、
 长度、token 数),【绝不】记任务/输出正文——由 InProcessPrivacyTraceSink「构造即保证」,
 本包再用 conformance 把这条不变量绑死(见 spineagent/conformance.py)。
@@ -19,6 +22,7 @@ from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.artifact import ArtifactRef
+from spineagent.agent.trust import untrusted
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,8 @@ class LlmAgent:
             if completion.usage is not None
             else None
         )
-        result = AgentResult(agent=self._name, output=message.content or "", usage=usage)
+        # 模型输出是数据(源头打标)。
+        result = AgentResult(agent=self._name, output=untrusted(message.content or ""), usage=usage)
         _emit_step(trace, self._name, task, result)
         return result
 
@@ -107,7 +112,7 @@ class FunctionAgent:
         return self._name
 
     def step(self, task: str, *, trace: TraceSink | None = None) -> AgentResult:
-        result = AgentResult(agent=self._name, output=self._fn(task))
+        result = AgentResult(agent=self._name, output=untrusted(self._fn(task)))
         _emit_step(trace, self._name, task, result)
         return result
 

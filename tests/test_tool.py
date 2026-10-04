@@ -127,3 +127,47 @@ def test_calc_tool_deep_bare_parentheses_fail_fast():
 def test_calc_tool_still_handles_reasonable_powers():
     assert CalcTool().run("2**100").output == str(2**100)
     assert CalcTool().run("(1+2)*(3+4)").output == "21"
+
+
+# ---- CalcTool 的长度上限 / 解析期递归错误:各自是唯一防线(审查变异验证:去掉后测试仍全绿)--------------
+
+
+class _AstProxy:
+    """只替换 tools.tool 模块看到的 ast.parse(不动全局 ast:pytest 自己渲染 traceback 也要用它)。"""
+
+    def __init__(self, parse) -> None:
+        import ast as ast_module
+
+        self._ast = ast_module
+        self.parse = parse
+
+    def __getattr__(self, name):
+        return getattr(self._ast, name)
+
+
+def test_calc_rejects_overlong_expression_before_parsing(monkeypatch):
+    import ast as ast_module
+
+    import spineagent.tools.tool as tool_module
+
+    parsed: list[str] = []
+
+    def counting_parse(source, *args, **kwargs):
+        parsed.append(source)
+        return ast_module.parse(source, *args, **kwargs)
+
+    monkeypatch.setattr(tool_module, "ast", _AstProxy(counting_parse))
+    with pytest.raises(ValueError):
+        CalcTool().run("1+" * 2_100 + "1")  # 4201 字符:浅而长
+    assert parsed == [], "超长表达式必须在解析之前就被拒绝"
+
+
+def test_calc_turns_parser_recursion_error_into_value_error(monkeypatch):
+    import spineagent.tools.tool as tool_module
+
+    def exploding_parse(source, *args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded during compilation")
+
+    monkeypatch.setattr(tool_module, "ast", _AstProxy(exploding_parse))
+    with pytest.raises(ValueError):
+        CalcTool().run("1+1")

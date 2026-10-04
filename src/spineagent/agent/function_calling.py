@@ -36,6 +36,7 @@ from spineagent.agent.approval import (
     enforce_tool_approval,
     preflight_tool_approvals,
 )
+from spineagent.agent.trust import untrusted
 from spineagent.tools.function_tool import FunctionTool, InvalidToolArguments
 from spineagent.tools.tool import index_tools_by_name
 
@@ -101,7 +102,8 @@ class FunctionCallingAgent:
             tool_calls = message.tool_calls or ()
             if not tool_calls:
                 _emit_finish(trace, self._name, index, message.content or "")
-                return AgentResult(self._name, message.content or "", usage=total_usage)
+                # 模型的最终文本是数据(源头打标,ADR 0003)。
+                return AgentResult(self._name, untrusted(message.content or ""), usage=total_usage)
             # 把这一轮的 assistant(带 tool_calls)按 OpenAI 形状追加进对话历史。
             messages.append(
                 {
@@ -143,7 +145,7 @@ class FunctionCallingAgent:
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。
         _emit_step_limit(trace, self._name, self._max_steps)
         _emit_finish(trace, self._name, self._max_steps, _NO_OUTPUT)
-        return AgentResult(self._name, _NO_OUTPUT, usage=total_usage)
+        return AgentResult(self._name, untrusted(_NO_OUTPUT), usage=total_usage)
 
     def tool_inventory(self) -> frozenset[str] | None:
         return frozenset(self._tools)

@@ -94,8 +94,8 @@ agent 在一步里可调用的能力:有 `name`,`run(arg: str) -> ToolResult`(�
 
 ### 信任边界:指令 vs 数据(ADR 0003)
 
-只有调用方直接给 `agent.step()` 的 task 文本是**指令**。pipeline 上游输出、附件、工具结果、MCP / A2A
-对端返回都是**数据**:在源头被标为 `TaskText` 不可信段,`SyntaxToolPolicy` 绝不把其中的 `<tool>: <arg>`
+只有调用方直接给 `agent.step()` 的 task 文本是**指令**。agent 的产出(`AgentResult.output`,产出时即打标)、
+pipeline 上游输出、附件、工具结果、MCP / A2A 对端返回都是**数据**:被标为 `TaskText` 不可信段,`SyntaxToolPolicy` 绝不把其中的 `<tool>: <arg>`
 当工具调用执行(需要旧行为显式 `SyntaxToolPolicy(parse_untrusted=True)`)。真 LLM 读到数据里的「指令」
 属于提示注入,由审批闸与工具最小授权兜底。
 

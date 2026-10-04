@@ -1,6 +1,6 @@
 # ADR 0003 — 指令与数据分通道:上游输出不是给下游的指令
 
-- 状态:已接受
+- 状态:已接受(2026-10-04 修订:决策 2 由「在边界打标」改为「agent 产出在源头打标 + 边界打标」,见修订记录)
 - 日期:2026-10-04
 - 相关:`agent/trust.py`、`agent/policy.py`、`orchestration/coordinator.py`、`agent/middleware.py`、
   `agent/tool_using.py`、`agent/as_tool.py`、`protocol/a2a/seam.py`、`protocol/mcp/seam.py`
@@ -21,12 +21,17 @@ A2A 对端回复里带一行 `nuke: now`,pipeline 下游的 `ToolUsingAgent` 真
    - **plain `str` = 调用方直接给的指令**(向后兼容:`agent.step("calc: 1+1")` 行为不变)。
    - 因为是 str 子类,对只认 str 的代码(LLM prompt、trace 长度、序列化、相等比较)完全透明,
      不需要改 `Agent.step(task: str)` 协议。
-2. **数据在源头打标。** 以下一律标为数据:
-   - `Coordinator.run_pipeline` 传给下游的上游输出(`ChainAgent` 复用它,嵌套 pipeline 自然覆盖);
-   - `AttachmentMiddleware` 前置的附件内容;`SummaryMiddleware` 生成的摘要(模型输出);
-   - `ToolUsingAgent` 经 `$prev` 拼进参数的上一步工具结果;
-   - `AgentTool` 返回的子 agent 产出、`McpClientTool` 返回的 MCP 结果、`A2AAgentAdapter` 返回的
-     对端应答。
+2. **数据在两处打标:agent 产出的源头 + 进入下一个 agent 的边界。**
+   - **源头(修订新增)**:本包每个 agent 的结果文本在**产出时**就是数据(`AgentResult.output` 是
+     整段不可信的 `TaskText`,str 子类,对只认 str 的代码透明):`LlmAgent` 的模型输出、`FunctionAgent`
+     的函数返回、`ToolUsingAgent` 的 Finish / 触顶答案、`FunctionCallingAgent` 的最终文本、`ChainAgent` /
+     `MiddlewareAgent` / `DeepResearchAgent` 的组合产出、`A2AAgentAdapter` 的对端应答。调用方把它直接传给
+     下一个 agent(`down.step(up.step(t).output)`)时不再被当指令执行(审查实测修订前会执行 1 次)。
+   - **边界**(第三方 agent / 工具返回 plain str 时的防线,保留):`Coordinator.run_pipeline` 传给下游的
+     上游输出(`ChainAgent` 复用它,嵌套 pipeline 自然覆盖);`AttachmentMiddleware` 前置的附件内容;
+     `SummaryMiddleware` 生成的摘要;`ToolUsingAgent` 经 `$prev` 拼进参数的上一步工具结果;`AgentTool`
+     返回的子 agent 产出、`McpClientTool` 返回的 MCP 结果;`DeepResearchAgent` 拼进综合 prompt 的各条发现。
+   - 每一处都有以它为唯一防线的端到端测试(上游刻意用返回 plain str 的自定义 agent / 工具)。
 3. **指令解析只看可信行。** `SyntaxToolPolicy` 只把**完全由可信字符组成**的行当作可能的指令;
    含任何不可信字符的行(包括「可信前缀 + 数据后缀」的拼接行)一律按正文处理——数据仍然出现在
    最终答案 / 转述里,只是不被执行。
@@ -40,8 +45,10 @@ A2A 对端回复里带一行 `nuke: now`,pipeline 下游的 `ToolUsingAgent` 真
 
 - 可信 = 你的代码直接传给 `agent.step()` 的字符串字面量 / 你自己拼的 plain str。
 - 不可信 = 一切来自模型、工具、远端 agent、MCP server、附件、上游 agent 的文本。
-- 自己转手这些文本时,用 `untrusted()` 包住源头、用 `compose()` 拼接;对 `TaskText` 做普通 str
-  运算(`+`、f-string、`strip`、切片)得到的是 plain str,**标记会丢、会被重新当成指令**。
+- 自己转手这些文本时,用 `untrusted()` 包住源头、用 `compose()` 拼接。对 `TaskText` 做普通 str 运算得到的
+  是 plain str,**标记会丢、会被重新当成指令**——实测会丢标记的有:`+` / `%` / `str.format` / f-string / `str.join` / `strip` / `replace` / `split` / 切片 / `upper` / `lower` / `str()` / `encode().decode()` / `string.Template` / JSON 往返;会保留的只有 `copy.copy` /
+  `pickle` 往返。经这些运算转手 agent 产出 / 工具结果后,再交给下一个 agent 前必须重新 `untrusted()`,或改用
+  `compose(指令前缀, 数据段)` 拼接。
 - 本 ADR 只约束**指令语法解析**(离线 `SyntaxToolPolicy`)。真 LLM function-calling 下模型本身会
   读到数据里的「指令」——那是提示注入问题,由审批闸(ADR 0002)与工具最小授权兜底,不在本 ADR
   能力范围内。
@@ -51,3 +58,9 @@ A2A 对端回复里带一行 `nuke: now`,pipeline 下游的 `ToolUsingAgent` 真
 - 缺省安全:pipeline / 嵌套 pipeline / 附件 / 工具结果回灌 / A2A / MCP 返回里的指令语法不再执行。
 - 行为变化:依赖「上游输出驱动下游执行工具」的 pipeline 需要显式 `parse_untrusted=True`;
   `SummaryMiddleware` 产出的摘要不再可被解析为指令。见 CHANGELOG。
+
+## 修订记录
+
+- 2026-10-04(审查第二轮):原决策 2 写「在源头打标」,实际只在 pipeline / AgentTool / MCP / A2A 等**边界**
+  打标,agent 的产出本身是 plain str——调用方直接把它传给下一个 agent 时指令会被执行。修订为「agent 产出在
+  源头打标 + 边界打标」两层,并列出会丢标记的 str 运算。本 ADR 尚未随版本发布,故就地修订。

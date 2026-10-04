@@ -321,9 +321,11 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   `untrusted_spans`(不可信字符区间)。对只认 str 的代码完全透明。
 - `untrusted(text: str) -> TaskText`:把整段标为数据。`compose(*parts: str) -> str`:按序拼接并保留各段区间
   (全可信退回 plain str)。`lines_with_trust(text) -> list[tuple[str, bool]]`:按行给出是否完全可信。
-- 规则:plain str = 调用方直接给的**指令**;pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
-  `McpClientTool` / `A2AAgentAdapter` 的返回、`SummaryMiddleware` 的摘要都是**数据**。对 `TaskText` 做普通
-  str 运算(`+` / f-string / `strip` / 切片)得到 plain str,标记会丢——转手数据时用 `untrusted` / `compose`。
+- 规则:plain str = 调用方直接给的**指令**。**本包每个 agent 的 `AgentResult.output` 在产出时就是数据**
+  (整段不可信的 `TaskText`);pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` / `McpClientTool` /
+  `A2AAgentAdapter` 的返回、`SummaryMiddleware` 的摘要在边界再标一次(防第三方返回 plain str)。对 `TaskText`
+  做普通 str 运算得到 plain str,标记会丢——实测会丢的有 `+` / `%` / `str.format` / f-string / `str.join` / `strip` / `replace` / `split` / 切片 / `upper` / `lower` / `str()` / `encode().decode()` / `string.Template` / JSON 往返(`copy` / `pickle` 保留);转手数据时用
+  `untrusted` / `compose`。
 
 ---
 

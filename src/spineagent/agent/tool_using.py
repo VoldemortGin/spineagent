@@ -65,13 +65,16 @@ class ToolUsingAgent:
             action = self._policy.decide(task, tools=self._tool_names, history=tuple(history))
             if isinstance(action, Finish):
                 _emit_finish(trace, self._name, len(history), action.answer)
-                return AgentResult(self._name, action.answer, usage, artifacts=tuple(artifacts))
+                # 本 agent 的产出对调用方是数据(源头打标,ADR 0003)。
+                return AgentResult(
+                    self._name, untrusted(action.answer), usage, artifacts=tuple(artifacts)
+                )
             # ToolCall:已用满 max_steps 次工具调用,policy 还想再调 -> 触顶强制收尾。
             if len(history) >= self._max_steps:
                 answer = (history[-1].output if history else "") or _NO_OUTPUT
                 _emit_step_limit(trace, self._name, self._max_steps)
                 _emit_finish(trace, self._name, len(history), answer)
-                return AgentResult(self._name, answer, usage, artifacts=tuple(artifacts))
+                return AgentResult(self._name, untrusted(answer), usage, artifacts=tuple(artifacts))
             # 把 $prev 替换为上一步观测输出后执行该工具,观测追加进历史。
             arg = _splice_prev(action.arg, history[-1].output if history else "")
             # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
