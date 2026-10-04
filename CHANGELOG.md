@@ -27,6 +27,12 @@
 - 同一轮内不重放副作用:`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls 里有任何受审批调用未获批则整轮
   不执行。挂起后重跑 run 是**至少一次**语义(此前已执行过的工具会再次执行,库不复用任何跨 run 的结果);不想重跑用
   不中断模式 `on_approval="feed_back"`。
+- `raise` 模式下多轮多审批会指数重跑(N 个受审批调用分布在 N 轮:批 2^N−1 次、首个动作执行 2^(N−1) 次;
+  `run_parallel` 非 resilient 同理)。缺省仍为 `raise`(评估后不改:现有契约 / conformance 断言「未批准抛错」,改缺省会
+  让不读 `held_approvals` 的调用方把「没执行」当成功),但:`ManualApprovalGate` 记录每个 request id 已核销的次数(有界
+  `max_decided` / 短 TTL `decided_ttl`),重新登记的待审请求带 `ApprovalRequest.prior_executions` 并在 `preview` 首行注明,
+  `ApprovalPending` 的消息与 `context["prior_executions"]` 提示「多个受审批调用的流程请使用 `on_approval="feed_back"`」。
+  这类流程**必须**用 `feed_back`(每个动作恰好执行一次);`run_parallel` 审批场景用 `feed_back` 或 `resilient=True`。
 - `InProcessSandbox`:消除热路径上被 beartype claw 每次调用重新装饰的嵌套函数(大 env 求值从秒级
   降到毫秒级);`timeout` 作为协作式 deadline 在节点之间检查(超时判 `limit_exceeded`)。注:这一条
   **不能**中断单个内建调用,单次求值的代价上界见下两条。

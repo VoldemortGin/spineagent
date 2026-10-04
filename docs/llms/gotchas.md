@@ -148,6 +148,23 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
   只有 `require_approval(tool, gate)`(绑在工具对象上)可靠;若必须用中间件,在起线程处用
   `pool.submit(bind_context(agent.step), task)` 把当前上下文带过去。自定义执行工具的 agent 要调 `enforce_tool_approval`。
 
+## 12a) 多个受审批调用分布在多轮:`raise` 模式会指数重跑,必须用 `feed_back`
+
+`on_approval="raise"`(缺省)遇到待审就抛 `ApprovalPending`,批准后**整个 run 重跑**;一次性批准被核销后,下一跑里
+此前已执行的受审批调用会重新挂起。所以一个 run 里有 N 个受审批调用分布在 N 轮时,要批 2^N−1 次,第一个动作被执行
+2^(N−1) 次(N=4:批 15 次、执行 8 次),且每次需要再批的请求与已执行过的那条 request id 相同——这是**至少一次**语义的
+最坏形态,不是放行漏洞(每次执行都有一次批准),但缺省模式在这种流程里不可用。
+
+- **何时必须 `on_approval="feed_back"`**:一个 run 里有 ≥2 个受审批调用且不在同一轮。`feed_back` 下挂起 / 拒绝作为
+  tool 结果喂回模型、run 正常结束,没有重跑;每个动作恰好执行一次、N 个动作批 N 次(从 `result.held_approvals` 取请求,
+  批准后由下一个任务执行)。
+- 审批人看得出重复:重新登记的待审请求带 `ApprovalRequest.prior_executions`(此前已执行的次数,有界 / 短 TTL 的提示性
+  计数),`pending()` 的 `preview` 首行注明「此前已执行过 n 次」,`ApprovalPending` 的消息与
+  `context["prior_executions"]` 同样带出并提示改用 `feed_back`。
+- `Coordinator.run_parallel`(非 resilient):一个分支挂起即整批冒泡、未开始的兄弟分支被取消,审批人一次只看到一条,
+  批准后整批重跑、已获批的分支再执行一次。审批场景请让分支用 `on_approval="feed_back"`,或用 `resilient=True`
+  (分支各自跑完,挂起的带 error,不取消兄弟);分支内的工具应幂等。
+
 ## 13) 上游输出是数据,不是指令
 
 `Coordinator.run_pipeline` / `ChainAgent` 把上游输出以 `TaskText` 数据段传给下游;附件、`$prev` 回灌的

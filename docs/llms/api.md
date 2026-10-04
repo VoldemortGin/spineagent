@@ -63,7 +63,8 @@
   之前先预检整轮,有任何受审批调用未获批则整轮一个都不执行;`on_approval="feed_back"` 时本执行点的挂起 / 拒绝
   作为 tool 结果(`error: approval required [code=... request_id=...]`,不含作用域)喂回模型而不抛,同时记进
   `AgentResult.held_approvals`(每项 `{"code", "request_id", "scope", "tool"}`,给调用方完成审批)。`raise` 模式下
-  挂起后重跑整个 run 是**至少一次**语义:此前各轮已执行过的工具会再次执行(库不复用任何跨 run 的结果)。
+  挂起后重跑整个 run 是**至少一次**语义:此前各轮已执行过的工具会再次执行(库不复用任何跨 run 的结果);多个受审批调用分布在
+  N 轮时按 2^N 增长,此类流程**必须**用 `feed_back`(`ApprovalPending` 在同一请求第二次挂起时带 `context["prior_executions"]` 并提示)。
   一轮 tool_calls 超过 `max_tool_calls_per_turn` 时整轮不执行、不送审,每个调用喂回 `code=tool.too_many_calls`。
 - 工具失败:工具函数抛的 `Exception`(审批错误除外)归一成 tool 消息
   `error: tool failed [code=<code> type=<异常类型名>]` 喂回模型(`code` 为 CorespineError 的 code,否则
@@ -376,7 +377,8 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   定位摘要(code / id / 工具名 / schema 指纹 / 计数 / 作用域)+ 给审批人的内容。`canonical_arguments` 是完整规范化参数
   (键排序紧凑 JSON,正是 `id` 所哈希的内容),`arguments() -> dict` 解析出一份新 dict——**审批人据完整参数做决定**。
   `preview` 是列表展示用的 `(键, 值文本)` 元组:缺省不打码;长值只截断一次,注明「省略 N 字符」与该值的 sha256 前缀。
-  `canonical_arguments` / `preview` 不进 `repr` / trace;`preview` 不参与相等比较。
+  `canonical_arguments` / `preview` 不进 `repr` / trace;`preview` 不参与相等比较。`prior_executions: int = 0`:门登记这条待审请求时,
+  同一 request id 此前已被核销(执行)的次数(不进 id、不参与相等比较);>0 时 `preview` 首行注明「此前已执行过 n 次」。
 - `make_approval_request(code, tool, arguments=None, *, nonce="", bind_values=False, scope="", sensitive_args=()) -> ApprovalRequest`:
   `bind_values=True` 时把完整规范化参数的 sha256 折进 `id`(参数一变即新请求);`scope` 折进 `id`;`sensitive_args`
   声明 preview 里要打码的参数路径(点号穿过 dict,如 `"password"`、`"body.to_token"`;显示为 `***(sha256:<前缀>)`)。
@@ -385,13 +387,14 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   抛异常,这次批准也已用掉)。可核销的门会产生需要人工决议的待审请求,**必须有显式作用域**。
 - `AutoApprovalGate(*, allow=(), deny=(), default=Decision.APPROVED)`:工具名 glob 策略表,deny > allow > default,
   永不 pending;不可核销(常驻策略放行);不需要作用域。
-- `ManualApprovalGate(*, token_store=None, max_requests=1024, max_pending_per_scope=64, request_ttl=3600.0, now_fn=time.monotonic)`:
+- `ManualApprovalGate(*, token_store=None, max_requests=1024, max_pending_per_scope=64, request_ttl=3600.0, max_decided=4096, decided_ttl=600.0, now_fn=time.monotonic)`:
   `review` 登记待审;每个作用域最多 `max_pending_per_scope` 条待审、全表最多 `max_requests` 条,到上限时**拒绝新请求**
   (抛 `ApprovalGateError`,fail-closed),绝不淘汰既有的待审 / 已批准条目。`resolve(request_id, decision, *, uses=1,
   ttl_seconds=None) -> str` 只接受**已登记、未过期**的请求(否则 `UnknownApprovalRequest`),返回一次性 resume token;
   `uses=1` 缺省只放行一次、`uses=N` 放行 N 次、`uses=None` 为显式可选的幂等模式(有效期内不限次,有重放风险);
   `consume(request) -> bool`(请求须与登记时逐字段相等,含完整参数);`redeem(token) -> ResumeTicket`(重放抛
-  `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`(带完整参数与 preview)。
+  `InvalidResumeToken`);`pending() -> list[ApprovalRequest]`(带完整参数与 preview);`executed_count(request_id) -> int`(此前已核销次数,
+  `max_decided` 条 / `decided_ttl` 秒的有界提示性计数,超出丢最早的)。
 - `ResumeTokenStore` / `InMemoryResumeTokenStore(*, max_tokens=1024, ttl=3600.0, now_fn=time.monotonic)` /
   `ResumeTicket(request_id, decision)`:ticket 只是 resume 句柄,不是执行凭据;批准在执行点核销,重放 ticket 不会多执行。
   token 存储有界(超出时最早签发的未兑现 token 失效)、过期、加锁,兑现即删除。

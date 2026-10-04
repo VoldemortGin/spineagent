@@ -146,6 +146,29 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
      继续,状态只在调用方手里):`Agent.step` 协议没有续跑通道,而挂起可以发生在嵌套 agent 里(`AgentTool` /
      `ChainAgent` / `run_parallel` / `DeepResearchAgent` / 工具函数里的子 agent),只在最内层 `FunctionCallingAgent`
      保存进度无法恢复外层的进度;要让所有组合 agent 都可续跑是协议级改动。代价大,本轮不做。
+5b. **多轮多审批下 `raise` 模式的重跑放大(第四轮修订)。** 5a 的「至少一次」在多个受审批调用分布在 N 个不同轮次时
+   会指数放大:`raise` 模式遇到待审就抛、批准后整个 run 重跑,而每次批准只放行一次、已核销的受审批调用在下一跑里
+   重新挂起,所以要批 2^N−1 次、第一个动作被执行 2^(N−1) 次(N=4:批 15 次、执行 8 次);每次需要再批的请求与
+   已执行过的那条 request id 完全相同,审批人分不出这是第二次执行。`Coordinator.run_parallel`(非 resilient)同理:
+   一个分支挂起后未开始的兄弟分支被取消,审批人一次只看到一条,已批的分支每次重跑都再执行一次。这不是放行漏洞(每次
+   执行都有对应的一次批准),但在这种场景下缺省模式实际不可用且危险。决策:
+   - **让审批人看得出重复**:`ManualApprovalGate` 记录每个 request id 已被核销的次数(有界表,`max_decided` 条、
+     `decided_ttl` 秒,超出丢最早的——只是提示性计数,丢了不影响安全),重新登记待审请求时把它写进
+     `ApprovalRequest.prior_executions`(不进 id、不参与核销时的逐字段比较),并在 `preview` 首行如实注明「此前已
+     执行过 n 次」;`ApprovalPending` 的消息与 `context["prior_executions"]` 同样带出,并提示「多个受审批调用的流程
+     请使用 `on_approval='feed_back'`」。门以可选方法 `executed_count(request_id)` 向执行闸提供计数,第三方门不提供时
+     只是没有这条提示。不重新引入任何跨 run 的结果缓存。
+   - **缺省模式仍是 `raise`(评估后不改成 `feed_back`)**:①`raise` 是 ADR 0001 起的契约,`ApprovalMiddleware` /
+     conformance 的 10 个执行形态都断言「未批准 -> 抛 `ApprovalPending` / `ApprovalRejected`」;改缺省等于让所有
+     不读 `held_approvals` 的现有调用方把「没执行」当成功(run 正常结束、模型收到一句「需要审批」就继续编下去)——
+     从「显式失败」变成「静默没做」,对安全闸是更坏的默认。②`feed_back` 把**拒绝**也喂回模型,模型可换个说法再试,
+     是调用方需要显式接受的语义。③单动作 / 单轮(最常见)的流程在 `raise` 下没有任何放大。所以缺省不动,用提示 +
+     文档把「何时必须 `feed_back`」讲清:**一个 run 里有 ≥2 个受审批调用且分布在不同轮次时,用 `on_approval="feed_back"`**
+     (每个动作恰好执行一次,N 个动作批 N 次)。
+   - **`run_parallel`(非 resilient)**:一个分支抛 `ApprovalPending` 即整批冒泡、其余分支被取消,批准后整批重跑,已
+     获批的分支再执行一次。审批场景请用分支内部的 `FunctionCallingAgent(on_approval="feed_back")`(各分支都不抛,审批人
+     一次看到全部待审请求,批准后下一个任务各执行一次),或 `resilient=True`(分支各自跑完、挂起的分支带 error,不取消
+     兄弟);并让分支内的工具幂等。
 6. **fail-closed。** 作用域里有受审批工具时:gate.review 抛任何 `Exception`、或返回非 `Decision`,
    一律抛 `ApprovalGateError`(code `approval.gate_error`),工具不执行。未配置审批(无作用域、
    `gated_tools` 为空)时执行点只读一次 contextvar 即返回,行为与修复前完全一致。
@@ -184,8 +207,9 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
   参数保密手段。(完整参数本来就给审批人看,见决策 4。)
 - 作用域唯一性由调用方保证:两个调用方误用同一个作用域字符串时,「同工具 + 同参数」的调用共用同一个请求与批准
   (库无从区分);不同参数的调用仍各自需要批准。
-- 挂起后重跑是至少一次语义(决策 5a):一个 run 里有多个受审批调用分布在不同轮次时,`raise` 模式下每次重跑都会把
-  此前已执行、已核销的受审批调用重新挂起(需要再批一次,且批准后会再执行一次)。这类多动作流程用 `feed_back` 模式。
+- 挂起后重跑是至少一次语义(决策 5a / 5b):一个 run 里有多个受审批调用分布在不同轮次时,`raise` 模式下每次重跑都会把
+  此前已执行、已核销的受审批调用重新挂起(需要再批一次,且批准后会再执行一次),总量按 2^N 增长。这类多动作流程
+  **必须**用 `feed_back` 模式;`prior_executions` 只是让审批人看得出重复,不是修复。
 - 按名字 gate 对别名注册不设防;推断不了工具清单的不透明 agent 只能检测「近似名」写错,完全写错
   的名字(如把 `delete_file` 写成 `rm`)在不透明 agent 下仍无法发现——用 `require_approval`。
 
@@ -213,3 +237,6 @@ ADR 0001 的 `ApprovalMiddleware` 在 `before_step` 里只看 `ctx.tools`(本步
   「审批人看得到要批准的完整内容」):审批人拿到完整规范化参数,打码改为显式声明。另:请求表满时拒绝新请求而非
   淘汰别人的、token 存储有界、删除 ticket 作用域旁表、找不到的受审批名降级为一次性警告(`strict_names=True` 可选
   严格)、每次受审批调用恰好一条 `mw_approval` trace。
+- 2026-10-04(复审第四轮,首条):新增决策 5b——`raise` 模式多轮多审批的 2^N 放大:门记录已核销次数、重新登记的待审
+  请求带 `prior_executions`(preview 与 `ApprovalPending` 同步体现);缺省模式保持 `raise` 并写明理由;`run_parallel`
+  的建议。

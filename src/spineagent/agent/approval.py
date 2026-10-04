@@ -137,6 +137,9 @@ class ApprovalConfigError(ApprovalError, ValueError):
     code = "approval.config_error"
 
 
+# preview 首行的标记键:门在重新登记已执行过的请求时写入(见 ApprovalRequest.prior_executions)。
+PRIOR_EXECUTIONS_KEY = "<prior_executions>"
+
 _PENDING_MESSAGE = (
     "审批待定:受审批工具调用待人类拍板。批准后在同一作用域里重跑本 run 时,此前已执行过的工具会再次执行"
     "(至少一次语义;工具应幂等,或改用 on_approval='feed_back')"
@@ -160,7 +163,10 @@ class ApprovalRequest:
     - canonical_arguments:完整规范化参数(键排序紧凑 JSON,非 JSON 值退回 repr)——正是 id 所哈希的内容。
       审批人据它(`arguments()`)做决定;
     - preview:列表展示用的预览((键, 值文本) 元组;长值截断一次并如实注明省略的字符数与该值的摘要前缀;
-      只对调用方显式声明的敏感参数打码)。审批人不应只凭 preview 做决定。
+      只对调用方显式声明的敏感参数打码)。审批人不应只凭 preview 做决定;
+    - prior_executions:门登记这条待审请求时,同一 request id 此前已被核销(即已执行)的次数(只是计数,不进 id、
+      不参与核销时的逐字段比较)。>0 说明这是「已执行过的调用被重新挂起」(raise 模式重跑 / 一次性批准已用掉),
+      审批人据此分得清「第一次」与「再执行一次」;门在登记时写入,并在 preview 首行如实注明。
 
     canonical_arguments 与 preview 只经审批接口(gate.review / ManualApprovalGate.pending)给审批人:不进 repr、
     不进 trace / 日志(trace 只记 code / 计数 / 决议,见 docs/adr/0002)。
@@ -174,6 +180,7 @@ class ApprovalRequest:
     scope: str = field(default="", repr=False)
     canonical_arguments: str = field(default="", repr=False)
     preview: tuple[tuple[str, str], ...] = field(default=(), repr=False, compare=False)
+    prior_executions: int = field(default=0, compare=False)
 
     def arguments(self) -> dict[str, Any]:
         """完整规范化参数(每次返回新 dict;未打码——审批人据它决定放不放行)。"""
@@ -290,6 +297,12 @@ def make_approval_request(
         canonical_arguments=canonical,
         preview=_build_preview(args, sensitive_args),
     )
+
+
+def _with_prior_executions(request: ApprovalRequest, prior: int) -> ApprovalRequest:
+    """登记「此前已执行过 prior 次」的请求:带上计数,并在 preview 首行如实注明。"""
+    note = (PRIOR_EXECUTIONS_KEY, f"此前已执行过 {prior} 次(这是再执行一次,不是第一次)")
+    return replace(request, prior_executions=prior, preview=(note, *request.preview))
 
 
 # ---- ApprovalGate 协议 ------------------------------------------------------------------------
@@ -457,6 +470,9 @@ class AutoApprovalGate:
 _DEFAULT_MAX_REQUESTS = 1_024
 _DEFAULT_MAX_PENDING_PER_SCOPE = 64
 _DEFAULT_REQUEST_TTL = 3_600.0
+# 已核销次数表的上限(条数)与存活期(秒):只服务于「审批人可见的重复提示」,有界、较短 TTL,丢了不影响安全。
+_DEFAULT_MAX_DECIDED = 4_096
+_DEFAULT_DECIDED_TTL = 600.0
 
 
 @dataclass
@@ -495,8 +511,14 @@ class ManualApprovalGate:
         max_requests: int = _DEFAULT_MAX_REQUESTS,
         max_pending_per_scope: int = _DEFAULT_MAX_PENDING_PER_SCOPE,
         request_ttl: float = _DEFAULT_REQUEST_TTL,
+        max_decided: int = _DEFAULT_MAX_DECIDED,
+        decided_ttl: float = _DEFAULT_DECIDED_TTL,
         now_fn: Callable[[], float] = time.monotonic,
     ) -> None:
+        if max_decided < 1 or decided_ttl <= 0:
+            raise ValueError(
+                f"max_decided 必须 ≥ 1、decided_ttl 必须为正:{max_decided} / {decided_ttl}"
+            )
         if max_requests < 1 or max_pending_per_scope < 1:
             raise ValueError(
                 f"max_requests / max_pending_per_scope 必须 ≥ 1:{max_requests} / {max_pending_per_scope}"
@@ -508,8 +530,30 @@ class ManualApprovalGate:
         self._max_requests = max_requests
         self._max_pending_per_scope = max_pending_per_scope
         self._request_ttl = request_ttl
+        self._max_decided = max_decided
+        self._decided_ttl = decided_ttl
+        # request id -> (已核销次数, 过期时刻);有界(超出丢最早的)、较短 TTL。
+        self._executed: dict[str, tuple[int, float]] = {}
         self._now = now_fn
         self._lock = threading.Lock()
+
+    def _executed_count(self, request_id: str, now: float) -> int:
+        entry = self._executed.get(request_id)
+        if entry is None or now >= entry[1]:
+            return 0
+        return entry[0]
+
+    def _note_execution(self, request_id: str, now: float) -> None:
+        count = self._executed_count(request_id, now) + 1
+        self._executed.pop(request_id, None)
+        self._executed[request_id] = (count, now + self._decided_ttl)
+        while len(self._executed) > self._max_decided:
+            del self._executed[next(iter(self._executed))]  # 插入序:最早的
+
+    def executed_count(self, request_id: str) -> int:
+        """该 request id 此前被核销(执行)过的次数(有界 / 短 TTL 的提示性计数,供执行闸与审批 UI 使用)。"""
+        with self._lock:
+            return self._executed_count(request_id, self._now())
 
     def _live(self, request_id: str, now: float) -> _RequestRecord | None:
         record = self._records.get(request_id)
@@ -544,6 +588,9 @@ class ManualApprovalGate:
             record = self._live(request.id, now)
             if record is None:
                 self._admit(request, now)
+                prior = self._executed_count(request.id, now)
+                if prior:
+                    request = _with_prior_executions(request, prior)
                 self._records[request.id] = _RequestRecord(
                     request=request, expires=now + self._request_ttl
                 )
@@ -561,6 +608,7 @@ class ManualApprovalGate:
                 or record.request != request
             ):
                 return False
+            self._note_execution(request.id, self._now())
             if record.uses_left is not None:
                 record.uses_left -= 1
                 if record.uses_left <= 0:
@@ -825,12 +873,33 @@ class _ApprovalGuard:
                 tool=tool,
                 scope=request.scope,
             )
+        prior = self._prior_executions(request.id)
+        if prior:
+            raise ApprovalPending(
+                f"{_PENDING_MESSAGE}。该调用此前已执行过 {prior} 次;多个受审批调用的流程请使用 "
+                "on_approval='feed_back'",
+                request_id=request.id,
+                tool=tool,
+                scope=request.scope,
+                prior_executions=prior,
+            )
         raise ApprovalPending(
             _PENDING_MESSAGE,
             request_id=request.id,
             tool=tool,
             scope=request.scope,
         )
+
+    def _prior_executions(self, request_id: str) -> int:
+        """门若提供 executed_count(如 ManualApprovalGate),取该请求此前已执行的次数;取不到按 0(提示而已)。"""
+        counter = getattr(self.gate, "executed_count", None)
+        if not callable(counter):
+            return 0
+        try:
+            count = counter(request_id)
+        except Exception:  # noqa: BLE001 —— 只是提示,绝不因它改变放行结果
+            return 0
+        return count if isinstance(count, int) and count > 0 else 0
 
     def _emit(self, decision: Decision) -> None:
         # 隐私:只记 code / 计数 / 决议,绝不记参数正文或预览。
