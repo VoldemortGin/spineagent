@@ -49,10 +49,13 @@
 - `FunctionCallingAgent` / `ToolUsingAgent` / `DeepResearchAgent` 传入重名工具时构造即抛
   `ValueError`,不再静默覆盖。
 
-- `FailoverProvider` / `StreamingFailoverProvider`:不可重试错(`NonRetryableProviderError`,
-  4xx 坏请求)不再打遍整个池子并冷却全部下游,而是直接抛给调用方;游标 / 冷却表加锁。
-- 各适配器按 vendor 状态码设 `retryable`:400 / 413 / 422 → `NonRetryableProviderError`;
-  其余(网络 / 超时 / 408 / 429 / 5xx / 鉴权类)→ `ProviderError(retryable=True)`。
+- `FailoverProvider` / `StreamingFailoverProvider`:回退与冷却按错误分类,且分类函数可注入
+  (`failover_policy`,缺省 `default_failover_policy`)。`retryable` 只表示「对同一家重试有无意义」,与「换一家
+  是否可能成功」分开:余额不足 / 配额 / 鉴权 / 模型不存在(含以 400 返回的)回退并**只冷却出错的那一家**;上下文
+  超长与无法判定的 4xx 回退但不冷却(同一条坏请求不会把全池冷却);确知畸形的请求(`BadRequestProviderError`)
+  不回退、不冷却。游标 / 冷却表加锁。
+- 各适配器按 vendor 状态码设 `retryable`:非瞬时 4xx(400 / 401 / 403 / 404 / 413 / 422 …)→
+  `NonRetryableProviderError`(`retryable=False`);网络 / 超时 / 408 / 425 / 429 / 5xx → `ProviderError(retryable=True)`。
 - `MiddlewareAgent` 步序取号加锁,多线程共享时不重号。
 - usage 不再丢失:`FunctionCallingAgent` 多轮累加;`ChainAgent` 累加各段 usage 并拼接 artifacts;
   `AgentTool` 经 `ToolResult` 透传子 agent 的 usage / artifacts,`ToolUsingAgent` 汇总。
@@ -78,7 +81,9 @@
   `ToolExecutionHarness.run(scope=...)`。
 - `ApprovalGateError`(code `approval.gate_error`)、`enforce_tool_approval`、`require_approval`、
   `make_approval_request(..., bind_values=True)`、`StepContext.cleanups`。
-- `spineagent.llm.errors.NonRetryableProviderError` / `provider_error_from`;
+- `spineagent.llm.errors.NonRetryableProviderError` / `BadRequestProviderError` / `provider_error_from`;
+  `spineagent.llm.failover_provider.FailoverDecision` / `default_failover_policy`、
+  `FailoverProvider(failover_policy=...)` / `make_failover_provider(failover_policy=...)`;
   `spineagent.agent.agent.merge_usage`;`ToolResult.usage` / `ToolResult.artifacts`(可选字段)。
 - `Coordinator.run_parallel(timeout=..., task_timeout=..., clock=...)`、`AgentTimeoutError`。
 - `A2AAgentAdapter(name=...)`;conformance `TOOL_TRACE_INVARIANTS`(未知工具名不进 trace);
@@ -139,8 +144,11 @@
 - `FunctionCallingAgent` 缺省不再让工具异常冒泡(需要旧行为传 `fail_fast=True`)。
 - `McpClientTool` 缺结果键时抛 `McpProtocolError` 而非 `KeyError`。
 - 重名工具从「后者静默覆盖前者」变为构造期 `ValueError`。
-- 适配器抛出的 `ProviderError` 现在带 `retryable=True`(此前为类默认 False);坏请求改抛子类
-  `NonRetryableProviderError`(仍是 `ProviderError`),`FailoverProvider` 对它不回退。
+- 适配器抛出的 `ProviderError` 现在带 `retryable=True`(此前为类默认 False);非瞬时 4xx 改抛子类
+  `NonRetryableProviderError`(仍是 `ProviderError`,code `provider.non_retryable`)。**failover 分类变化**:
+  HTTP 400 / 413 / 422 不再一律「不回退」——缺省会回退到下一家(余额 / 配额类还会冷却出错的那一家);401 / 403 /
+  404 的 `retryable` 由 True 改为 False(仍会回退,并冷却出错的那一家)。只有 `BadRequestProviderError`(code
+  `provider.bad_request`)不回退;依赖「400 直接上抛」的调用方改抛 / 改判它,或注入 `failover_policy`。
 - `FunctionCallingAgent` 的 `usage` 由「末轮」改为「各轮累加」。
 - `SyntaxToolPolicy` 缺省不再解析被标为数据的文本:依赖「pipeline 上游输出驱动下游执行工具」的
   调用方需显式 `SyntaxToolPolicy(parse_untrusted=True)`;`SummaryMiddleware` 的摘要也属数据。

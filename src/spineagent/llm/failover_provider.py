@@ -13,11 +13,20 @@
       冷却中的(它们也许已自愈);若连强制这轮也全失败,抛 `FailoverExhaustedError` 聚合错误,
       逐个列出下游失败原因——但【绝不含 API key / 凭据】(经 `_redact_credentials` 脱敏)。
 
-【只对可重试错回退,绝不吞逻辑错】:catch 的是显式的 `retryable_errors`(默认 ProviderError),
+【只对 provider 故障回退,绝不吞逻辑错】:catch 的是显式的 `retryable_errors`(默认 ProviderError),
 【不】用裸 `except Exception`。KeyError / TypeError 等程序 bug 照常上抛、立即失败,绝不被容错外衣
-掩盖成「换一家再试」——那只会把真正的代码缺陷藏进重试噪声里。适配器判定为坏请求的
-`NonRetryableProviderError`(4xx 坏请求)同样【不回退、不冷却】,直接抛给调用方:换哪家都一样失败,
-回退只会把一条坏请求打遍整个池子并把健康下游全部冷却。
+掩盖成「换一家再试」——那只会把真正的代码缺陷藏进重试噪声里。
+
+【回退与冷却按错误分类,且分类可注入】`retryable`(对同一家重试有无意义)与「换另一家是否可能成功」
+是两个问题。每个被接住的错误交给 `failover_policy`(缺省 `default_failover_policy`)给出
+`FailoverDecision(fallback, cooldown)`:
+  - 瞬时故障(网络 / 超时 / 408 / 425 / 429 / 5xx)-> 回退 + 冷却出错的这一家;
+  - 与具体 provider 相关、对这一家持续失效的拒绝(401 / 402 / 403 / 404、余额 / 配额 / 计费 / 模型不存在)
+    -> 不对同一家重试,回退到下一家,【只冷却出错的那一家】;
+  - 上下文超长、以及无法确定是否与 provider 相关的 4xx -> 回退(宁可多试一家,也不在可恢复时停摆),
+    但不冷却——同一条请求在全池都失败时不会把整个池子冷却掉;
+  - 显式的 `BadRequestProviderError`(确知请求畸形)-> 不回退、不冷却,直接上抛。
+在没有真实 SDK 可核实各家错误码的前提下,缺省规则是保守的;需要不同取舍的调用方注入自己的分类函数。
 
 【线程安全】:游标与冷却表的读改写在一把锁内完成(DeepResearchAgent 等会跨线程共享 provider);
 下游调用本身在锁外进行,不串行化并发请求。
@@ -36,6 +45,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any, cast
 
 from corespine.llm.provider import (
@@ -45,7 +55,7 @@ from corespine.llm.provider import (
     StreamingLLMProvider,
 )
 
-from spineagent.llm.errors import NonRetryableProviderError, ProviderError
+from spineagent.llm.errors import BadRequestProviderError, NonRetryableProviderError, ProviderError
 
 # 冷却窗口默认时长(秒):某下游撞可重试错后,这段时间内的调用跳过它。30s 是限流/瞬时故障的
 # 常见恢复量级,既不会长到白白闲置一家、也不会短到刚冷却就又去打它。
@@ -69,6 +79,36 @@ def _redact_credentials(text: str) -> str:
     return text
 
 
+@dataclass(frozen=True)
+class FailoverDecision:
+    """对一次下游失败的处置:fallback = 是否换下一家;cooldown = 是否冷却出错的这一家。"""
+
+    fallback: bool
+    cooldown: bool
+
+
+# 与具体 provider 相关、对这一家持续失效的拒绝:换一家可能成功,且这一家短期内别再打。
+_PROVIDER_STATUS = frozenset({401, 402, 403, 404})
+_PROVIDER_HINT = re.compile(
+    r"(?i)(credit|balance|billing|quota|payment|insufficient|exceeded your|"
+    r"model[^.]{0,40}(not found|does not exist|not exist|unsupported|not supported)|"
+    r"unknown model|invalid model|no such model|api[ _-]?key|unauthori[sz]ed|permission)"
+)
+
+
+def default_failover_policy(exc: BaseException) -> FailoverDecision:
+    """缺省分类(保守):见模块 docstring 的规则表。可经 FailoverProvider(failover_policy=...) 替换。"""
+    if isinstance(exc, BadRequestProviderError):
+        return FailoverDecision(fallback=False, cooldown=False)
+    if isinstance(exc, NonRetryableProviderError):
+        status = exc.context.get("status")
+        if status in _PROVIDER_STATUS or _PROVIDER_HINT.search(str(exc)):
+            return FailoverDecision(fallback=True, cooldown=True)
+        # 上下文超长 / 无法判定的 4xx:换一家试试,但不冷却(很可能是这条请求的问题)。
+        return FailoverDecision(fallback=True, cooldown=False)
+    return FailoverDecision(fallback=True, cooldown=True)
+
+
 class FailoverExhaustedError(ProviderError):
     """全部下游都失败(含强制回退)后抛出的聚合错误。
 
@@ -82,8 +122,9 @@ class FailoverProvider:
     """容错组合 LLMProvider:轮询分摊 + 失败冷却 + 全冷却时强制回退(见模块 docstring)。
 
     只实现非流式 `chat`(满足 corespine LLMProvider 协议);流式变体见 `StreamingFailoverProvider`。
-    构造须给非空下游列表;`cooldown_seconds` 配冷却时长,`retryable_errors` 配「哪些异常算可重试」
-    (默认仅 ProviderError),`now_fn` 注入时钟(默认 time.monotonic)以便确定性测试。
+    构造须给非空下游列表;`cooldown_seconds` 配冷却时长,`retryable_errors` 配「哪些异常交给回退
+    策略处置」(默认仅 ProviderError),`failover_policy` 配每个错误的回退 / 冷却决定(缺省
+    `default_failover_policy`),`now_fn` 注入时钟(默认 time.monotonic)以便确定性测试。
     """
 
     def __init__(
@@ -93,6 +134,7 @@ class FailoverProvider:
         cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
         retryable_errors: tuple[type[BaseException], ...] = (ProviderError,),
         now_fn: Callable[[], float] = time.monotonic,
+        failover_policy: Callable[[BaseException], FailoverDecision] = default_failover_policy,
     ) -> None:
         providers = tuple(providers)
         if not providers:
@@ -102,6 +144,7 @@ class FailoverProvider:
         self._providers = providers
         self._cooldown_seconds = cooldown_seconds
         self._retryable_errors = retryable_errors
+        self._policy = failover_policy
         self._now = now_fn
         # 每个下游的冷却截止时刻(now_fn 时间轴);<= now 视为可用。初始全 0(均可用)。
         self._cooldown_until = [0.0] * len(providers)
@@ -132,9 +175,13 @@ class FailoverProvider:
     def _on_failure(
         self, idx: int, exc: BaseException, now: float, failures: dict[int, str]
     ) -> None:
-        """某下游撞可重试错:记录(脱敏)原因并置其冷却截止时刻。"""
-        with self._lock:
-            self._cooldown_until[idx] = now + self._cooldown_seconds
+        """某下游失败:按回退策略决定是否上抛 / 冷却它;可回退时记录(脱敏)原因。"""
+        decision = self._policy(exc)
+        if not decision.fallback:
+            raise exc
+        if decision.cooldown:
+            with self._lock:
+                self._cooldown_until[idx] = now + self._cooldown_seconds
         label = type(self._providers[idx]).__name__
         failures[idx] = f"[{idx}] {label}: {_redact_credentials(str(exc))}"
 
@@ -150,16 +197,14 @@ class FailoverProvider:
     ) -> ChatCompletion:
         """按 `_attempt_order` 逐个下游试 chat;首个成功即返回,全失败则抛聚合错误。
 
-        只 catch `retryable_errors`(默认 ProviderError):可重试错 → 记录 + 冷却 + 试下一家;
-        坏请求(NonRetryableProviderError)与其它异常(逻辑 bug)照常上抛、立即失败,不冷却。
+        只 catch `retryable_errors`(默认 ProviderError),交给回退策略:可回退 → 记录(按需冷却)+ 试下一家;
+        不可回退(如 BadRequestProviderError)与其它异常(逻辑 bug)照常上抛、立即失败,不冷却。
         """
         now = self._now()
         failures: dict[int, str] = {}
         for idx in self._attempt_order(now):
             try:
                 result = self._providers[idx].chat(messages, tools=tools)
-            except NonRetryableProviderError:
-                raise
             except self._retryable_errors as exc:
                 self._on_failure(idx, exc, now, failures)
                 continue
@@ -196,8 +241,6 @@ class StreamingFailoverProvider(FailoverProvider):
             except StopIteration:  # 下游合法地吐了个空流:算成功,推进游标后正常结束
                 self._on_success(idx)
                 return
-            except NonRetryableProviderError:
-                raise
             except self._retryable_errors as exc:
                 self._on_failure(idx, exc, now, failures)
                 continue
@@ -214,6 +257,7 @@ def make_failover_provider(
     cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
     retryable_errors: tuple[type[BaseException], ...] = (ProviderError,),
     now_fn: Callable[[], float] = time.monotonic,
+    failover_policy: Callable[[BaseException], FailoverDecision] = default_failover_policy,
 ) -> FailoverProvider:
     """按下游能力【诚实地】选类:全下游支持流式 → StreamingFailoverProvider,否则 → FailoverProvider。
 
@@ -228,6 +272,7 @@ def make_failover_provider(
         "cooldown_seconds": cooldown_seconds,
         "retryable_errors": retryable_errors,
         "now_fn": now_fn,
+        "failover_policy": failover_policy,
     }
     if providers and all(isinstance(p, StreamingLLMProvider) for p in providers):
         return StreamingFailoverProvider(providers, **kwargs)

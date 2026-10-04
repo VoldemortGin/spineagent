@@ -160,10 +160,13 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
 `sorted(x)` 记 `len(x)` 单位)截住。要真正的抢占式超时,用 OS 级沙箱后端(子进程 / 容器)。`CalcTool` 拒绝超长(> 4096 字符)、过深(> 100 层)、超大幂 / 乘法结果的表达式,立即抛
 `ValueError`。
 
-## 16) failover 不会替坏请求「换一家再试」
+## 16) failover:「同一家重试」与「换一家」是两件事
 
-适配器把 HTTP 400 / 413 / 422 归一为 `NonRetryableProviderError`,`FailoverProvider` 直接上抛、不冷却任何下游;
-网络 / 超时 / 429 / 5xx / 鉴权类错误仍按可重试处理。自定义下游想表达「别重试」,抛 `NonRetryableProviderError`。
+`retryable=False`(`NonRetryableProviderError`,非瞬时 4xx)只表示别对**同一家**原样重试;余额不足 / 配额 /
+鉴权 / 模型不存在 / 上下文超长这类常以 400 返回的错误,换一家完全可能成功,所以 `FailoverProvider` 缺省会回退:
+与 provider 相关且持续失效的(401 / 402 / 403 / 404、余额 / 配额 / 计费 / 模型不存在)只冷却出错的那一家;上下文
+超长和无法判定的 4xx 回退但不冷却(同一条请求在全池失败时不会把整个池子冷却掉)。确知请求畸形、想表达
+「别回退」的下游抛 `BadRequestProviderError`;想换取舍就注入 `failover_policy`。
 
 ## 17) 重名工具直接报错
 

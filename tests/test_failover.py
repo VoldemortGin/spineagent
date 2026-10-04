@@ -15,7 +15,7 @@ from corespine.llm.provider import (
     StreamingLLMProvider,
 )
 
-from spineagent.llm.errors import NonRetryableProviderError, ProviderError
+from spineagent.llm.errors import BadRequestProviderError, NonRetryableProviderError, ProviderError
 from spineagent.llm.failover_provider import (
     FailoverExhaustedError,
     FailoverProvider,
@@ -261,24 +261,26 @@ def test_registry_builds_failover_from_config():
     assert fp.chat(_MSGS).choices[0].message.content, "经注册表装配的 failover 应可正常 chat"
 
 
-# ---- 不可重试错(4xx 坏请求)不回退、不冷却;适配器按状态码分类 -------------------------------
+# ---- 确知畸形的请求(BadRequestProviderError)不回退、不冷却;适配器按状态码分类 ----------------
+# 修复 5 改写:此前适配器把 400 一律归为「不回退」的 NonRetryableProviderError;现在 NonRetryable 只表示
+# 「对同一家重试无意义」,「不回退」由显式的 BadRequestProviderError 表达(见 default_failover_policy)。
 
 
 class _BadRequest:
-    """模拟一条坏请求:适配器会把 vendor 400 归一成不可重试的 ProviderError。"""
+    """模拟一条确知畸形的请求(下游显式判定)。"""
 
     def __init__(self) -> None:
         self.calls = 0
 
     def chat(self, messages, *, tools=None):
         self.calls += 1
-        raise NonRetryableProviderError("400 invalid request", status=400)
+        raise BadRequestProviderError("400 invalid request", status=400)
 
 
 def test_non_retryable_provider_error_is_raised_without_failover_or_cooldown():
     bad, a, b = _BadRequest(), _Recording("a"), _Recording("b")
     fp = FailoverProvider([bad, a, b], now_fn=_FakeClock())
-    with pytest.raises(NonRetryableProviderError):
+    with pytest.raises(BadRequestProviderError):
         fp.chat(_MSGS)
     assert (bad.calls, a.calls, b.calls) == (1, 0, 0), "坏请求不该打遍整个池子"
     assert all(t == 0.0 for t in fp._cooldown_until), "坏请求不该冷却任何下游"
@@ -288,13 +290,13 @@ def test_stream_non_retryable_error_is_raised_without_failover():
     class _BadStream(_BadRequest):
         def stream_chat(self, messages, *, tools=None):
             self.calls += 1
-            raise NonRetryableProviderError("400", status=400)
+            raise BadRequestProviderError("400", status=400)
             yield  # pragma: no cover
 
     bad = _BadStream()
     good = _BadStream()
     fp = StreamingFailoverProvider([bad, good], now_fn=_FakeClock())
-    with pytest.raises(NonRetryableProviderError):
+    with pytest.raises(BadRequestProviderError):
         list(fp.stream_chat(_MSGS))
     assert (bad.calls, good.calls) == (1, 0)
 
@@ -370,3 +372,159 @@ def test_concurrent_calls_share_state_safely():
     assert errors == []
     assert sum(d.calls for d in downstreams) == 8 * per_thread
     assert 0 <= fp._cursor < 3
+
+
+# ---- 修复 5:「对同一家重试有无意义」与「换一家是否可能成功」分开;只冷却出错的那一家 ----------------
+
+
+class _Raises:
+    """每次调用都抛给定的错误(记录被打次数)。"""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None):
+        self.calls += 1
+        raise self.exc
+
+
+def _nre(status: int, message: str) -> BaseException:
+    from spineagent.llm.errors import NonRetryableProviderError
+
+    return NonRetryableProviderError(message, status=status)
+
+
+@pytest.mark.parametrize(
+    ("label", "error", "falls_over", "cools_failed"),
+    [
+        ("余额不足(400)", lambda: _nre(400, "Your credit balance is too low"), True, True),
+        ("配额(400)", lambda: _nre(400, "insufficient_quota: billing"), True, True),
+        (
+            "上下文超长(400)",
+            lambda: _nre(400, "prompt is too long: maximum context length"),
+            True,
+            False,
+        ),
+        ("无法判定的 4xx", lambda: _nre(400, "unexpected field"), True, False),
+        ("413", lambda: _nre(413, "payload too large"), True, False),
+        ("401", lambda: _nre(401, "invalid x-api-key"), True, True),
+        ("403", lambda: _nre(403, "forbidden"), True, True),
+        ("404 模型不存在", lambda: _nre(404, "model not found"), True, True),
+        ("429", lambda: ProviderError("rate limited", retryable=True, status=429), True, True),
+        ("503", lambda: ProviderError("overloaded", retryable=True, status=503), True, True),
+    ],
+)
+def test_failover_classification_hits_and_cools(label, error, falls_over, cools_failed):
+    failing, healthy, spare = _Raises(error()), _Recording("b"), _Recording("c")
+    fp = FailoverProvider([failing, healthy, spare], now_fn=_FakeClock())
+    assert fp.chat(_MSGS).choices[0].message.content == "b", label
+    assert (failing.calls, healthy.calls, spare.calls) == (1, 1, 0)
+    assert (fp._cooldown_until[0] > 0) is cools_failed, f"{label}:只冷却出错的那一家"
+    assert fp._cooldown_until[1:] == [0.0, 0.0], "健康下游绝不被冷却"
+
+
+def test_explicit_bad_request_neither_falls_over_nor_cools():
+    from spineagent.llm.errors import BadRequestProviderError
+
+    failing, healthy = (
+        _Raises(BadRequestProviderError("schema invalid", status=400)),
+        _Recording("b"),
+    )
+    fp = FailoverProvider([failing, healthy], now_fn=_FakeClock())
+    with pytest.raises(BadRequestProviderError):
+        fp.chat(_MSGS)
+    assert (failing.calls, healthy.calls) == (1, 0)
+    assert fp._cooldown_until == [0.0, 0.0]
+
+
+def test_ambiguous_4xx_everywhere_exhausts_without_cooling_the_pool():
+    pool = [_Raises(_nre(400, "unexpected field")) for _ in range(3)]
+    fp = FailoverProvider(pool, now_fn=_FakeClock())
+    with pytest.raises(FailoverExhaustedError):
+        fp.chat(_MSGS)
+    assert [p.calls for p in pool] == [1, 1, 1]
+    assert fp._cooldown_until == [0.0, 0.0, 0.0], "无法判定的 4xx 不触发全池冷却"
+
+
+def test_failover_policy_is_injectable():
+    from spineagent.llm.failover_provider import FailoverDecision
+
+    failing, healthy = _Raises(_nre(401, "nope")), _Recording("b")
+    fp = FailoverProvider(
+        [failing, healthy],
+        now_fn=_FakeClock(),
+        failover_policy=lambda exc: FailoverDecision(fallback=False, cooldown=False),
+    )
+    with pytest.raises(ProviderError):
+        fp.chat(_MSGS)
+    assert healthy.calls == 0
+
+
+def test_stream_failover_uses_the_same_classification():
+    class _StreamRaises(_Raises):
+        def stream_chat(self, messages, *, tools=None):
+            self.calls += 1
+            raise self.exc
+            yield  # pragma: no cover
+
+    failing = _StreamRaises(_nre(400, "Your credit balance is too low"))
+    healthy = _StreamFlaky("b", fail=False)
+    fp = StreamingFailoverProvider([failing, healthy], now_fn=_FakeClock())
+    assert list(fp.stream_chat(_MSGS))
+    assert failing.calls == 1 and fp._cooldown_until[0] > 0
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (413, False),
+        (422, False),
+        (408, True),
+        (429, True),
+        (500, True),
+        (503, True),
+    ],
+)
+def test_adapter_retryable_means_same_provider_retry(status, retryable):
+    from types import SimpleNamespace
+
+    from spineagent.llm.errors import NonRetryableProviderError
+    from spineagent.llm.provider import OpenAICompatProvider
+
+    def create(**kwargs):
+        raise _StatusError(status)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with pytest.raises(ProviderError) as ei:
+        OpenAICompatProvider("m", client=client).chat(_MSGS)
+    assert ei.value.retryable is retryable
+    assert isinstance(ei.value, NonRetryableProviderError) is (not retryable)
+
+
+def test_adapter_400_credit_error_fails_over_to_a_healthy_provider_end_to_end():
+    from types import SimpleNamespace
+
+    from spineagent.llm.provider import OpenAICompatProvider
+
+    class _Credit(Exception):
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "Your credit balance is too low to access the API"
+
+    def create(**kwargs):
+        raise _Credit()
+
+    broke = OpenAICompatProvider(
+        "m",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))),
+    )
+    healthy = _Recording("b")
+    fp = FailoverProvider([broke, healthy], now_fn=_FakeClock())
+    assert fp.chat(_MSGS).choices[0].message.content == "b"
+    assert fp._cooldown_until[0] > 0 and fp._cooldown_until[1] == 0.0

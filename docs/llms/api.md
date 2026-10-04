@@ -280,18 +280,25 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
   Converse native → OpenAI `ChatCompletion`。extra `[bedrock]`。
 
 ### `class FailoverProvider` / `StreamingFailoverProvider` / `make_failover_provider`
-`FailoverProvider(providers: Sequence[LLMProvider], *, cooldown_seconds: float = 30.0, retryable_errors: tuple[type[BaseException], ...] = (ProviderError,), now_fn: Callable[[], float] = time.monotonic)`
-- 组合式容错 provider:包裹一组下游,做 (a) 轮询分摊 + (b) 撞可重试错后冷却窗口内跳过 +
+`FailoverProvider(providers: Sequence[LLMProvider], *, cooldown_seconds: float = 30.0, retryable_errors: tuple[type[BaseException], ...] = (ProviderError,), now_fn: Callable[[], float] = time.monotonic, failover_policy: Callable[[BaseException], FailoverDecision] = default_failover_policy)`
+- 组合式容错 provider:包裹一组下游,做 (a) 轮询分摊 + (b) 失败后按分类冷却出错的那一家 +
   (c) 全冷却时强制按序回退,全失败抛 `FailoverExhaustedError`(聚合各下游原因,经凭据脱敏,绝不含 key)。
-- 只 catch `retryable_errors`(默认 `ProviderError`);逻辑错(KeyError/ValueError…)照常上抛,不被吞。
-  `NonRetryableProviderError`(坏请求)**不回退、不冷却**,直接上抛。游标 / 冷却表加锁,可跨线程共享。
-- 不在顶层导出:`from spineagent.llm.failover_provider import FailoverProvider, make_failover_provider`。
+- 只 catch `retryable_errors`(默认 `ProviderError`),交给 `failover_policy` 给出
+  `FailoverDecision(fallback: bool, cooldown: bool)`;逻辑错(KeyError/ValueError…)照常上抛,不被吞。缺省
+  `default_failover_policy`(保守,可注入替换):瞬时故障(网络 / 超时 / 408 / 425 / 429 / 5xx)→ 回退 + 冷却该家;
+  401 / 402 / 403 / 404 或消息含余额 / 配额 / 计费 / 模型不存在 / 鉴权 → 回退 + **只冷却出错的那一家**;上下文超长
+  与其它无法判定的 4xx → 回退但**不冷却**(全池都失败也不会把池子冷却掉);`BadRequestProviderError` →
+  不回退、不冷却,直接上抛。游标 / 冷却表加锁,可跨线程共享。
+- 不在顶层导出:`from spineagent.llm.failover_provider import FailoverProvider, FailoverDecision, default_failover_policy, make_failover_provider`。
 
-### `ProviderError` / `NonRetryableProviderError` / `provider_error_from`
-- `ProviderError` 来自 corespine(顶层再导出)。各适配器经 `spineagent.llm.errors.provider_error_from(message, exc)`
-  归一 vendor 异常:HTTP 400 / 413 / 422 → `NonRetryableProviderError`(code `provider.bad_request`,
-  `retryable=False`);其余(网络 / 超时 / 408 / 429 / 5xx / 401 / 403 / 404 / 取不到状态码)→
-  `ProviderError(retryable=True)`。状态码进 `context["status"]`。
+### `ProviderError` / `NonRetryableProviderError` / `BadRequestProviderError` / `provider_error_from`
+- `ProviderError` 来自 corespine(顶层再导出)。`retryable` 只表示「对**同一家**重试有没有意义」;「换另一家
+  是否可能成功」由 `FailoverProvider` 的 `failover_policy` 决定。各适配器经
+  `spineagent.llm.errors.provider_error_from(message, exc)` 归一 vendor 异常:网络 / 超时 / 408 / 425 / 429 /
+  5xx / 取不到状态码 → `ProviderError(retryable=True)`;其余 4xx(400 / 401 / 403 / 404 / 413 / 422 …)→
+  `NonRetryableProviderError`(code `provider.non_retryable`,`retryable=False`)。状态码进 `context["status"]`。
+- `BadRequestProviderError(NonRetryableProviderError)`(code `provider.bad_request`):确知请求本身畸形、换谁都
+  不行——适配器**不会**自动判定出它(离线无法核实各家错误码,宁可多试一家),由确知的下游 / 自定义分类显式使用。
 - `make_failover_provider(providers, **kw) -> FailoverProvider`:诚实选类——【全下游都实现
   `StreamingLLMProvider`】才返回带 `stream_chat` 的 `StreamingFailoverProvider`,混编则返回不带
   `stream_chat` 的基类(`isinstance(p, StreamingLLMProvider)` 如实报 False)。`now_fn` 可注入以确定性测试冷却。

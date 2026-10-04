@@ -17,22 +17,39 @@ from __future__ import annotations
 
 from corespine import ProviderError
 
-__all__ = ["NonRetryableProviderError", "ProviderError", "provider_error_from"]
+__all__ = [
+    "BadRequestProviderError",
+    "NonRetryableProviderError",
+    "ProviderError",
+    "provider_error_from",
+]
 
-# 「请求本身有问题」的 4xx:换哪家 provider 重发都一样失败,重试 / 回退只会把坏请求打遍整个池子。
-# 401 / 403 / 404 不在此列——鉴权 / 模型名是【各家各自的配置】,换一家可能就好,仍按可重试处理。
-_NON_RETRYABLE_STATUS = frozenset({400, 413, 422})
+# 【两个不同的问题】retryable 只回答「对【同一个】provider 重试有没有意义」;「换【另一个】provider 是否
+# 可能成功」由 FailoverProvider 的分类函数(failover_provider.default_failover_policy,可注入)回答。
+# 瞬时故障:网络 / 超时 / 408 / 425 / 429 / 5xx —— 同一家稍后重试可能就好。
+_TRANSIENT_STATUS = frozenset({408, 425, 429})
 
 
 class NonRetryableProviderError(ProviderError):
-    """vendor 明确判定为坏请求的失败(retryable=False):FailoverProvider 不回退、不冷却,直接上抛。
+    """vendor 以非瞬时的 4xx 拒绝了这次请求(retryable=False):对【同一家】原样重试没有意义。
 
-    在本包内用子类表达「不可重试」,而不改 corespine:ProviderError 的类默认 retryable=False 被各处
-    当作「可回退的 provider 故障」使用,无法用它区分;子类让判定显式、可 isinstance。
+    换另一家是否可能成功是另一个问题:余额 / 配额 / 鉴权 / 模型不存在 / 上下文超长这类与具体 provider
+    相关的拒绝,换一家完全可能成功——FailoverProvider 缺省会回退(见 default_failover_policy)。
+    在本包内用子类表达,而不改 corespine 的 ProviderError。
+    """
+
+    code = "provider.non_retryable"
+    retryable = False
+
+
+class BadRequestProviderError(NonRetryableProviderError):
+    """请求本身畸形(如参数校验失败),换哪家都一样失败:FailoverProvider 不回退、不冷却,直接上抛。
+
+    适配器在无法核实各家错误码的前提下【不会】自动判定出它(宁可多试一家);确知请求畸形的下游 /
+    自定义分类函数显式使用它。
     """
 
     code = "provider.bad_request"
-    retryable = False
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -53,12 +70,13 @@ def _status_code(exc: BaseException) -> int | None:
 
 
 def provider_error_from(message: str, exc: BaseException) -> ProviderError:
-    """把 vendor 异常归一成 ProviderError,并按状态码标 retryable(坏请求 -> 不可重试子类)。
+    """把 vendor 异常归一成 ProviderError,retryable 只表示「对同一家重试是否有意义」。
 
-    网络 / 超时 / 5xx / 限流 / 取不到状态码 -> 可重试(retryable=True);400 / 413 / 422 ->
-    NonRetryableProviderError。消息沿用调用方给的文本,状态码进 context。
+    网络 / 超时 / 408 / 425 / 429 / 5xx / 取不到状态码 -> ProviderError(retryable=True);其余 4xx
+    (400 / 401 / 403 / 404 / 413 / 422 …)-> NonRetryableProviderError(retryable=False)。是否换一家由
+    FailoverProvider 的分类函数决定。消息沿用调用方给的文本,状态码进 context。
     """
     status = _status_code(exc)
-    if status in _NON_RETRYABLE_STATUS:
+    if status is not None and 400 <= status < 500 and status not in _TRANSIENT_STATUS:
         return NonRetryableProviderError(message, status=status)
     return ProviderError(message, retryable=True, status=status)
