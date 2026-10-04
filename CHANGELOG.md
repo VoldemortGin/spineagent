@@ -26,6 +26,10 @@
   `ManualApprovalGate.resolve` 只接受已登记、未过期的请求(不能离线算出 id 预先批准);请求表有上限与过期;
   `pending()` 的条目带脱敏 + 截断的参数预览(只给审批人,不进 trace);受审批工具名含通配符 / 对应不到已知工具 /
   与已注册工具仅大小写或分隔符不同时 fail-closed(`ApprovalConfigError`)。
+- 等待审批期间的重跑不再重放其它工具的副作用(ADR 0002 决策 5a):`ApprovalMiddleware` 的步内记账让因审批挂起而在
+  同一作用域重跑时复用已执行调用的结果(含并行分支);`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls
+  里有任何受审批调用未获批则整轮不执行;新增不中断模式 `on_approval="feed_back"` 与预检 API
+  `preflight_tool_approvals`。
 - 指令 / 数据分通道(ADR 0003):pipeline 上游输出、附件、`$prev` 回灌的工具结果、`AgentTool` /
   `McpClientTool` / `A2AAgentAdapter` 的返回都标为数据(`TaskText`),`SyntaxToolPolicy` 不再把其中的
   `<tool>: <arg>` 当指令执行。
@@ -59,6 +63,9 @@
 
 ### Added
 
+- 审批记账 / 预检:`ToolCallLedger` / `InMemoryToolCallLedger` / `RecordedCall` / `begin_tool_call`、
+  `preflight_tool_approvals`、`ApprovalMiddleware(ledger=)`、`FunctionCallingAgent(approve_before_execute=,
+  on_approval=)`。
 - 审批:`approval_scope` / `current_approval_scope`、`ConsumableApprovalGate`(`consume`)、`ApprovalConfigError`、
   `UnknownApprovalRequest`、`default_redactor` / `Redactor`、`ApprovalRequest.scope` / `.preview`、
   `ResumeTicket.scope`、`ManualApprovalGate(max_requests=, request_ttl=, now_fn=)` 与
@@ -113,6 +120,9 @@
   `UnknownApprovalRequest`(此前可预先批准)。`gated_tools` 含通配符、对应不到已知工具、与已注册工具仅大小写 /
   分隔符不同时抛 `ApprovalConfigError`(此前静默放行)。`ApprovalRequest` 新增 `scope` / `preview` 字段,
   请求 id 在设了作用域时随作用域变化;`ToolExecutionHarness.run` 新增 `scope` 关键字参数。
+- **`FunctionCallingAgent` 缺省「先审后行」**:同一轮 tool_calls 里有任何受审批调用未获批时,该轮其它(未受审批的)
+  工具也不执行(此前排在前面的会先执行);要旧行为传 `approve_before_execute=False`。在 `ApprovalMiddleware` 的步里
+  因审批挂起后在同一作用域重跑,已成功执行过的调用复用记录结果而不再执行(此前会重放)。
 - `InProcessSandbox.run(timeout=...)` / `Limits.timeout_seconds` 从「只记录」变为强制:求值超过
   timeout(缺省 `DEFAULT_LIMITS` 为 5 秒)判失败。
 - `InProcessSandbox` 新增拒绝规则:`round(x, n)` 要求 `|n|` ≤ 2467(`limit_exceeded`);`int(s)` 要求

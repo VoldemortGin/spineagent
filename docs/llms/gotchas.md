@@ -128,6 +128,10 @@ ragspine(或任意检索能力)包成一个实现了 `Tool`(`run(arg)->ToolResul
   建议用会话 id 显式传 `ApprovalMiddleware(scope=...)` / `approval_scope(...)`。
 - `ManualApprovalGate.resolve` 只接受已登记的待审请求(先 review 过);请求表有上限与过期。`pending()` 的条目带
   脱敏截断后的参数预览(`request.preview`),只给审批人看,不进 trace。
+- **重跑不重放**:在 `ApprovalMiddleware` 的步里因审批挂起后,同一作用域里重跑会复用已执行调用的结果(步内记账),
+  `send_email` 之类不会被再发一遍;`FunctionCallingAgent` 缺省**先审后行**——一轮 tool_calls 里有任何受审批调用
+  未获批,整轮一个都不执行(`approve_before_execute=False` 恢复逐个执行)。不想整步抛错就用
+  `on_approval="feed_back"` 把待审 / 被拒作为 tool 结果喂回模型。
 - `gated_tools` 必须写确切工具名:通配符直接报错;能推断工具清单时写错的名字也报错(`ApprovalConfigError`)。
   按名字 gate 挡不住「同一函数以别名注册」——安全场景用 `require_approval(tool, gate)` 绑在工具对象上。
 - 自己起线程跑 agent 时,中间件作用域不会自动跟过去(`Coordinator.run_parallel` 已处理);需要跨任意线程

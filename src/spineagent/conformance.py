@@ -704,26 +704,16 @@ def _changed_arguments_require_reapproval(harness: ToolExecutionHarness) -> None
 
 
 def _approval_is_consumed_once(harness: ToolExecutionHarness) -> None:
-    # 一次批准只放行【一次】匹配的工具调用:同一 run 里重复的同参调用、之后的重跑都要重新审批。
+    # 一次批准只放行【一次】匹配的工具调用:同一 run 里第二次同参调用要重新审批;在同一作用域里
+    # resume 时,已执行过的那次由步内记账复用(不再执行),第二次仍然挂起。
     counter, gate = _Counter(), ManualApprovalGate()
     tools = {"delete_file": counter}
-    first = _expect_approval_error(
-        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-a"
-    )
+    calls = [("delete_file", "/a"), ("delete_file", "/a")]
+    first = _expect_approval_error(harness, ApprovalPending, calls, tools, gate, scope="session-a")
     gate.resolve(str(first.context["request_id"]), Decision.APPROVED)
-    _expect_approval_error(
-        harness,
-        ApprovalPending,
-        [("delete_file", "/a"), ("delete_file", "/a")],
-        tools,
-        gate,
-        scope="session-a",
-    )
-    assert counter.calls == ["/a"], "一次批准只能执行一次"
-    _expect_approval_error(
-        harness, ApprovalPending, [("delete_file", "/a")], tools, gate, scope="session-a"
-    )
-    assert counter.calls == ["/a"], "批准核销后重跑必须重新审批"
+    for _ in range(2):
+        _expect_approval_error(harness, ApprovalPending, calls, tools, gate, scope="session-a")
+        assert counter.calls == ["/a"], "一次批准只能执行一次,重跑也不得多执行"
 
 
 def _approval_is_scope_bound(harness: ToolExecutionHarness) -> None:

@@ -51,11 +51,15 @@
 - 实现 `Agent` 协议,可直接进 `Coordinator` / `ChainAgent` / 被 `AgentTool` 包成工具。
 
 ### `class FunctionCallingAgent`
-`FunctionCallingAgent(name: str, model: LLMProvider, tools: Iterable[FunctionTool], *, system: str = "", max_steps: int = 8, fail_fast: bool = False, include_error_message: bool = False)`
+`FunctionCallingAgent(name: str, model: LLMProvider, tools: Iterable[FunctionTool], *, system: str = "", max_steps: int = 8, fail_fast: bool = False, include_error_message: bool = False, approve_before_execute: bool = True, on_approval: Literal["raise", "feed_back"] = "raise")`
 - `step(task, *, trace=None) -> AgentResult`:**真 LLM** 原生 function-calling 多步循环——把每个
   `FunctionTool.schema()` 喂给 `model.chat(messages, tools=...)`;模型回 `tool_calls` 则逐个
   `parse_arguments` 校验 → `enforce_tool_approval` 审批 → `invoke`、以 OpenAI `tool` 角色消息喂回、
   再 chat;无 tool_calls 则出文本收尾。触顶 `max_steps` 兜底非空。`usage` 为各轮累加。
+- 审批(ADR 0002 决策 5 / 5a):`approve_before_execute=True`(缺省)时**先审后行**——一轮 tool_calls 执行任何一个
+  之前先预检整轮,有任何受审批调用未获批则整轮一个都不执行;`on_approval="feed_back"` 时本执行点的挂起 / 拒绝
+  作为 tool 结果(`error: approval required [code=... request_id=...]`)喂回模型而不抛。处在 `ApprovalMiddleware`
+  的步里时,因审批挂起而在同一作用域重跑会复用已执行调用的记录结果(步内记账),不重放副作用。
 - 工具失败:工具函数抛的 `Exception`(审批错误除外)归一成 tool 消息
   `error: tool failed [code=<code> type=<异常类型名>]` 喂回模型(`code` 为 CorespineError 的 code,否则
   `tool.execution_failed`);`include_error_message=True` 才附异常消息原文;`fail_fast=True` 恢复冒泡。
@@ -357,11 +361,17 @@ fake / 真实 client 做离线单测;不注入则在构造时经对应 `load_*_s
 - `ResumeTokenStore` / `InMemoryResumeTokenStore` / `ResumeTicket(request_id, decision, scope="")`:ticket 只是 resume
   句柄(告诉你在哪个作用域重跑),不是执行凭据;批准在执行点核销,重放 ticket 不会多执行。
 - `approval_scope(scope: str)`(上下文管理器)/ `current_approval_scope() -> str | None`:设置 / 读取当前上下文的审批作用域。
-- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call", scope=None, redact=None)`:before_step 把审批配置与作用域
+- 步内记账:`ToolCallLedger`(Protocol:`lookup(scope, key)` / `record(scope, key, output)` / `discard(scope)`)、
+  `InMemoryToolCallLedger(*, max_scopes=256, max_entries=1024, ttl=3600.0, now_fn=time.monotonic)`;
+  `begin_tool_call(tool, arguments) -> RecordedCall`(执行点领取槽位:`replay` 非 None 时直接复用、不执行;成功后
+  `record(output)`)。只在带受审批工具的 `ApprovalMiddleware` 步里生效,且只对「因审批挂起而结束」的步保留。
+- `preflight_tool_approvals(calls: Sequence[tuple[str, Mapping, object | None]], *, available=()) -> list[ApprovalError | None]`:
+  执行前预检一批调用(只 review、不核销;待审的被登记),返回与输入对齐的「错误或 None」。
+- `ApprovalMiddleware(gate, *, gated_tools=(), code="tool_call", scope=None, redact=None, ledger=None)`:before_step 把审批配置与作用域
   压进当前上下文(`ctx.cleanups` 弹出);作用域内**每一次真实工具调用**都按「工具名 + 规范化参数 + 作用域」review 并核销。
   作用域:`scope=` > 外层 `approval_scope` > 缺省每次 step 新建(并传给嵌套 agent)。`gated_tools` 须是确切名字:含通配符 /
   空名在构造时抛 `ApprovalConfigError`;能推断被包裹 agent 的工具清单时,对应不到已知工具的名字在首个工具执行前抛
-  `ApprovalConfigError`。缺省 `gated_tools` 空 = 零行为变化。
+  `ApprovalConfigError`。缺省 `gated_tools` 空 = 零行为变化。`ledger` 缺省按审批门共享一份进程内记账。
 - `enforce_tool_approval(tool: str, arguments, *, target=None, available=()) -> None`:执行点在调用工具前调它;
   approved(并核销)返回,rejected 抛 `ApprovalRejected`,pending 抛 `ApprovalPending`(`context["request_id"]` /
   `context["scope"]`),门抛异常或返回非 `Decision` 抛 `ApprovalGateError`(fail-closed)。`target` = 被执行的工具对象

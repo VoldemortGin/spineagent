@@ -20,14 +20,22 @@ agent_step_limit——只记 code / 计数,绝不记任务 / 参数 / 输出正�
 """
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Literal
 
 from corespine.errors import CorespineError
 from corespine.llm.provider import LLMProvider
 from corespine.observability.trace import TraceSink
 
 from spineagent.agent.agent import AgentResult, merge_usage
-from spineagent.agent.approval import ApprovalError, enforce_tool_approval
+from spineagent.agent.approval import (
+    ApprovalError,
+    ApprovalPending,
+    ApprovalRejected,
+    RecordedCall,
+    begin_tool_call,
+    enforce_tool_approval,
+    preflight_tool_approvals,
+)
 from spineagent.tools.function_tool import FunctionTool, InvalidToolArguments
 from spineagent.tools.tool import index_tools_by_name
 
@@ -39,6 +47,12 @@ UNKNOWN_TOOL = "<unknown>"
 
 # 工具执行失败的稳定错误码(非 CorespineError 时使用;CorespineError 用它自己的 code)。
 TOOL_EXECUTION_FAILED = "tool.execution_failed"
+
+# 「先审后行」下同一轮里因别的调用待审而整轮未执行时,喂回给模型的文本。
+_BATCH_HELD = "error: not executed [code=approval.batch_held] 本轮有工具调用待审批,整轮未执行"
+
+# 一轮里一个待执行调用的规划:(tool_call, 本地工具或 None, 校验后的参数或 None, 失败文本或 None)。
+type _Planned = tuple[Any, FunctionTool | None, dict[str, Any] | None, str | None]
 
 
 class FunctionCallingAgent:
@@ -54,7 +68,11 @@ class FunctionCallingAgent:
         max_steps: int = 8,
         fail_fast: bool = False,
         include_error_message: bool = False,
+        approve_before_execute: bool = True,
+        on_approval: Literal["raise", "feed_back"] = "raise",
     ) -> None:
+        if on_approval not in ("raise", "feed_back"):
+            raise ValueError(f"on_approval 只接受 'raise' / 'feed_back',收到:{on_approval!r}")
         self._name = name
         self._model = model
         self._tools = index_tools_by_name(tools)
@@ -62,6 +80,8 @@ class FunctionCallingAgent:
         self._max_steps = max_steps
         self._fail_fast = fail_fast
         self._include_error_message = include_error_message
+        self._approve_before_execute = approve_before_execute
+        self._on_approval = on_approval
 
     @property
     def name(self) -> str:
@@ -100,29 +120,25 @@ class FunctionCallingAgent:
                     ],
                 }
             )
-            # 逐个执行工具,把结果以 tool 角色消息喂回(tool_call_id 对齐)。
-            for tc in tool_calls:
-                tool = self._tools.get(tc.function.name)
-                arguments = tc.function.arguments or "{}"
-                if tool is None:
-                    output = f"error: unknown tool {tc.function.name!r}"
+            planned = [self._plan(tc) for tc in tool_calls]
+            # 步内记账:为本轮每个有效调用领取槽位(因审批挂起而重跑时,已执行过的直接复用结果)。
+            slots = {
+                i: begin_tool_call(tool.name, validated)
+                for i, (_, tool, validated, _) in enumerate(planned)
+                if tool is not None and validated is not None
+            }
+            held = self._preflight(planned, slots)
+            for i, (tc, tool, validated, failure) in enumerate(planned):
+                if held is not None:
+                    output = held.get(i, failure if failure is not None else _BATCH_HELD)
+                elif failure is not None or tool is None or validated is None:
+                    output = failure or ""
                 else:
-                    # 边界校验:LLM 发射的入参先按工具自带 schema 解析 + 校验再 splat;畸形/敌意
-                    # 载荷给清晰可定位的错误消息(以 tool 角色喂回,让循环优雅继续),而非裸
-                    # JSONDecodeError / TypeError 冒泡崩掉整轮。
-                    try:
-                        validated = tool.parse_arguments(arguments)
-                    except InvalidToolArguments as exc:
-                        output = f"error: {exc}"
-                    else:
-                        # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
-                        enforce_tool_approval(
-                            tool.name, validated, target=tool, available=self._tools.keys()
-                        )
-                        output = self._invoke(tool, validated)
+                    output = self._execute(tool, validated, slots[i])
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 # trace 只记本地注册表里存在的工具名;模型编造的名字记成固定占位。
                 traced_tool = tool.name if tool is not None else UNKNOWN_TOOL
+                arguments = tc.function.arguments or "{}"
                 _emit_tool_step(trace, self._name, index, traced_tool, arguments, output)
         # 触顶 max_steps 仍在要工具:强制收尾(兜底非空)。
         _emit_step_limit(trace, self._name, self._max_steps)
@@ -132,16 +148,73 @@ class FunctionCallingAgent:
     def tool_inventory(self) -> frozenset[str] | None:
         return frozenset(self._tools)
 
-    def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> str:
-        """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。"""
-        if self._fail_fast:
-            return tool.invoke(arguments)
+    def _plan(self, tc: Any) -> _Planned:
+        """解析一个 tool_call:未知工具 / 入参非法给出喂回文本,否则给出校验后的参数。"""
+        tool = self._tools.get(tc.function.name)
+        if tool is None:
+            return tc, None, None, f"error: unknown tool {tc.function.name!r}"
+        # 边界校验:LLM 发射的入参先按工具自带 schema 解析 + 校验再 splat;畸形/敌意载荷给清晰可定位
+        # 的错误消息(以 tool 角色喂回,让循环优雅继续),而非裸 JSONDecodeError / TypeError 冒泡。
         try:
-            return tool.invoke(arguments)
+            return tc, tool, tool.parse_arguments(tc.function.arguments or "{}"), None
+        except InvalidToolArguments as exc:
+            return tc, tool, None, f"error: {exc}"
+
+    def _preflight(
+        self, planned: list[_Planned], slots: dict[int, RecordedCall]
+    ) -> dict[int, str] | None:
+        """先审后行:本轮有任何一个调用未获批时一个都不执行(抛错,或在喂回模式下返回各调用的喂回文本)。"""
+        if not self._approve_before_execute:
+            return None
+        candidates = [
+            (i, tool, validated)
+            for i, (_, tool, validated, _) in enumerate(planned)
+            if tool is not None and validated is not None and slots[i].replay is None
+        ]
+        errors = preflight_tool_approvals(
+            [(tool.name, validated, tool) for _, tool, validated in candidates],
+            available=self._tools.keys(),
+        )
+        blocked = {i: e for (i, _, _), e in zip(candidates, errors, strict=True) if e is not None}
+        if not blocked:
+            return None
+        if self._on_approval == "raise" or not all(
+            isinstance(e, (ApprovalPending, ApprovalRejected)) for e in blocked.values()
+        ):
+            raise blocked[min(blocked)]
+        return {i: _approval_text(e) for i, e in blocked.items()}
+
+    def _execute(self, tool: FunctionTool, validated: dict[str, Any], slot: RecordedCall) -> str:
+        """执行一次调用:记账里已有结果就复用;否则过执行闸、执行、成功则记账。"""
+        if slot.replay is not None:
+            return slot.replay
+        try:
+            # 执行闸:每一次真实调用前按「真实工具名 + 参数」审批;未批准则抛错、不执行。
+            enforce_tool_approval(tool.name, validated, target=tool, available=self._tools.keys())
+        except (ApprovalPending, ApprovalRejected) as exc:
+            if self._on_approval == "raise":
+                raise
+            return _approval_text(exc)
+        output, ok = self._invoke(tool, validated)
+        if ok:
+            slot.record(output)
+        return output
+
+    def _invoke(self, tool: FunctionTool, arguments: dict[str, Any]) -> tuple[str, bool]:
+        """执行一次工具;失败归一成可喂回模型的错误文本(见模块 docstring)。返回 (文本, 是否成功)。"""
+        if self._fail_fast:
+            return tool.invoke(arguments), True
+        try:
+            return tool.invoke(arguments), True
         except ApprovalError:
             raise  # 嵌套 agent 里的审批挂起 / 拒绝必须冒到调用方(HITL 恢复靠它)
         except Exception as exc:  # noqa: BLE001 —— 工具失败喂回模型,不让整轮崩溃
-            return _tool_error_text(exc, include_message=self._include_error_message)
+            return _tool_error_text(exc, include_message=self._include_error_message), False
+
+
+def _approval_text(exc: ApprovalError) -> str:
+    """喂回模式下审批挂起 / 拒绝的 tool 文本:只含稳定 code 与 request id(不含参数)。"""
+    return f"error: approval required [code={exc.code} request_id={exc.context.get('request_id')}]"
 
 
 def _tool_error_text(exc: Exception, *, include_message: bool) -> str:
