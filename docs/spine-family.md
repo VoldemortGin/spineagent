@@ -4,7 +4,7 @@
 > `~/startup/spine/docs/spine-family.md`，用根目录 `make family-doc-sync` 同步、`make family-doc-check` 校验；
 > 修改请改真源再同步，不要只改某一个副本。
 >
-> 数据截至 **2026-09-10**（"当前事实"类陈述——各包版本、发布状态、依赖 rev——已于 **2026-10-03 最后核对**，见 §5 与 §6 G1 补记），由代码与配置实测得出（`pyproject.toml` / `Cargo.toml` / `Cargo.lock` / `uv.lock` /
+> 数据截至 **2026-09-10**（"当前事实"类陈述——各包版本、发布状态、依赖 rev——已于 **2026-10-07 最后核对**，见 §5 与 §6 G1 补记），由代码与配置实测得出（`pyproject.toml` / `Cargo.toml` / `Cargo.lock` / `uv.lock` /
 > 真实 `import` 与 `use` / `git log`），**不是仅凭意图文档**。证据路径写作 `<repo>/相对路径:行号`。
 
 > 2026-09-10 执行补记：§3/§4 与 §6 状态已按本轮本地提交更新；§2/§5 的提交数、旧工作树与环境描述保留为此前调研快照，当前迁移结果以 §6.15 的完成记录为准。未执行推送或新包发布。
@@ -56,11 +56,11 @@
 | `corespine/` | `VoldemortGin/corespine` | Python（stdlib only，hatchling） | `corespine` 0.5.1 | 已发 PyPI（Trusted Publishing） | L0 底座 | 2026-09-06 / 33 | 活跃 |
 | `ocrspine/` | `VoldemortGin/ocrspine` | Rust 单 crate | crate `ocrspine` 0.0.1（`publish = false`）；数据包 `ocrspine-models` 0.0.3 | crate 仅 git dep；`ocrspine-models` 已发 PyPI | L0 底座 | 2026-09-06 / 11 | 活跃（小） |
 | `ragspine/` | `VoldemortGin/ragspine` | Python（hatchling，FastAPI，内置 Vite 前端） | **`rag-spine`**（import `ragspine`）0.13.0；main 已改名 `ragspine`（0.17.3 未发；PyPI 当前发行名仍 `rag-spine` 0.17.2，**等待 PyPI support 处理项目改名**） | 已发 PyPI（旧名） | L1 引擎 | 2026-09-03（实质功能停在 08-03）/ 245 | 活跃，最成熟 |
-| `spineagent/` | `VoldemortGin/spineagent` | Python（hatchling） | `spineagent` 0.3.1 | 已发 PyPI | L1 引擎 | 2026-07-30 / 42 | 停滞约 5 周 |
+| `spineagent/` | `VoldemortGin/spineagent` | Python（hatchling） | `spineagent` 0.3.1 | 已发 PyPI | L1 引擎 | 2026-07-30 / 42 | ⏸ 2026-10-07 起短期暂停开发，不投入 token；近期上线走 `~/startup/rag-platform`（AgentHub）；最后一批提交 2026-10-04（审批门加固） |
 | `pdfspine/` | `VoldemortGin/pdfspine` | Rust 2021 + PyO3 0.29 + maturin | `pdfspine` 0.12.0（2026-10-03 发布，tag `972e38c`）；13 个 crate 全 `publish = false` | 已发 PyPI；crates.io 未发 | L1 引擎（含 `pdf-typeset` / `pdf-fonts` 被 git dep） | 2026-09-24 / 535 | 最活跃 |
 | `docspine/` | `VoldemortGin/docspine` | Rust + PyO3 + maturin | `docspine`，tag v0.5.1（Cargo 内长期 0.0.1 占位） | 已发 PyPI | L2 文档引擎 | 2026-07-30 / 29 | 停滞 |
 | `pptspine/` | `VoldemortGin/pptspine` | Rust + PyO3 + maturin | `pptspine`，tag v0.5.1（Cargo 内 0.0.1 占位） | 已发 PyPI | L2 文档引擎 | 2026-07-30 / 37 | 停滞 |
-| `spinestudio/` | `VoldemortGin/spinestudio` | Python（FastAPI）+ TS（Next.js 16）+ Python SDK | `spinestudio` 0.3.1、`spinestudio-sdk` 0.2.1、`spinestudio-web` 0.1.0（private） | 有 `dist/` 与 tag，**无 release CI**，大概率未上 PyPI | L3 应用 | 2026-07-30 / 46 | 停滞 |
+| `spinestudio/` | `VoldemortGin/spinestudio` | Python（FastAPI）+ TS（Next.js 16）+ Python SDK | `spinestudio` 0.3.1、`spinestudio-sdk` 0.2.1、`spinestudio-web` 0.1.0（private） | 有 `dist/` 与 tag，**无 release CI**，大概率未上 PyPI | L3 应用 | 2026-07-30 / 46 | ⏸ 2026-10-07 起短期暂停开发，不投入 token；近期上线走 `~/startup/rag-platform`（AgentHub）；最后一批提交 2026-10-04（部署方向） |
 | `pdfspine-studio/` | `VoldemortGin/pdfspine-studio`（private，2026-09-09 新建） | Rust 2024 + Tauri 2 + Vite/React/TS | workspace 0.1.0，私有 | 未发布 | L3 应用（GUI） | 2026-07-22 / 6 | 停滞，且当前构建不了 |
 | `ragspine-web/` | `VoldemortGin/ragspine-web` | TS（pnpm + Turborepo + Next.js 16 + Fumadocs） | `@ragspine/*` 四个 app，不发布 | 部署到 Cloudflare Pages | 旁路：文档站 | 2026-07-20 / 33 | 明显偏冷 |
 | `examples/` | `VoldemortGin/spine-examples` | Python 脚本 | 无包 | 未发布 | 旁路：示例 | 2026-06-23 / 1 | 只有 1 个 commit |
@@ -262,7 +262,7 @@ L0 底座     corespine (deps=[])        ocrspine (crate, 零依赖)
 - **被谁依赖**：spinestudio（6 imports：`admin/router.py:15-16`、`skills/governance.py:24-25` 等）、examples。ragspine **不** import 它。
 - **家族相关文档在哪**：`spineagent/CLAUDE.md:8-10,20,23-25`（"不在包层面依赖 ragspine…绝不写进 dependencies"）、`README.md:36-42`
   《运行时组合 ragspine（ADR 0001 D4b）》、`:50` entry-point group `corespine.tool`。
-- **当前状态与注意事项**：0.3.1，2026-07-30 起停滞。README/CLAUDE.md 的核心承诺（不依赖 ragspine）**已兑现**。
+- **当前状态与注意事项**：0.3.1，⏸ 2026-10-07 起短期暂停开发，不投入 token（近期上线走 `~/startup/rag-platform`（AgentHub）；最后一批提交 2026-10-04，审批门加固）。README/CLAUDE.md 的核心承诺（不依赖 ragspine）**已兑现**。
   小漂移：`release.yml:12` 注释仍写 `corespine>=0.1.1`，pyproject 已是 `>=0.2.0`。`deploy/helm/` 是自认的"前瞻骨架"，当前无 server 入口。
 
 ### 5.4 pdfspine
@@ -338,7 +338,7 @@ L0 底座     corespine (deps=[])        ocrspine (crate, 零依赖)
 - **被谁依赖**：家族内**无人**。
 - **家族相关文档在哪**：`spinestudio/CLAUDE.md`《宪章》段；`docs/adr/0001-app-boundary-and-stack.md` D1/D2/D3/D5/D8（D5 自认 path editable 是偏离并给出理由）；
   `docs/adr/0011` D1（刻意不复用 `ragspine.qa_eval`）。
-- **当前状态与注意事项**：0.3.1，2026-07-30 起停滞。`.github/workflows/` 只有 `ci.yml`，**无 `release.yml`**——没有 `--no-sources` 隔离，
+- **当前状态与注意事项**：0.3.1，⏸ 2026-10-07 起短期暂停开发，不投入 token（近期上线走 `~/startup/rag-platform`（AgentHub）；最后一批提交 2026-10-04，部署方向）。`.github/workflows/` 只有 `ci.yml`，**无 `release.yml`**——没有 `--no-sources` 隔离，
   一旦按 PyPI 发布，装到的是远旧于开发环境的引擎版本（`rag-spine>=0.10.0` vs 0.13.0、`spineagent>=0.2.0` vs 0.3.1、`corespine>=0.4.0` vs 0.5.1）。
   用的是 `ragspine.agent.llm_provider.MockProvider` 而非 corespine 的通用 echo MockProvider。
 
